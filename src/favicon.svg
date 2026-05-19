@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="22" fill="#1a1d24"/>
+  <!-- 主竖 sw=13 -->
+  <path d="M28 18 V82" stroke="#34d399" stroke-width="13" stroke-linecap="round" fill="none"/>
+  <!-- 一级粗杈 sw=10 -->
+  <g stroke="#34d399" stroke-width="10" stroke-linecap="round" fill="none">
+    <path d="M30 50 L52 37"/>
+    <path d="M30 50 L52 63"/>
+  </g>
+  <!-- 二级细线 sw=5(父节点 1/2)-->
+  <g stroke="#34d399" stroke-width="5" stroke-linecap="round" fill="none">
+    <path d="M52 37 L76 23"/>
+    <path d="M52 37 L76 42"/>
+    <path d="M52 63 L76 58"/>
+    <path d="M52 63 L76 77"/>
+  </g>
+  <!-- 节点 -->
+  <g fill="#34d399">
+    <circle cx="52" cy="37" r="5.5"/>
+    <circle cx="52" cy="63" r="5.5"/>
+    <circle cx="76" cy="23" r="4.5"/>
+    <circle cx="76" cy="42" r="4.5"/>
+    <circle cx="76" cy="58" r="4.5"/>
+    <circle cx="76" cy="77" r="4.5"/>
+  </g>
+</svg>

@@ -1,0 +1,17 @@
+{
+  "name": "ktree-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ktree 文档转换 sidecar:docx/xlsx/pdf/html → Markdown",
+  "type": "commonjs",
+  "main": "convert.js",
+  "dependencies": {
+    "mammoth": "^1.8.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
+    "pdf-parse": "^1.1.1",
+    "turndown": "^7.2.0"
+  },
+  "devDependencies": {
+    "@yao-pkg/pkg": "^6.3.0"
+  }
+}

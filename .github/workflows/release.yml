@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-14'
+            args: '--target aarch64-apple-darwin'
+            label: 'macos-arm64'
+          - platform: 'macos-14'
+            args: '--target x86_64-apple-darwin'
+            label: 'macos-x64'
+          - platform: 'ubuntu-22.04'
+            args: ''
+            label: 'linux'
+          - platform: 'windows-latest'
+            args: ''
+            label: 'windows'
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri -> target'
+          key: ${{ matrix.label }}
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libgtk-3-dev
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Install sidecar dependencies
+        run: npm --prefix sidecar ci
+
+      - name: Build Node sidecar binaries
+        # 把 sidecar/convert.js / feishu-sync.js 打包成自包含二进制,
+        # 写入 src-tauri/binaries/,Tauri externalBin 在 tauri build 时自动打包进应用。
+        run: node sidecar/build.js
+
+      - name: Generate changelog from commits
+        id: changelog
+        shell: bash
+        run: |
+          git fetch --tags --force --quiet
+          PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${GITHUB_REF_NAME}$" | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          ZH_FILE=$(mktemp)
+          EN_FILE=$(mktemp)
+          HAS_EN=0
+
+          # 一次拿 commit SHA 列表,再逐个 git log -1 取 subject/body,避免 body 里换行干扰 bash 分词
+          while IFS= read -r sha; do
+            [ -z "$sha" ] && continue
+            subj=$(git log -1 --format=%s "$sha")
+            case "$subj" in
+              Merge*|"chore: bump"*|"chore: release"*) continue ;;
+            esac
+            printf -- '- %s\n' "$subj" >> "$ZH_FILE"
+            en=$(git log -1 --format=%b "$sha" | sed -n 's/^EN: //p' | head -1)
+            if [ -n "$en" ]; then
+              HAS_EN=1
+              printf -- '- %s\n' "$en" >> "$EN_FILE"
+            else
+              printf -- '- %s\n' "$subj" >> "$EN_FILE"
+            fi
+          done < <(git log "$RANGE" --no-merges --format=%H)
+
+          [ -s "$ZH_FILE" ] || echo "- 维护性更新" > "$ZH_FILE"
+
+          {
+            echo "body<<__CHANGELOG_EOF__"
+            echo "## 本次更新"
+            echo ""
+            cat "$ZH_FILE"
+            if [ "$HAS_EN" = "1" ]; then
+              echo ""
+              echo "## What's Changed"
+              echo ""
+              cat "$EN_FILE"
+            fi
+            echo ""
+            echo "---"
+            echo "首次安装请见 [README](https://github.com/YvoStudio/Ktree#readme)。"
+            echo "First-time install: see [README](https://github.com/YvoStudio/Ktree#readme)."
+            echo "__CHANGELOG_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build with tauri-action
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Ktree ${{ github.ref_name }}'
+          releaseBody: ${{ steps.changelog.outputs.body }}
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

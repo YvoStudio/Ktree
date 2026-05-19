@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+sidecar/node_modules/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/Cargo.lock.bak
+src-tauri/gen/
+**/*.rs.bk
+
+# Tauri sidecar 二进制产物(各平台用 sidecar/build.js 现场生成)
+src-tauri/binaries/
+
+# Build outputs
+dist/
+build/
+
+# 运行时数据(知识库文件、索引、SQLite)
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local config
+.env
+.env.local
+
+# Tauri signing keys(本地生成,绝不入库)
+*.key
+*.key.pub
+.tauri/
+
+# Tauri updater private key (本地保存在 .keys/,never commit)
+.keys/

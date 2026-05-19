@@ -1,0 +1,22 @@
+{
+  "name": "ktree",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ktree — 跨平台知识库服务:文档上传、转换、全文索引、REST/MCP 接口",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "sidecar:install": "npm --prefix sidecar install",
+    "sidecar:build": "node sidecar/build.js"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-dialog": "^2.0.1",
+    "@tauri-apps/plugin-opener": "^2.0.0",
+    "@tauri-apps/plugin-shell": "^2.0.1"
+  }
+}
