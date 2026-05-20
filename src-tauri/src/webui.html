@@ -50,6 +50,28 @@
   .ops-report { font-size:12px; color:#555; padding:8px 10px; background:#f5f5f5;
     border-radius:6px; margin-top:8px; white-space:pre-wrap; word-break:break-all;
     max-height:280px; overflow-y:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  /* 操作弹窗 - AI 接入区块 */
+  .ops-sec-title { font-size:11px; font-weight:600; color:#999; letter-spacing:.06em;
+    text-transform:uppercase; margin:10px 2px 6px; }
+  .ops-ai-block { padding:12px 14px; border:1px solid var(--card-line);
+    border-radius:8px; background:#faf8fd; }
+  .ops-ai-intro { font-size:12px; color:#666; line-height:1.6; margin-bottom:10px; }
+  .ops-ai-intro b { color:var(--accent); }
+  .ops-ai-row { display:flex; align-items:center; gap:8px; padding:4px 0; font-size:12.5px; }
+  .ops-ai-row .lbl { width:78px; flex-shrink:0; color:#888; font-size:12px; }
+  .ops-ai-row .val { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; background:#fff; border:1px solid #ececec; border-radius:5px;
+    padding:4px 8px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:12px; color:#333; }
+  .ops-ai-cmd { margin-top:10px; }
+  .ops-ai-cmd-head { display:flex; align-items:center; justify-content:space-between;
+    font-size:11.5px; color:#777; margin-bottom:4px; }
+  .ops-ai-cmd-body { display:block; background:#fff; border:1px solid #ececec;
+    border-radius:6px; padding:8px 10px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:11.5px; color:#333; line-height:1.55; white-space:pre;
+    overflow-x:auto; max-height:280px; overflow-y:auto; }
+  .ops-ai-hint { margin-top:8px; font-size:11.5px; color:#999; line-height:1.55; }
+  .ops-ai-hint code { background:#eee; padding:1px 5px; border-radius:3px; font-size:11px; }
   .nav-fav { display:flex; align-items:center; gap:8px; margin:0 8px 4px; padding:7px 12px;
     border-radius:7px; cursor:pointer; color:#555; font-size:14px; }
   .nav-fav:hover { background:#efefef; color:#111; }
@@ -615,12 +637,20 @@ document.getElementById('btnOps').addEventListener('click', showOpsDialog);
 
 function showOpsDialog(){
   const ov=document.createElement('div'); ov.className='dlg-overlay';
-  const box=document.createElement('div'); box.className='dlg-box'; box.style.maxWidth='560px';
+  const box=document.createElement('div'); box.className='dlg-box';
+  // 默认 dlg-box width:520px 不够 — AI 区块的命令行很长,加宽到 920px 并按视口收缩
+  box.style.width='920px';
+  box.style.maxWidth='92vw';
+  box.style.maxHeight='90vh';
+  box.style.overflowY='auto';
   box.innerHTML=`
     <div class="dlg-msg" style="display:flex;align-items:center;justify-content:space-between">
       <span>操作</span>
       <button class="btn ghost sm" data-act="close" style="font-size:18px;line-height:1;padding:2px 8px">×</button>
     </div>
+    <div class="ops-sec-title">让 AI 接入知识库</div>
+    ${renderAiBlock()}
+    <div class="ops-sec-title" style="margin-top:14px">知识库操作</div>
     <div class="ops-dlg-list" id="opsList"><div class="empty">加载中…</div></div>
     <div class="dlg-actions" style="margin-top:6px">
       <button class="btn ghost" data-act="close">关闭</button>
@@ -631,7 +661,87 @@ function showOpsDialog(){
   box.querySelectorAll('[data-act="close"]').forEach(b=>b.addEventListener('click',close));
   ov.addEventListener('click',e=>{ if(e.target===ov) close(); });
   document.addEventListener('keydown',onkey);
+  wireAiBlock(box);
   renderOpsList(document.getElementById('opsList'));
+}
+
+// ---------- AI 接入说明 ----------
+// 给 Claude Code / Claude Desktop / 其它 MCP 客户端、以及 curl/REST 调用方提供一键复制的接入参数。
+// URL 直接用当前浏览器访问 webui 的 origin,这样在哪个地址打开页面就给哪个地址,
+// 同一局域网内其他机器把 hostname 换成本机 LAN IP 即可。
+function renderAiBlock(){
+  const origin=location.origin;
+  const isLocal=/^(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(location.host);
+  const restBase=`${origin}/api`;
+  const mcpUrl=`${origin}/mcp`;
+  const cliCmd=`claude mcp add --transport http ktree ${mcpUrl}`;
+  const jsonCfg=JSON.stringify({
+    mcpServers:{ ktree:{ type:'http', url:mcpUrl } }
+  }, null, 2);
+  const stdioCfg=JSON.stringify({
+    mcpServers:{ ktree:{ command:'npx', args:['-y','mcp-remote',mcpUrl] } }
+  }, null, 2);
+  const restSample=`curl "${restBase}/search?q=关键字&limit=10"`;
+  return `
+    <div class="ops-ai-block">
+      <div class="ops-ai-intro">
+        知识库已在 <b>${esc(origin)}</b> 提供 REST + MCP 接口。
+        把下方 URL 配进 Claude Code / Claude Desktop / 任意 MCP 客户端,
+        AI 即可检索本知识库;同一局域网其它机器把 hostname 改成本机 IP 即可访问。
+      </div>
+      <div class="ops-ai-row">
+        <span class="lbl">REST API</span>
+        <code class="val">${esc(restBase)}</code>
+        <button class="btn ghost sm" data-ai-copy="${esc(restBase)}">复制</button>
+      </div>
+      <div class="ops-ai-row">
+        <span class="lbl">MCP 端点</span>
+        <code class="val">${esc(mcpUrl)}</code>
+        <button class="btn ghost sm" data-ai-copy="${esc(mcpUrl)}">复制</button>
+      </div>
+      <div class="ops-ai-cmd">
+        <div class="ops-ai-cmd-head">
+          <span>Claude Code 一键接入</span>
+          <button class="btn ghost sm" data-ai-copy="${esc(cliCmd)}">复制</button>
+        </div>
+        <code class="ops-ai-cmd-body">${esc(cliCmd)}</code>
+      </div>
+      <div class="ops-ai-cmd">
+        <div class="ops-ai-cmd-head">
+          <span>Claude Desktop / 新版客户端(HTTP transport)</span>
+          <button class="btn ghost sm" data-ai-copy="${esc(jsonCfg)}">复制</button>
+        </div>
+        <pre class="ops-ai-cmd-body">${esc(jsonCfg)}</pre>
+      </div>
+      <div class="ops-ai-cmd">
+        <div class="ops-ai-cmd-head">
+          <span>只支持 stdio 的旧客户端(用 mcp-remote 桥接)</span>
+          <button class="btn ghost sm" data-ai-copy="${esc(stdioCfg)}">复制</button>
+        </div>
+        <pre class="ops-ai-cmd-body">${esc(stdioCfg)}</pre>
+      </div>
+      <div class="ops-ai-cmd">
+        <div class="ops-ai-cmd-head">
+          <span>REST 调用示例(脚本 / 客户端)</span>
+          <button class="btn ghost sm" data-ai-copy="${esc(restSample)}">复制</button>
+        </div>
+        <code class="ops-ai-cmd-body">${esc(restSample)}</code>
+      </div>
+      <div class="ops-ai-hint">
+        MCP 工具:<code>kb_search</code> / <code>kb_get_doc</code> / <code>kb_list_categories</code> /
+        <code>kb_list_docs</code> / <code>kb_upload</code>。
+        ${isLocal?'<br>当前访问的是 <code>'+esc(location.hostname)+'</code>,给其它机器用时请把 hostname 换成本机 LAN IP。':''}
+      </div>
+    </div>`;
+}
+
+function wireAiBlock(box){
+  box.querySelectorAll('[data-ai-copy]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const ok=await copyText(btn.getAttribute('data-ai-copy'));
+      toast(ok?'已复制':'复制失败');
+    });
+  });
 }
 
 async function renderOpsList(host){
