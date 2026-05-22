@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use md5::{Digest, Md5};
 use serde::Serialize;
 
 use crate::config::{KnowledgeBase, VcsBinding};
@@ -20,6 +21,8 @@ pub struct VcsSyncReport {
     pub vcs_type: String,
     pub url: String,
     pub sub_dir: String,
+    /// 仅 git 子目录同步:同步的仓库内子目录;其它情况为空
+    pub repo_sub_path: String,
     /// VCS 命令拉取后报告的修订(git: HEAD sha;svn: working copy 修订号)
     pub revision: String,
     /// 新加进 store 的文件(rel_path,相对 src/)
@@ -105,7 +108,166 @@ fn run_cmd(mut cmd: Command, ctx: &str) -> anyhow::Result<String> {
     Ok(stdout)
 }
 
-fn git_pull_or_clone(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
+/// git 子目录同步用的隐藏工作副本目录 —— 放 `.ktree/vcs-cache/` 下,`.git` 不进 src。
+/// 按 url+branch+repo_sub_path 取哈希,改了任一项就换一个目录,互不干扰。
+fn git_cache_dir(kb: &KnowledgeBase, b: &VcsBinding) -> PathBuf {
+    let key = format!(
+        "{:x}",
+        Md5::digest(
+            format!(
+                "{}\u{0}{}\u{0}{}",
+                b.url.trim(),
+                b.branch.trim(),
+                b.repo_sub_path.trim()
+            )
+            .as_bytes()
+        )
+    );
+    kb.root
+        .join(".ktree")
+        .join("vcs-cache")
+        .join(format!("git-{}", &key[..16]))
+}
+
+/// git 同步入口:`repo_sub_path` 为空走整仓克隆(工作副本就在 target);
+/// 非空走稀疏检出 —— 在隐藏目录里只拉那个子目录,再扁平镜像到 target。
+fn git_sync(kb: &KnowledgeBase, target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
+    let repo_sub = b.repo_sub_path.trim().trim_matches('/').to_string();
+    if repo_sub.is_empty() {
+        return git_whole_repo(target, b);
+    }
+    if safe_rel_path(&repo_sub).is_none() {
+        anyhow::bail!("VCS 绑定 repo_sub_path「{repo_sub}」不合法");
+    }
+    let workdir = git_cache_dir(kb, b);
+    let from = workdir.join(&repo_sub);
+    // 拉取前先记下上一轮同步过的文件 —— 拉取后据此把 git 端已删除的文件从 target 精确清掉,
+    // 只动本绑定自己同步过的文件,不会误删 target 里其它来源(用户上传 / 飞书 / 别的绑定)的内容。
+    let prev_files = if from.is_dir() {
+        list_repo_files(&from).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let revision = git_sparse_checkout(&workdir, b, &repo_sub)?;
+    if !from.is_dir() {
+        anyhow::bail!("git 仓库里找不到子目录「{repo_sub}」(分支 / 路径填对了吗?)");
+    }
+    // 把仓库子目录扁平镜像到 src 目标目录:补齐 / 覆盖文件,并清掉 git 端已删除的。
+    mirror_tree(&from, target, &prev_files)?;
+    Ok(revision)
+}
+
+/// 在隐藏工作副本里对一个仓库做稀疏检出,工作树里只保留 `repo_sub` 这一个子目录。
+fn git_sparse_checkout(workdir: &Path, b: &VcsBinding, repo_sub: &str) -> anyhow::Result<String> {
+    let url = git_url_with_creds(&b.url, &b.username, &b.password);
+    let branch = b.branch.trim();
+    if workdir.join(".git").exists() {
+        // 已有工作副本:刷新稀疏集合(repo_sub 可能改过)→ fetch → reset 到上游
+        let mut sp = Command::new("git");
+        sp.current_dir(workdir)
+            .args(["sparse-checkout", "set", repo_sub]);
+        run_cmd(sp, "git sparse-checkout set")?;
+        let mut fetch = Command::new("git");
+        fetch.current_dir(workdir).args(["fetch", "--prune"]);
+        run_cmd(fetch, "git fetch")?;
+        let mut reset = Command::new("git");
+        reset.current_dir(workdir).arg("reset").arg("--hard");
+        if branch.is_empty() {
+            reset.arg("@{u}");
+        } else {
+            reset.arg(format!("origin/{branch}"));
+        }
+        let _ = run_cmd(reset, "git reset --hard");
+    } else {
+        if let Some(parent) = workdir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // 优先 --filter=blob:none(只拉用到的 blob,省带宽);服务端不支持就回落整克隆
+        if git_sparse_clone(&url, workdir, branch, true).is_err() {
+            let _ = fs::remove_dir_all(workdir);
+            git_sparse_clone(&url, workdir, branch, false)?;
+        }
+        let mut sp = Command::new("git");
+        sp.current_dir(workdir)
+            .args(["sparse-checkout", "set", repo_sub]);
+        run_cmd(sp, "git sparse-checkout set")?;
+        let mut co = Command::new("git");
+        co.current_dir(workdir).arg("checkout");
+        run_cmd(co, "git checkout")?;
+    }
+    let mut head = Command::new("git");
+    head.current_dir(workdir).args(["rev-parse", "HEAD"]);
+    Ok(run_cmd(head, "git rev-parse HEAD")?.trim().to_string())
+}
+
+/// 一次稀疏 clone(不检出工作树)。`partial=true` 时带 `--filter=blob:none`。
+fn git_sparse_clone(url: &str, workdir: &Path, branch: &str, partial: bool) -> anyhow::Result<()> {
+    let mut clone = Command::new("git");
+    clone.args(["clone", "--no-checkout", "--sparse"]);
+    if partial {
+        clone.arg("--filter=blob:none");
+    }
+    if !branch.is_empty() {
+        clone.arg("--branch").arg(branch);
+    }
+    clone.arg(url).arg(workdir);
+    run_cmd(clone, "git clone --sparse")?;
+    Ok(())
+}
+
+/// 把 `from` 目录树镜像进 `to`:复制 / 覆盖所有文件,并按 `prev_files`(上一轮同步过的
+/// 相对路径)清掉 git 端已删除的文件。只动本绑定同步过的文件,`to` 里其它来源的内容
+/// 不受影响 —— 因此 `to` 可以是 src 根目录。
+fn mirror_tree(from: &Path, to: &Path, prev_files: &[String]) -> anyhow::Result<()> {
+    fs::create_dir_all(to)?;
+    copy_tree(from, to, Path::new(""))?;
+    for rel in prev_files {
+        if from.join(rel).is_file() {
+            continue; // git 里还有这个文件 → 保留
+        }
+        let p = to.join(rel);
+        let _ = fs::remove_file(&p);
+        // 顺手清掉因此空掉的目录(向上回溯到 `to` 为止)
+        let mut dir = p.parent();
+        while let Some(d) = dir {
+            if d == to || fs::remove_dir(d).is_err() {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+    Ok(())
+}
+
+/// 递归把 `from` 下的文件复制进 `to`(覆盖同名);遇到类型冲突先清掉旧的。
+fn copy_tree(from: &Path, to: &Path, rel: &Path) -> anyhow::Result<()> {
+    for e in fs::read_dir(from.join(rel))?.flatten() {
+        let r = rel.join(e.file_name());
+        let dst = to.join(&r);
+        match e.file_type() {
+            Ok(t) if t.is_dir() => {
+                if dst.is_file() {
+                    let _ = fs::remove_file(&dst);
+                }
+                fs::create_dir_all(&dst)?;
+                copy_tree(from, to, &r)?;
+            }
+            Ok(_) => {
+                if dst.is_dir() {
+                    let _ = fs::remove_dir_all(&dst);
+                } else {
+                    let _ = fs::remove_file(&dst);
+                }
+                fs::copy(from.join(&r), &dst)?;
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// 整仓克隆 / 更新:工作副本(含 `.git`)就落在 target。
+fn git_whole_repo(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
     let url = git_url_with_creds(&b.url, &b.username, &b.password);
     if target.join(".git").exists() {
         // 已有工作副本 → fetch + reset 到上游
@@ -229,12 +391,15 @@ pub fn sync_binding(
         .clone();
     let (target, sub_norm) = binding_target_dir(kb, &b)?;
 
+    let repo_sub = b.repo_sub_path.trim().trim_matches('/').to_string();
+
     let mut report = VcsSyncReport {
         kb_id: kb.id.clone(),
         binding_idx,
         vcs_type: b.vcs_type.clone(),
         url: b.url.clone(),
         sub_dir: sub_norm.clone(),
+        repo_sub_path: repo_sub.clone(),
         revision: String::new(),
         added: Vec::new(),
         updated: Vec::new(),
@@ -253,7 +418,7 @@ pub fn sync_binding(
 
     // 拉取 / 更新
     report.revision = match b.vcs_type.as_str() {
-        "git" => git_pull_or_clone(&target, &b)?,
+        "git" => git_sync(kb, &target, &b)?,
         "svn" => svn_update_or_checkout(&target, &b)?,
         other => anyhow::bail!("不支持的 VCS 类型「{other}」(只支持 git / svn)"),
     };

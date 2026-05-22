@@ -8,21 +8,22 @@
 <script src="updater.js"></script>
 <style>
   :root {
-    --bg:#fff; --fg:#333; --muted:#999; --line:#eee; --accent:#5b21b6;
-    --accent-bg:#e8e0f0; --card:#fafafa; --card-line:#f0f0f0; --danger:#dc2626; --ok:#16a34a;
+    --bg:#f4f3f7; --fg:#2c2c34; --muted:#9a99a3; --line:#ececf0; --accent:#5b21b6;
+    --accent-bg:#e8e0f0; --card:#ffffff; --card-line:#eaeaef; --danger:#dc2626; --ok:#16a34a;
   }
   * { box-sizing:border-box; margin:0; padding:0; }
   body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
     background:var(--bg); color:var(--fg); font-size:14px; line-height:1.6;
     -webkit-font-smoothing:antialiased; }
-  .wrap { max-width:680px; margin:0 auto; padding:20px 22px 40px; }
-  h1 { font-size:18px; font-weight:600; color:#111; margin-bottom:4px;
-    display:flex; align-items:center; gap:9px; }
-  h1 img { width:26px; height:26px; flex-shrink:0; }
+  .wrap { max-width:880px; margin:0 auto; padding:26px 30px 48px; }
+  h1 { font-size:21px; font-weight:600; color:#111; margin-bottom:4px;
+    display:flex; align-items:center; gap:10px; }
+  h1 img { width:30px; height:30px; flex-shrink:0; }
 
   .status { display:flex; gap:18px; align-items:center; flex-wrap:wrap;
-    background:var(--card); border:1px solid var(--card-line); border-radius:10px;
-    padding:12px 16px; margin:14px 0; font-size:13px; color:#555; }
+    background:var(--card); border:1px solid var(--card-line); border-radius:12px;
+    padding:13px 18px; margin:16px 0; font-size:13px; color:#555;
+    box-shadow:0 1px 3px rgba(20,16,40,.04); }
   .status b { color:var(--accent); }
   .status .web { margin-left:auto; }
   .status .web code { background:#fff; border:1px solid #ddd; border-radius:5px;
@@ -30,9 +31,10 @@
   .dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:4px; }
   .dot.on { background:var(--ok); } .dot.off { background:#ccc; }
 
-  .section { background:var(--card); border:1px solid var(--card-line); border-radius:10px;
-    padding:16px 18px; margin-bottom:14px; }
-  .section h3 { font-size:14px; margin-bottom:12px; color:#111; display:flex; align-items:center; }
+  .section { background:var(--card); border:1px solid var(--card-line); border-radius:12px;
+    padding:20px 22px; margin-bottom:16px;
+    box-shadow:0 1px 3px rgba(20,16,40,.04); }
+  .section h3 { font-size:15px; margin-bottom:14px; color:#111; display:flex; align-items:center; }
   .row { display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap; margin-bottom:12px; }
   .row:last-child { margin-bottom:0; }
   label.field { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
@@ -42,7 +44,8 @@
   input:focus { outline:none; border-color:#c7b8e0; box-shadow:0 0 0 1.5px var(--accent-bg); }
   .hint { color:var(--muted); font-size:12px; }
   button.btn { background:var(--accent); color:#fff; border:none; padding:7px 16px;
-    border-radius:7px; cursor:pointer; font-size:13px; font-weight:500; }
+    border-radius:7px; cursor:pointer; font-size:13px; font-weight:500;
+    transition:background .15s ease, opacity .15s ease; }
   button.btn:hover { background:#4c1d95; }
   button.btn.ghost { background:#ececec; color:#555; }
   button.btn.ghost:hover { background:#e0e0e0; }
@@ -62,16 +65,21 @@
   .dlg-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:18px; }
   button.btn.dlg-danger { background:var(--danger); color:#fff; }
   button.btn.dlg-danger:hover { background:#b91c1c; }
-  select { background:#fff; border:1px solid #ddd; color:#333; padding:6px 10px;
-    border-radius:7px; font-size:13px; width:100%; cursor:pointer; }
+  select { background:#fff; border:1px solid #ddd; color:#333;
+    padding:6px 28px 6px 10px; border-radius:7px; font-size:14px; font-weight:600;
+    width:100%; cursor:pointer; -webkit-appearance:none; appearance:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23999' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat:no-repeat; background-position:right 10px center; }
   select:focus { outline:none; border-color:#c7b8e0; box-shadow:0 0 0 1.5px var(--accent-bg); }
   .vcs-section { margin-top:12px; padding-top:12px; border-top:1px dashed var(--card-line); }
   .vcs-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
   .vcs-title { font-size:13px; color:#555; font-weight:500; }
   .vcs-head .btn { margin-left:auto; }
-  .vcs-row { background:#fff; border:1px solid #eee; border-radius:8px; padding:10px;
-    margin-bottom:8px; }
+  .vcs-row { background:#faf9fc; border:1px solid var(--card-line); border-radius:10px;
+    padding:42px 14px 14px; margin-bottom:10px; position:relative; }
+  .vcs-del-btn { position:absolute; top:10px; right:12px; }
   .vcs-row .row { margin-bottom:8px; }
+  .vcs-row.is-svn .vcs-git-only { display:none; }
 </style>
 </head>
 <body>
@@ -89,19 +97,14 @@
   <div class="section">
     <h3>全局</h3>
     <div class="row">
-      <label class="field" style="flex:1">HTTP 端口(留当前值 = 沿用自动选取;手填则固定该端口)
+      <label class="field" style="flex:1;min-width:200px">HTTP 端口(留当前值 = 沿用自动选取;手填则固定该端口)
         <input type="number" id="cfgPort" min="0" max="65535" />
       </label>
-      <label class="field" style="flex:1">飞书自动同步间隔(分钟,0 = 关闭)
-        <input type="number" id="cfgInterval" min="0" />
-      </label>
-    </div>
-    <div class="row">
-      <label class="field" style="flex:1">自定义域名(可空。状态条与复制地址会用它替代 IP:端口)
+      <label class="field" style="flex:2;min-width:240px">自定义域名(可空。状态条与复制地址会用它替代 IP:端口)
         <input type="text" id="cfgDomain" placeholder="例如 https://kb.example.com" />
       </label>
     </div>
-    <p class="hint">端口与同步间隔修改后需重启应用生效;自定义域名保存即生效。</p>
+    <p class="hint">端口修改后需重启应用生效;自定义域名保存即生效。</p>
   </div>
 
   <div id="kbSections"></div>
@@ -170,7 +173,6 @@ async function loadConfig(){
   portInp.value = actualPort || configured;
   portInp.dataset.actualPort = actualPort;
   portInp.dataset.configured  = configured;
-  document.getElementById('cfgInterval').value = CFG.sync_interval_minutes ?? 0;
   document.getElementById('cfgDomain').value = CFG.custom_domain ?? '';
   renderKbs();
 }
@@ -190,21 +192,7 @@ function renderKbs(){
           <input type="text" data-i="${i}" data-f="root" value="${esc(kb.root||'')}" />
         </label>
       </div>
-      <div class="row">
-        <label class="field" style="flex:1;min-width:120px">飞书 App ID
-          <input type="text" data-i="${i}" data-f="app_id" value="${esc(kb.feishu?.app_id||'')}" />
-        </label>
-        <label class="field" style="flex:1;min-width:120px">App Secret
-          <input type="password" data-i="${i}" data-f="app_secret" value="${esc(kb.feishu?.app_secret||'')}" />
-        </label>
-        <label class="field" style="flex:1;min-width:120px">文件夹 Token
-          <input type="text" data-i="${i}" data-f="folder_token" value="${esc(kb.feishu?.folder_token||'')}" />
-        </label>
-      </div>
-      <div class="row">
-        <button class="btn ghost sm" data-act="sync" data-id="${esc(kb.id||'')}">立即同步飞书</button>
-        <span class="hint">${kb.id ? '' : '(填好名称并保存后才能同步)'}</span>
-      </div>
+      ${renderFeishu(kb, i)}
       <div class="vcs-section" data-vcs-kb="${i}">
         <div class="vcs-head">
           <span class="vcs-title">VCS 绑定(git / svn)</span>
@@ -214,27 +202,66 @@ function renderKbs(){
       </div>
     </div>`).join('') || '<p class="hint" style="margin-bottom:14px">还没有知识库,点下方「添加知识库」。</p>';
 }
+// 哪些知识库的飞书配置当前处于展开态(仅 UI 状态,不持久化)
+const feishuExpanded = new Set();
+// 飞书同步配置块 —— 跟 VCS 一样做成可选:没配过就折叠,点「配置飞书」才展开。
+function renderFeishu(kb, i){
+  const f = kb.feishu || {};
+  const has = !!(f.app_id || f.app_secret || f.folder_token);
+  const open = has || feishuExpanded.has(i);
+  const head = `
+    <div class="vcs-head">
+      <span class="vcs-title">飞书同步(可选)</span>
+      ${open
+        ? `<button class="btn ghost sm" data-act="feishu-clear" data-i="${i}">清除配置</button>`
+        : `<button class="btn ghost sm" data-act="feishu-add" data-i="${i}">＋ 配置飞书</button>`}
+    </div>`;
+  const body = open ? `
+    <div class="row" style="margin-bottom:8px">
+      <label class="field" style="flex:1;min-width:120px">飞书 App ID
+        <input type="text" data-i="${i}" data-f="app_id" value="${esc(f.app_id||'')}" />
+      </label>
+      <label class="field" style="flex:1;min-width:120px">App Secret
+        <input type="password" data-i="${i}" data-f="app_secret" value="${esc(f.app_secret||'')}" />
+      </label>
+      <label class="field" style="flex:1;min-width:120px">文件夹 Token
+        <input type="text" data-i="${i}" data-f="folder_token" value="${esc(f.folder_token||'')}" />
+      </label>
+    </div>
+    <div class="row" style="margin-bottom:0">
+      <label class="field" style="width:170px">自动同步间隔(分钟,0=关)
+        <input type="number" min="0" data-i="${i}" data-f="sync_interval_minutes" value="${f.sync_interval_minutes||0}" />
+      </label>
+      <button class="btn ghost sm" data-act="sync" data-id="${esc(kb.id||'')}">立即同步飞书</button>
+      <span class="hint">${kb.id ? '' : '(填好名称并保存后才能同步)'}</span>
+    </div>`
+    : `<p class="hint" style="margin:4px 0 0">未配置飞书同步。点上方「配置飞书」启用。</p>`;
+  return `<div class="vcs-section">${head}<div class="vcs-list">${body}</div></div>`;
+}
 function renderVcsList(list, kbIdx){
   if(!list.length) return '<p class="hint" style="margin:4px 0 0">未配置 VCS 绑定。点上方「添加绑定」。</p>';
   return list.map((b,j)=>`
-    <div class="vcs-row" data-vi="${kbIdx}-${j}">
+    <div class="vcs-row${b.vcs_type==='svn'?' is-svn':''}" data-vi="${kbIdx}-${j}">
+      <button class="btn danger sm vcs-del-btn" data-act="vcs-del" data-vi="${kbIdx}-${j}">删除</button>
       <div class="row" style="margin-bottom:6px">
-        <label class="field" style="width:90px">类型
+        <label class="field" style="width:120px">类型
           <select data-vi="${kbIdx}-${j}" data-vf="vcs_type">
             <option value="git" ${b.vcs_type==='git'?'selected':''}>git</option>
             <option value="svn" ${b.vcs_type==='svn'?'selected':''}>svn</option>
           </select>
         </label>
-        <label class="field" style="flex:2;min-width:200px">仓库 URL
+        <label class="field" style="flex:2;min-width:180px">仓库 URL
           <input type="text" data-vi="${kbIdx}-${j}" data-vf="url" value="${esc(b.url||'')}" placeholder="https://… 或 git@host:repo.git / svn://…" />
         </label>
-        <label class="field" style="flex:1;min-width:120px">src 子目录(空=src 根)
+        <label class="field vcs-git-only" style="flex:1;min-width:120px">仓库子目录(仅 git)
+          <input type="text" data-vi="${kbIdx}-${j}" data-vf="repo_sub_path" value="${esc(b.repo_sub_path||'')}" placeholder="空=整仓,如 packages/core" />
+        </label>
+        <label class="field" style="flex:1;min-width:110px">src 子目录(空=src 根)
           <input type="text" data-vi="${kbIdx}-${j}" data-vf="sub_dir" value="${esc(b.sub_dir||'')}" placeholder="code 或 spec/v1" />
         </label>
-        <button class="btn danger sm" data-act="vcs-del" data-vi="${kbIdx}-${j}" style="align-self:flex-end">删除</button>
       </div>
       <div class="row" style="margin-bottom:0">
-        <label class="field" style="flex:1;min-width:90px">分支(仅 git)
+        <label class="field vcs-git-only" style="flex:1;min-width:90px">分支(仅 git)
           <input type="text" data-vi="${kbIdx}-${j}" data-vf="branch" value="${esc(b.branch||'')}" placeholder="main / master" />
         </label>
         <label class="field" style="flex:1;min-width:100px">用户名(留空走系统凭证)
@@ -247,6 +274,7 @@ function renderVcsList(list, kbIdx){
           <input type="number" min="0" data-vi="${kbIdx}-${j}" data-vf="sync_interval_minutes" value="${b.sync_interval_minutes||0}" />
         </label>
       </div>
+      <p class="hint" style="margin:6px 0 0">git 填「仓库子目录」= 只稀疏检出该目录,内容扁平同步到 src 子目录(留空则同步到 src 根);svn 不用此项,直接把 URL 指到子目录即可。</p>
     </div>`).join('');
 }
 function collect(){
@@ -256,6 +284,7 @@ function collect(){
     if(!kb) return;
     if(f==='name') kb.name=inp.value.trim();
     else if(f==='root') kb.root=inp.value.trim();
+    else if(f==='sync_interval_minutes'){ kb.feishu=kb.feishu||{}; kb.feishu[f]=parseInt(inp.value)||0; }
     else { kb.feishu=kb.feishu||{}; kb.feishu[f]=inp.value.trim(); }
   });
   // VCS 绑定:input + select 都 collect。data-vi 是 "<kbIdx>-<bIdx>"
@@ -276,7 +305,6 @@ function collect(){
   const actual = parseInt(portInp.dataset.actualPort)||0;
   const wasAuto = (parseInt(portInp.dataset.configured)||0) === 0;
   CFG.http_port = (wasAuto && newPort === actual) ? 0 : newPort;
-  CFG.sync_interval_minutes = parseInt(document.getElementById('cfgInterval').value)||0;
   CFG.custom_domain = document.getElementById('cfgDomain').value.trim();
 }
 
@@ -292,7 +320,7 @@ document.getElementById('kbSections').addEventListener('click', async e=>{
     const i = +el.dataset.i;
     const kb = CFG.knowledge_bases[i];
     kb.vcs_bindings = kb.vcs_bindings || [];
-    kb.vcs_bindings.push({ vcs_type:'git', url:'', sub_dir:'', branch:'', username:'', password:'', sync_interval_minutes:0 });
+    kb.vcs_bindings.push({ vcs_type:'git', url:'', sub_dir:'', repo_sub_path:'', branch:'', username:'', password:'', sync_interval_minutes:0 });
     renderKbs();
   } else if(el.dataset.act==='vcs-del'){
     const ok=await confirmDialog('删除此 VCS 绑定?\n(不会影响磁盘上的工作副本和已入库内容,只是不再自动同步)',{okText:'删除',danger:true});
@@ -300,6 +328,18 @@ document.getElementById('kbSections').addEventListener('click', async e=>{
     collect();
     const [ki,bi] = el.dataset.vi.split('-').map(Number);
     CFG.knowledge_bases[ki].vcs_bindings.splice(bi,1);
+    renderKbs();
+  } else if(el.dataset.act==='feishu-add'){
+    collect();
+    feishuExpanded.add(+el.dataset.i);
+    renderKbs();
+  } else if(el.dataset.act==='feishu-clear'){
+    const ok=await confirmDialog('清除该知识库的飞书配置?\n(App ID / Secret / 文件夹 Token 都会清空)',{okText:'清除',danger:true});
+    if(!ok) return;
+    collect();
+    const i=+el.dataset.i;
+    CFG.knowledge_bases[i].feishu={app_id:'',app_secret:'',folder_token:'',sync_interval_minutes:0};
+    feishuExpanded.delete(i);
     renderKbs();
   } else if(el.dataset.act==='sync'){
     const id = el.dataset.id;
@@ -313,10 +353,17 @@ document.getElementById('kbSections').addEventListener('click', async e=>{
     finally { el.disabled=false; el.textContent='立即同步飞书'; }
   }
 });
+// 切换 VCS 绑定类型时,git 专属字段(仓库子目录)随 svn / git 显隐
+document.getElementById('kbSections').addEventListener('change', e=>{
+  const sel = e.target.closest('select[data-vf="vcs_type"]');
+  if(!sel) return;
+  const row = sel.closest('.vcs-row');
+  if(row) row.classList.toggle('is-svn', sel.value==='svn');
+});
 document.getElementById('btnAddKb').addEventListener('click', ()=>{
   collect();
   CFG.knowledge_bases = CFG.knowledge_bases || [];
-  CFG.knowledge_bases.push({ id:'', name:'新知识库', root:'', feishu:{app_id:'',app_secret:'',folder_token:''}, vcs_bindings:[] });
+  CFG.knowledge_bases.push({ id:'', name:'新知识库', root:'', feishu:{app_id:'',app_secret:'',folder_token:'',sync_interval_minutes:0}, vcs_bindings:[] });
   renderKbs();
 });
 document.getElementById('btnSave').addEventListener('click', async ()=>{

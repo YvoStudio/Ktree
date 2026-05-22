@@ -14,6 +14,7 @@
 mod commands;
 mod config;
 mod convert;
+mod embed;
 mod feishu;
 mod http;
 mod index;
@@ -21,6 +22,8 @@ mod ingest;
 mod kbmeta;
 mod mcp;
 mod scheduler;
+mod search;
+mod textproc;
 mod vcs;
 mod state;
 mod store;
@@ -68,13 +71,33 @@ pub fn run() {
                 config: cfg_store,
                 store,
                 index: search_index,
+                embedder: Arc::new(embed::Embedder::new()),
                 http_port: Arc::new(Mutex::new(None)),
             };
             app.manage(app_state.clone());
 
-            // 启动时:按 manifest 重建各知识库的 SQLite + tantivy 缓存
+            // 启动时:清理孤儿 → 按 manifest 重建缓存 → 给存量文档补算语义向量
             let rebuild_state = app_state.clone();
             tauri::async_runtime::spawn(async move {
+                // 清理改名 / 删库遗留的孤儿文档记录(SQLite + tantivy)
+                let valid: Vec<String> = rebuild_state
+                    .config
+                    .snapshot()
+                    .knowledge_bases
+                    .iter()
+                    .map(|k| k.id.clone())
+                    .collect();
+                if let Ok(ids) = rebuild_state.store.orphan_doc_ids(&valid) {
+                    if !ids.is_empty() {
+                        for id in &ids {
+                            let _ = rebuild_state.store.delete_document(*id);
+                            let _ = rebuild_state.index.delete(*id);
+                        }
+                        let _ = rebuild_state.index.commit();
+                        println!("[ktree] 清理孤儿文档记录 {} 条", ids.len());
+                    }
+                }
+
                 for kb in rebuild_state.config.snapshot().knowledge_bases {
                     let st = rebuild_state.clone();
                     let _ = tokio::task::spawn_blocking(move || {
@@ -92,6 +115,26 @@ pub fn run() {
                     })
                     .await;
                 }
+
+                // 给还没有语义向量的存量文档后台补算
+                let st = rebuild_state.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let (done, failed) = ingest::backfill_vectors(&st);
+                    if done > 0 || failed > 0 {
+                        println!("[ktree] 语义向量补算完成:成功 {done} 失败 {failed}");
+                    }
+                })
+                .await;
+
+                // 给摘要为空的存量文档补算摘要 / 关键词,并用纯文本重建其索引
+                let st = rebuild_state.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let n = ingest::backfill_meta(&st);
+                    if n > 0 {
+                        println!("[ktree] 摘要 / 关键词补算完成:{n} 篇");
+                    }
+                })
+                .await;
             });
 
             // 启动 HTTP API 服务(局域网可访问)

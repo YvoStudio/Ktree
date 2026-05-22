@@ -2,6 +2,9 @@
 node_modules/
 sidecar/node_modules/
 
+# 语义检索嵌入模型(embed.js 首次运行自动下载并缓存到此)
+sidecar/models/
+
 # Rust / Tauri
 src-tauri/target/
 src-tauri/Cargo.lock.bak

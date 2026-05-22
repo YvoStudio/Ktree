@@ -54,6 +54,49 @@ fn default_source() -> String {
     "upload".to_string()
 }
 
+/// 记事板里的一条公共记事。`note_type`:text(纯文本)/ url(网络链接)/ kblink(知识库链接)。
+/// kblink 时 `kb_id` 为目标知识库,`content` 为相对知识库根的路径。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Note {
+    pub id: i64,
+    pub title: String,
+    pub note_type: String,
+    pub content: String,
+    #[serde(default)]
+    pub kb_id: String,
+    /// 卡片背景色(空 = 默认)。
+    #[serde(default)]
+    pub color: String,
+    /// 是否置顶。
+    #[serde(default)]
+    pub pinned: bool,
+    pub created_at: i64,
+}
+
+/// 新建记事入参(id / 时间戳由 Store 填充)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewNote {
+    #[serde(default)]
+    pub title: String,
+    pub note_type: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub kb_id: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+/// 把小端序列化的 BLOB 还原成 f32 向量。
+fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -88,8 +131,32 @@ impl Store {
                 UNIQUE(kb_id, rel_path)
             );
             CREATE INDEX IF NOT EXISTS idx_documents_kb ON documents(kb_id);
+            CREATE TABLE IF NOT EXISTS doc_vectors (
+                doc_id  INTEGER PRIMARY KEY,
+                dim     INTEGER NOT NULL,
+                vec     BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS notes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                title       TEXT NOT NULL DEFAULT '',
+                note_type   TEXT NOT NULL DEFAULT 'text',
+                content     TEXT NOT NULL DEFAULT '',
+                kb_id       TEXT NOT NULL DEFAULT '',
+                color       TEXT NOT NULL DEFAULT '',
+                pinned      INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL
+            );
             "#,
         )?;
+        // 老库补列(已存在则忽略报错)
+        let _ = conn.execute(
+            "ALTER TABLE notes ADD COLUMN color TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -153,6 +220,16 @@ impl Store {
         }
     }
 
+    /// 只更新一篇文档的 summary / tags(摘要 / 关键词补算用)。
+    pub fn update_meta(&self, id: i64, summary: &str, tags: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE documents SET summary = ?1, tags = ?2, updated_at = ?3 WHERE id = ?4",
+            params![summary, tags, now(), id],
+        )?;
+        Ok(())
+    }
+
     pub fn get_document(&self, id: i64) -> anyhow::Result<Option<Document>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -210,6 +287,7 @@ impl Store {
 
     pub fn delete_document(&self, id: i64) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM doc_vectors WHERE doc_id = ?1", params![id])?;
         let n = conn.execute("DELETE FROM documents WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -217,8 +295,155 @@ impl Store {
     /// 清空某知识库的全部文档记录(缓存重建前用)。
     pub fn delete_by_kb(&self, kb_id: &str) -> anyhow::Result<usize> {
         let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM doc_vectors WHERE doc_id IN
+                (SELECT id FROM documents WHERE kb_id = ?1)",
+            params![kb_id],
+        )?;
         let n = conn.execute("DELETE FROM documents WHERE kb_id = ?1", params![kb_id])?;
         Ok(n)
+    }
+
+    // ----- 语义向量(doc_vectors)-----
+
+    /// 存 / 更新一篇文档的语义向量(f32 按小端序列化成 BLOB)。
+    pub fn set_vector(&self, doc_id: i64, vec: &[f32]) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let bytes: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT INTO doc_vectors (doc_id, dim, vec) VALUES (?1, ?2, ?3)
+             ON CONFLICT(doc_id) DO UPDATE SET dim = ?2, vec = ?3",
+            params![doc_id, vec.len() as i64, bytes],
+        )?;
+        Ok(())
+    }
+
+    /// 取某知识库(None = 全部)所有文档的向量,供检索时暴力算相似度。
+    pub fn all_vectors(&self, kb_id: Option<&str>) -> anyhow::Result<Vec<(i64, Vec<f32>)>> {
+        let conn = self.conn.lock().unwrap();
+        let to_pair =
+            |row: &rusqlite::Row| -> rusqlite::Result<(i64, Vec<u8>)> {
+                Ok((row.get(0)?, row.get(1)?))
+            };
+        let pairs: Vec<(i64, Vec<u8>)> = match kb_id {
+            Some(kb) => {
+                let mut stmt = conn.prepare(
+                    "SELECT v.doc_id, v.vec FROM doc_vectors v
+                     JOIN documents d ON d.id = v.doc_id WHERE d.kb_id = ?1",
+                )?;
+                let rows = stmt.query_map(params![kb], to_pair)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare("SELECT doc_id, vec FROM doc_vectors")?;
+                let rows = stmt.query_map([], to_pair)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(pairs
+            .into_iter()
+            .map(|(id, bytes)| (id, bytes_to_vec(&bytes)))
+            .collect())
+    }
+
+    /// 列出 kb_id 已不在配置里的孤儿文档 id —— 知识库改名 / 删除会留下这些。
+    pub fn orphan_doc_ids(&self, valid_kb_ids: &[String]) -> anyhow::Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, kb_id FROM documents")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, kb) = r?;
+            if !valid_kb_ids.iter().any(|v| v == &kb) {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    // ----- 记事板(notes)-----
+
+    /// 列出全部公共记事,最新的在前。
+    pub fn list_notes(&self) -> anyhow::Result<Vec<Note>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, note_type, content, kb_id, color, pinned, created_at
+             FROM notes ORDER BY pinned DESC, created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Note {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                note_type: r.get(2)?,
+                content: r.get(3)?,
+                kb_id: r.get(4)?,
+                color: r.get(5)?,
+                pinned: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 新增一条公共记事,返回完整 Note。
+    pub fn add_note(&self, n: &NewNote) -> anyhow::Result<Note> {
+        let conn = self.conn.lock().unwrap();
+        let ts = now();
+        conn.execute(
+            "INSERT INTO notes (title, note_type, content, kb_id, color, pinned, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![n.title, n.note_type, n.content, n.kb_id, n.color, n.pinned, ts],
+        )?;
+        Ok(Note {
+            id: conn.last_insert_rowid(),
+            title: n.title.clone(),
+            note_type: n.note_type.clone(),
+            content: n.content.clone(),
+            kb_id: n.kb_id.clone(),
+            color: n.color.clone(),
+            pinned: n.pinned,
+            created_at: ts,
+        })
+    }
+
+    /// 更新一条公共记事,返回是否命中。
+    pub fn update_note(&self, id: i64, n: &NewNote) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE notes SET title = ?1, note_type = ?2, content = ?3, kb_id = ?4,
+                color = ?5, pinned = ?6 WHERE id = ?7",
+            params![n.title, n.note_type, n.content, n.kb_id, n.color, n.pinned, id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// 删除一条公共记事。
+    pub fn delete_note(&self, id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// 列出还没有语义向量的文档(供启动时给存量文档补算)。
+    pub fn docs_missing_vector(&self) -> anyhow::Result<Vec<Document>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT d.* FROM documents d
+             LEFT JOIN doc_vectors v ON v.doc_id = d.id
+             WHERE v.doc_id IS NULL",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_doc)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// 统计文档数;kb_id 为 None 时统计全部。

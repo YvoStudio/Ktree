@@ -2322,6 +2322,7 @@ dependencies = [
  "axum",
  "dirs 5.0.1",
  "image",
+ "jieba-rs",
  "md-5",
  "mime_guess",
  "rusqlite",

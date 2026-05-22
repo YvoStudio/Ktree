@@ -77,7 +77,73 @@
   .nav-fav:hover { background:#efefef; color:#111; }
   .nav-fav.active { background:var(--accent-bg); color:var(--accent); font-weight:500; }
   .nav-fav .star { color:var(--star); width:15px; height:15px; }
+  .nav-fav .nico { width:15px; height:15px; flex-shrink:0; }
+  #navNotes { margin-top:10px; }
   .kb-list { flex:1; padding:4px 8px; }
+
+  /* 记事板 */
+  .notes-view { padding:18px 22px; }
+  @keyframes noteFlash { from { background:#fff3c4; } to { background:#fff; } }
+  .note-card.flash { animation:noteFlash 1.9s ease; }
+  .note-form { background:#fff; border:1px solid #e6e6e6; border-radius:10px;
+    padding:14px; margin-bottom:18px; display:flex; flex-direction:column; gap:10px; }
+  .note-form input, .note-form textarea, .note-form select {
+    font:inherit; padding:7px 10px; border:1px solid #ddd; border-radius:7px; }
+  .note-form textarea { min-height:80px; resize:vertical; }
+  .nf-row { display:flex; gap:10px; }
+  .nf-row select, .nf-row input { flex:1; min-width:0; }
+  .nf-actions { display:flex; justify-content:flex-end; gap:10px; }
+  .notes-section { margin-bottom:22px; }
+  .notes-section h4 { font-size:13px; color:#888; font-weight:600; margin:0 0 10px; }
+  .notes-list { display:grid; gap:10px;
+    grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); }
+  .note-card { box-sizing:border-box;
+    position:relative; background:#fff; border:1px solid #ececec;
+    border-radius:9px; padding:8px 32px 8px 13px; cursor:pointer; }
+  .note-card:hover { border-color:#d8c9ee; background:#faf9fc; }
+  .note-title { font-size:17px; font-weight:600; color:#222; margin-bottom:3px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .note-line { font-size:12.5px; color:#8a8a8a;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .note-actions { position:absolute; top:5px; right:6px; display:flex; gap:1px;
+    opacity:0; transition:opacity .12s ease; }
+  .note-card:hover .note-actions { opacity:1; }
+  .note-act { border:none; background:none; color:#b4b4b4; cursor:pointer;
+    line-height:1; padding:3px 5px; border-radius:4px; display:flex; align-items:center; }
+  .note-act svg { width:14px; height:14px; display:block; }
+  .note-act:hover { background:#ececec; color:#555; }
+  .note-act.del:hover { background:#fdeaea; color:#dc2626; }
+  .note-ic { display:inline-flex; vertical-align:-2px; margin-right:4px; color:#a0a0a0; }
+  .note-ic svg { width:13px; height:13px; }
+  .note-act.on { color:#5b21b6; }
+  .note-card.pinned { border-color:#d8c9ee; }
+  @keyframes noteSelPulse {
+    0%   { box-shadow:0 0 0 2px rgba(91,33,182,.55), 0 0 0 4px rgba(91,33,182,.22); }
+    70%  { box-shadow:0 0 0 2px rgba(91,33,182,.55), 0 0 0 13px rgba(91,33,182,0); }
+    100% { box-shadow:0 0 0 2px rgba(91,33,182,.55), 0 0 0 13px rgba(91,33,182,0); }
+  }
+  .note-card.selected { border-color:#5b21b6;
+    animation:noteSelPulse 1.8s ease-out infinite; }
+  .note-pin-mark { display:inline-flex; vertical-align:-2px; margin-right:4px; color:#5b21b6; }
+  .note-pin-mark svg { width:13px; height:13px; }
+  .nf-mode { font-size:13px; font-weight:600; color:#666; }
+  .nf-colors { display:flex; gap:7px; align-items:center; }
+  .nf-color { width:22px; height:22px; border-radius:50%; cursor:pointer;
+    box-sizing:border-box; border:2px solid transparent; }
+  .nf-color.sel { border-color:#5b21b6; }
+  .nf-color.none { background:#fff; border:1px solid #ddd; }
+  .nf-color.none.sel { border:2px solid #5b21b6; }
+  .notes-empty { color:#bbb; font-size:13px; padding:6px 2px; }
+  .note-modal-ov { position:fixed; inset:0; background:rgba(0,0,0,.42);
+    display:flex; align-items:center; justify-content:center; z-index:300; }
+  .note-modal { background:#fff; border-radius:12px; padding:20px 22px;
+    width:540px; max-width:90vw; max-height:80vh; display:flex; flex-direction:column;
+    box-shadow:0 16px 56px rgba(0,0,0,.3); }
+  .note-modal-title { font-size:16px; font-weight:600; color:#111; margin-bottom:12px;
+    word-break:break-word; }
+  .note-modal-body { white-space:pre-wrap; word-break:break-word; overflow:auto;
+    font-size:14px; line-height:1.7; color:#333; }
+  .note-modal-foot { display:flex; justify-content:flex-end; margin-top:16px; }
   .kb-node { margin-bottom:2px; }
   .kb-head { display:flex; align-items:center; gap:6px; padding:7px 10px; border-radius:7px;
     cursor:pointer; font-weight:600; color:#333; font-size:14px; }
@@ -120,6 +186,18 @@
     background:#ececec; font-size:13px; color:#333; outline:none; transition:.15s; }
   .search-input:focus { width:260px; background:#fff; box-shadow:0 0 0 1.5px #c7b8e0; }
   .search-input::placeholder { color:#aaa; }
+  .search-wrap { position:relative; }
+  .search-hist { position:absolute; top:calc(100% + 4px); left:0; right:0;
+    background:#fff; border:1px solid #e2e2e2; border-radius:8px;
+    box-shadow:0 8px 26px rgba(0,0,0,.14); z-index:60; overflow:hidden;
+    max-height:320px; overflow-y:auto; }
+  .sh-head { display:flex; justify-content:space-between; padding:6px 11px;
+    font-size:11px; color:#aaa; }
+  .sh-clear { cursor:pointer; }
+  .sh-clear:hover { color:#dc2626; }
+  .sh-item { padding:7px 11px; font-size:13px; color:#444; cursor:pointer;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sh-item:hover { background:#f2f0f7; color:#111; }
   .content { flex:1; overflow-y:auto; position:relative; padding:8px 24px 24px; }
   .content.drag-over::after { content:"松开上传文件 / 文件夹到当前目录"; position:absolute; inset:8px;
     border:2px dashed var(--accent); border-radius:12px; background:rgba(232,224,240,.5);
@@ -339,6 +417,10 @@
     <div class="brand"><img src="/favicon.svg" alt="" />Ktree
       <button class="brand-ops" id="btnOps" title="操作…">⋮</button>
     </div>
+    <div class="nav-fav" id="navNotes">
+      <svg class="nico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h9l4 4v14H6z"/><path d="M9 9h6M9 13h6M9 17h4"/></svg>
+      <span>记事板</span>
+    </div>
     <div class="nav-fav" id="navFav">
       <svg class="star" viewBox="0 0 24 24"><path d="M12 3l2.7 5.5 6 .9-4.3 4.2 1 6-5.4-2.8-5.4 2.8 1-6L3.3 9.4l6-.9z" fill="currentColor"/></svg>
       <span>我的收藏</span><span id="favCount" style="margin-left:auto;color:#999;font-size:12px"></span>
@@ -352,7 +434,11 @@
     <div class="topbar">
       <div class="breadcrumb" id="breadcrumb"></div>
       <div class="topbar-actions">
-        <input type="text" id="globalSearch" class="search-input" placeholder="搜索… (回车)" />
+        <button class="btn" id="btnNewNote" style="display:none">＋ 新增记事</button>
+        <div class="search-wrap">
+          <input type="text" id="globalSearch" class="search-input" placeholder="搜索… (回车)" autocomplete="off" />
+          <div class="search-hist" id="searchHist" style="display:none"></div>
+        </div>
         <div class="vs-wrap">
           <button class="btn ghost" id="btnVS"><span id="btnVSLabel">列表</span> ▾</button>
           <div class="vs-menu" id="vsMenu" style="display:none"></div>
@@ -456,6 +542,32 @@ function saveLS(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); }catch(e){
 // key = "知识库名/相对路径";文件夹 key 末尾带 / 以与同名文件区分
 function fkey(kb,rp,isFolder){ return kb+'/'+rp+(isFolder?'/':''); }
 
+// ---------- 导航树状态持久化 ----------
+// 没存过折叠状态 = 首次访问;该标记整个会话内固定。
+let FIRST_VISIT = localStorage.getItem('ktree-tree-collapsed')===null;
+// 把折叠 / 展开 / 当前目录存进 localStorage,刷新后能停在原位。
+function saveTreeState(){
+  saveLS('ktree-tree-collapsed', [...COLLAPSED]);
+  saveLS('ktree-tree-expanded', [...EXPANDED]);
+  saveLS('ktree-cur', { kb:CUR_KB, path:CUR_PATH });
+}
+function restoreTreeState(){
+  try {
+    const c=JSON.parse(localStorage.getItem('ktree-tree-collapsed'));
+    if(Array.isArray(c)) COLLAPSED=new Set(c);
+    const e=JSON.parse(localStorage.getItem('ktree-tree-expanded'));
+    if(Array.isArray(e)) EXPANDED=new Set(e);
+    const cur=JSON.parse(localStorage.getItem('ktree-cur'));
+    if(cur&&cur.kb){ CUR_KB=cur.kb; CUR_PATH=cur.path||'src'; }
+  } catch(e){}
+}
+// 首次访问:某知识库的树里所有目录都收起。
+function applyFirstVisitCollapse(kbId){
+  for(const f of (TREES[kbId]||[])){
+    COLLAPSED.add(kbId+'|'+f);
+  }
+}
+
 function toast(msg,ms=2400){
   const t=document.getElementById('toast');
   t.textContent=msg; t.classList.add('show');
@@ -531,6 +643,7 @@ async function copyText(text){
 // ---------- 面包屑 ----------
 function renderCrumb(){
   const bc=document.getElementById('breadcrumb');
+  if(VIEW==='notes'){ bc.innerHTML='<span class="cur">记事板</span>'; return; }
   const kb=KBS.find(k=>k.id===CUR_KB);
   if(!kb){ bc.innerHTML='<span class="cur">'+(KBS.length?'选择目录':'还没有知识库')+'</span>'; return; }
   let h=`<a data-nav data-kb="${esc(kb.id)}" data-path="">${esc(kb.name)}</a>`;
@@ -791,7 +904,7 @@ async function renderOpsList(host){
           const sub=b.sub_dir?`src/${esc(b.sub_dir)}`:'src';
           row.innerHTML=`
             <div class="vcs-info">
-              <code>${esc(b.vcs_type)}</code> · ${sub} ← ${esc(b.url)}
+              <code>${esc(b.vcs_type)}</code> · ${sub} ← ${esc(b.url)}${b.repo_sub_path?(' :: '+esc(b.repo_sub_path)):''}
               ${b.branch?` <span style="color:#aaa">[${esc(b.branch)}]</span>`:''}
               ${b.has_credentials?' <span style="color:#888;font-size:11px">(自定义凭证)</span>':''}
             </div>
@@ -824,7 +937,7 @@ function formatVcsReport(r){
   if(!r) return '(无报告)';
   const sub=r.sub_dir?('src/'+r.sub_dir):'src';
   const lines=[
-    `[${r.vcs_type}] ${r.url} → ${sub}`,
+    `[${r.vcs_type}] ${r.url}${r.repo_sub_path?(' :: '+r.repo_sub_path):''} → ${sub}`,
     `  修订: ${r.revision||'(空)'}`,
     `  新增 ${r.added.length}  更新 ${r.updated.length}  删除 ${r.deleted.length}  失败 ${r.failed.length}`,
   ];
@@ -850,8 +963,31 @@ async function boot(){
   updateFavCount();
   // 拉自定义域名:复制地址会优先用它替代 location.origin
   try { CUSTOM_DOMAIN=(await api('/api/env')).custom_domain||''; } catch(e){ CUSTOM_DOMAIN=''; }
+  restoreTreeState(); // 刷新后恢复折叠 / 展开 / 当前目录
   await loadKbs();
-  if(KBS.length){ EXPANDED.add(KBS[0].id); await selectKbRoot(KBS[0].id); }
+  // web 链接直达记事板 / 某条公共记事
+  const noteRoute=parseHash();
+  if(noteRoute){ showNotes(noteRoute.id||undefined); return; }
+  // 首次打开默认进记事板,知识库目录保持合上
+  if(FIRST_VISIT){ showNotes(); return; }
+  if(KBS.length){
+    if(!FIRST_VISIT && CUR_KB && KBS.some(k=>k.id===CUR_KB)){
+      // 刷新:回到上次停留的位置,加载所有展开过的知识库的树
+      EXPANDED.add(CUR_KB);
+      for(const id of [...EXPANDED]){
+        if(KBS.some(k=>k.id===id)) await loadTree(id);
+      }
+      renderSidebar();
+      selectFolder(CUR_KB, CUR_PATH);
+    } else {
+      // 首次访问:展开第一个知识库,树里只开 docs
+      const first=KBS[0].id;
+      EXPANDED.add(first);
+      await loadTree(first);
+      renderSidebar();
+      selectFolder(first, 'docs');
+    }
+  }
   else {
     renderCrumb();
     document.getElementById('listArea').innerHTML=
@@ -908,35 +1044,45 @@ function renderSidebar(){
     function toggle(){
       const car=t.querySelector('.t-caret'); // 叶子节点没有 caret → 不切换
       if(!car) return;
-      const k=t.dataset.kb+'|'+t.dataset.path;
-      if(COLLAPSED.has(k)) COLLAPSED.delete(k); else COLLAPSED.add(k);
+      const kb=t.dataset.kb, path=t.dataset.path, k=kb+'|'+path;
+      if(COLLAPSED.has(k)){
+        COLLAPSED.delete(k);
+      } else {
+        COLLAPSED.add(k);
+        // 合上一个目录时,连带合上其下所有已展开的子目录 —— 再展开时子目录都是收起状态
+        for(const f of (TREES[kb]||[])){
+          if(f.startsWith(path+'/')) COLLAPSED.add(kb+'|'+f);
+        }
+      }
       renderSidebar();
+      saveTreeState();
     }
     t.addEventListener('click',e=>{
       if(e.target.closest('.t-caret')){ e.stopPropagation(); toggle(); return; }
       selectFolder(t.dataset.kb,t.dataset.path);
+      toggle(); // 单击目录:进入该目录的同时展开 / 合上它
     });
-    t.addEventListener('dblclick',e=>{ e.preventDefault(); toggle(); });
   });
 }
 async function toggleKb(kbId){
   if(EXPANDED.has(kbId)) EXPANDED.delete(kbId);
   else { EXPANDED.add(kbId); await loadTree(kbId); }
   renderSidebar();
+  saveTreeState();
 }
 async function loadTree(kbId){
   try { TREES[kbId]=(await api('/api/tree?kb='+encodeURIComponent(kbId))).folders||[]; }
   catch(e){ TREES[kbId]=[]; }
+  if(FIRST_VISIT) applyFirstVisitCollapse(kbId);
 }
 
 // ---------- 选择目录 ----------
-async function selectKbRoot(kbId){
-  if(!EXPANDED.has(kbId)) EXPANDED.add(kbId);
-  await loadTree(kbId);
-  selectFolder(kbId,'src');
-}
 function selectFolder(kbId,path){
   VIEW='list'; CUR_KB=kbId; CUR_PATH=path||'src';
+  document.getElementById('navNotes').classList.remove('active');
+  document.getElementById('btnNewNote').style.display='none';
+  clearHash();
+  saveTreeState();
   loadDir();
 }
 
@@ -1195,13 +1341,385 @@ document.getElementById('navFav').addEventListener('click', openDrawer);
 document.getElementById('drawerClose').addEventListener('click', closeDrawer);
 document.getElementById('drawerOv').addEventListener('click', closeDrawer);
 
+// ---------- 记事板 ----------
+// 公共记事走 /api/notes(所有人可见可增删改);本地记事存浏览器 localStorage。
+const NOTES_LS = 'ktree-notes-local';
+let NOTES_PUB = [], NOTES_LOC = [], NOTE_EDIT = null; // NOTE_EDIT: {id, scope} 表示编辑中
+let NOTE_FOCUS = null;    // 一次性:渲染后滚动 + 闪烁的公共记事 id
+let NOTE_SELECTED = null; // 持久:来自 web 链接选中高亮的公共记事 id
+let NOTE_FORM_COLOR = ''; // 表单当前选中的卡片背景色
+const NOTE_COLORS = ['', '#fff3c4', '#ddf5e1', '#dbeafe', '#f3e0f7', '#fde4e4', '#e7e9ec'];
+// 扁平单色 SVG 图标(currentColor 跟随)
+const NOTE_IC = {
+  copy:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg>',
+  edit:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg>',
+  del:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  url:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 15l6-6M11 6l1-1a4 4 0 0 1 6 6l-1 1M13 18l-1 1a4 4 0 0 1-6-6l1-1"/></svg>',
+  kb:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h9l4 4v14H6z"/><path d="M9 9h6M9 13h5"/></svg>',
+  pin:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4h6l-1 7 3 3v2H7v-2l3-3z"/><path d="M12 16v4"/></svg>',
+};
+function localNotes(){ try{ return JSON.parse(localStorage.getItem(NOTES_LS))||[]; }catch(e){ return []; } }
+function saveLocalNotes(arr){ saveLS(NOTES_LS, arr); }
+
+// 解析 URL hash:#notes → 记事板;#note/<id> → 记事板并定位某条公共记事。
+function parseHash(){
+  const h=(location.hash||'').replace(/^#/,'');
+  if(h==='notes') return { id:null };
+  const m=h.match(/^note\/(.+)$/);
+  if(m){ try{ return { id:decodeURIComponent(m[1]) }; }catch(e){ return { id:m[1] }; } }
+  return null;
+}
+// 离开记事板时清掉 hash,避免刷新又跳回记事板。
+function clearHash(){
+  if(location.hash) history.replaceState(null,'',location.pathname+location.search);
+}
+async function copyNoteLink(id){
+  const url=(CUSTOM_DOMAIN||location.origin)+'/#note/'+encodeURIComponent(id);
+  toast(await copyText(url) ? '已复制记事链接' : ('复制失败:'+url));
+}
+
+function showNotes(focusId){
+  VIEW='notes';
+  NOTE_FOCUS = focusId || null;
+  NOTE_SELECTED = focusId || null;
+  location.hash = focusId ? ('note/'+encodeURIComponent(focusId)) : 'notes';
+  document.getElementById('navNotes').classList.add('active');
+  renderSidebar();
+  renderCrumb();
+  // 顶栏:显示「新增记事」,隐藏文件 / 上传相关按钮
+  document.getElementById('btnNewNote').style.display='';
+  document.getElementById('btnUpload').style.display='none';
+  document.getElementById('btnUploadFolder').style.display='none';
+  document.getElementById('btnNewFolder').style.display='none';
+  document.getElementById('listArea').innerHTML = `
+    <div class="notes-view">
+      <div class="note-form" id="noteForm" style="display:none">
+        <div class="nf-mode" id="nfMode">新增记事</div>
+        <div class="nf-row">
+          <input type="text" id="nfTitle" placeholder="标题" autocomplete="off" />
+          <select id="nfType" style="flex:0 0 150px">
+            <option value="text">纯文本</option>
+            <option value="url">网络链接</option>
+            <option value="kblink">知识库链接</option>
+          </select>
+          <select id="nfScope" style="flex:0 0 170px">
+            <option value="local">本地(仅自己可见)</option>
+            <option value="public">公共(所有人可见)</option>
+          </select>
+        </div>
+        <textarea id="nfText" placeholder="文本内容…"></textarea>
+        <input type="text" id="nfUrl" placeholder="https://…" autocomplete="off" style="display:none" />
+        <input type="text" id="nfKbUrl" placeholder="粘贴知识库 web 链接,如 http://host:8080/知识库名/docs/…" autocomplete="off" style="display:none" />
+        <div class="nf-row" style="align-items:center">
+          <span style="font-size:12px;color:#888">卡片颜色</span>
+          <div class="nf-colors" id="nfColors"></div>
+        </div>
+        <div class="nf-actions">
+          <button class="btn ghost" id="nfCancel">取消</button>
+          <button class="btn" id="nfSave">保存</button>
+        </div>
+      </div>
+      <div class="notes-section"><h4>公共记事</h4><div id="notesPublic" class="notes-list"></div></div>
+      <div class="notes-section"><h4>本地记事</h4><div id="notesLocal" class="notes-list"></div></div>
+    </div>`;
+  bindNoteForm();
+  loadNotes();
+}
+
+function syncNoteType(){
+  const t=document.getElementById('nfType').value;
+  document.getElementById('nfText').style.display = t==='text'?'':'none';
+  document.getElementById('nfUrl').style.display  = t==='url'?'':'none';
+  document.getElementById('nfKbUrl').style.display= t==='kblink'?'':'none';
+}
+
+// 渲染表单里的颜色选择块。
+function renderNoteColors(){
+  const box=document.getElementById('nfColors');
+  if(!box) return;
+  box.innerHTML = NOTE_COLORS.map(c=>{
+    const sel = (c===NOTE_FORM_COLOR) ? ' sel' : '';
+    const cls = c ? ('nf-color'+sel) : ('nf-color none'+sel);
+    return `<div class="${cls}" data-color="${c}" style="${c?('background:'+c):''}" title="${c||'无色'}"></div>`;
+  }).join('');
+  box.querySelectorAll('.nf-color').forEach(el=>{
+    el.onclick=()=>{ NOTE_FORM_COLOR=el.dataset.color||''; renderNoteColors(); };
+  });
+}
+
+function bindNoteForm(){
+  document.getElementById('btnNewNote').onclick=()=>{
+    const f=document.getElementById('noteForm');
+    if(!f) return;
+    const willShow = f.style.display==='none';
+    resetNoteForm();
+    if(willShow) f.style.display='';
+  };
+  document.getElementById('nfCancel').onclick=resetNoteForm;
+  document.getElementById('nfType').onchange=syncNoteType;
+  document.getElementById('nfSave').onclick=saveNote;
+  renderNoteColors();
+}
+
+// 重置表单到「新增」初始态并隐藏。
+function resetNoteForm(){
+  NOTE_EDIT=null;
+  NOTE_FORM_COLOR='';
+  const md=document.getElementById('nfMode'); if(md) md.textContent='新增记事';
+  ['nfTitle','nfText','nfUrl','nfKbUrl'].forEach(id=>{ const e=document.getElementById(id); if(e) e.value=''; });
+  const sc=document.getElementById('nfScope'); if(sc) sc.disabled=false;
+  const ty=document.getElementById('nfType'); if(ty) ty.value='text';
+  syncNoteType();
+  renderNoteColors();
+  const f=document.getElementById('noteForm'); if(f) f.style.display='none';
+}
+
+// 收集表单 → {title, note_type, content, kb_id, color};不合法时提示并返回 null。
+function collectNote(){
+  const title=document.getElementById('nfTitle').value.trim();
+  const type=document.getElementById('nfType').value;
+  let content='', kb_id='';
+  if(type==='text') content=document.getElementById('nfText').value.trim();
+  else if(type==='url'){
+    content=document.getElementById('nfUrl').value.trim();
+    if(content && !/^https?:\/\//i.test(content)) content='http://'+content;
+  } else {
+    const parsed=parseKbUrl(document.getElementById('nfKbUrl').value);
+    if(!parsed){ toast('无法识别知识库链接'); return null; }
+    if(!KBS.find(k=>k.id===parsed.kb)){ toast('链接里的知识库「'+parsed.kb+'」不存在'); return null; }
+    kb_id=parsed.kb; content=parsed.path;
+  }
+  if(!title && !content){ toast('标题和内容不能都为空'); return null; }
+  return { title, note_type:type, content, kb_id, color:NOTE_FORM_COLOR };
+}
+
+async function saveNote(){
+  const data=collectNote();
+  if(!data) return;
+  const editing=NOTE_EDIT;
+  const scope = editing ? editing.scope : document.getElementById('nfScope').value;
+  if(editing){
+    // 编辑是整体替换,保留原置顶状态(置顶是卡片操作、不在表单里)
+    const orig=findNote(editing.id, editing.scope);
+    data.pinned = orig ? !!orig.pinned : false;
+  }
+  if(scope==='local'){
+    const arr=localNotes();
+    if(editing){
+      const i=arr.findIndex(n=>String(n.id)===String(editing.id));
+      if(i>=0) arr[i]={ ...arr[i], ...data };
+    } else {
+      arr.unshift({ id:Date.now(), ...data, created_at:Math.floor(Date.now()/1000) });
+    }
+    saveLocalNotes(arr);
+  } else {
+    try {
+      const path = editing ? '/api/notes/'+encodeURIComponent(editing.id) : '/api/notes';
+      await api(path,{ method: editing?'PUT':'POST',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify(data) });
+    } catch(e){ toast('保存失败:'+e); return; }
+  }
+  resetNoteForm();
+  loadNotes();
+}
+
+async function loadNotes(){
+  try { NOTES_PUB=(await api('/api/notes')).notes||[]; } catch(e){ NOTES_PUB=[]; }
+  // 本地记事:置顶的排前面(公共记事后端已按 pinned 排序)
+  NOTES_LOC=localNotes().slice().sort((a,b)=>(b.pinned?1:0)-(a.pinned?1:0));
+  const pb=document.getElementById('notesPublic');
+  if(pb) pb.innerHTML = NOTES_PUB.length
+    ? NOTES_PUB.map(n=>noteCard(n,'public')).join('') : '<div class="notes-empty">暂无公共记事</div>';
+  const lb=document.getElementById('notesLocal');
+  if(lb) lb.innerHTML = NOTES_LOC.length
+    ? NOTES_LOC.map(n=>noteCard(n,'local')).join('') : '<div class="notes-empty">暂无本地记事</div>';
+  // 来自 web 链接的定位:滚动并高亮那条公共记事
+  if(NOTE_FOCUS){
+    const id=NOTE_FOCUS; NOTE_FOCUS=null;
+    const card=document.querySelector('.note-card[data-id="'+id+'"][data-scope="public"]');
+    if(card){
+      card.scrollIntoView({ block:'center', behavior:'smooth' });
+      card.classList.add('flash');
+      setTimeout(()=>card.classList.remove('flash'), 1900);
+    }
+  }
+}
+
+function findNote(id, scope){
+  const arr = scope==='public' ? NOTES_PUB : NOTES_LOC;
+  return arr.find(n=>String(n.id)===String(id));
+}
+
+function noteCard(n, scope){
+  let line;
+  if(n.note_type==='url') line='<span class="note-ic">'+NOTE_IC.url+'</span>'+esc(n.content);
+  else if(n.note_type==='kblink') line='<span class="note-ic">'+NOTE_IC.kb+'</span>'+esc(n.kb_id)+' / '+esc(n.content||'(根目录)');
+  else line=esc((n.content||'').replace(/\s+/g,' '));
+  const pinned = !!n.pinned;
+  const selCls = (scope==='public' && NOTE_SELECTED!=null
+    && String(n.id)===String(NOTE_SELECTED)) ? ' selected' : '';
+  const bg = n.color ? ` style="background:${esc(n.color)}"` : '';
+  const copyBtn = scope==='public'
+    ? `<button class="note-act" data-act="notecopy" data-id="${n.id}" title="复制链接">${NOTE_IC.copy}</button>` : '';
+  const mark = pinned ? '<span class="note-pin-mark">'+NOTE_IC.pin+'</span>' : '';
+  const titleHtml = (n.title || pinned)
+    ? `<div class="note-title">${mark}${esc(n.title||'')}</div>` : '';
+  return `<div class="note-card${pinned?' pinned':''}${selCls}" data-act="notecard" data-id="${n.id}" data-scope="${scope}"${bg}>
+    <div class="note-actions">
+      <button class="note-act${pinned?' on':''}" data-act="notepin" data-id="${n.id}" data-scope="${scope}" title="${pinned?'取消置顶':'置顶'}">${NOTE_IC.pin}</button>
+      ${copyBtn}
+      <button class="note-act" data-act="noteedit" data-id="${n.id}" data-scope="${scope}" title="编辑">${NOTE_IC.edit}</button>
+      <button class="note-act del" data-act="notedel" data-id="${n.id}" data-scope="${scope}" title="删除">${NOTE_IC.del}</button>
+    </div>
+    ${titleHtml}
+    <div class="note-line">${line||'(空)'}</div>
+  </div>`;
+}
+
+// 卡片点击:文本弹窗显示全文,网络链接新标签打开,知识库链接本页跳转。
+function openNote(n){
+  if(n.note_type==='url'){ if(n.content) window.open(n.content,'_blank'); }
+  else if(n.note_type==='kblink'){ gotoKbLink(n.kb_id, n.content); }
+  else showNoteDetail(n.title, n.content);
+}
+
+// 把一条记事载入表单进入编辑态。
+function startEditNote(id, scope){
+  const n=findNote(id, scope);
+  if(!n) return;
+  NOTE_EDIT={ id, scope };
+  NOTE_FORM_COLOR = n.color || '';
+  document.getElementById('nfMode').textContent='编辑记事';
+  document.getElementById('nfTitle').value=n.title||'';
+  document.getElementById('nfType').value=n.note_type;
+  const sc=document.getElementById('nfScope');
+  sc.value = scope==='public'?'public':'local';
+  sc.disabled=true; // 编辑时归属锁定
+  document.getElementById('nfText').value = n.note_type==='text'?(n.content||''):'';
+  document.getElementById('nfUrl').value  = n.note_type==='url'?(n.content||''):'';
+  document.getElementById('nfKbUrl').value = n.note_type==='kblink'
+    ? (CUSTOM_DOMAIN||location.origin)+rawUrl(n.content||'', n.kb_id) : '';
+  syncNoteType();
+  renderNoteColors();
+  document.getElementById('noteForm').style.display='';
+}
+
+// 切换一条记事的置顶状态。
+async function togglePin(id, scope){
+  const n=findNote(id, scope);
+  if(!n) return;
+  const np=!n.pinned;
+  if(scope==='local'){
+    const arr=localNotes();
+    const i=arr.findIndex(x=>String(x.id)===String(id));
+    if(i>=0){ arr[i].pinned=np; saveLocalNotes(arr); }
+  } else {
+    try {
+      await api('/api/notes/'+encodeURIComponent(id),{ method:'PUT',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ title:n.title, note_type:n.note_type, content:n.content,
+          kb_id:n.kb_id, color:n.color, pinned:np }) });
+    } catch(e){ toast('操作失败:'+e); return; }
+  }
+  loadNotes();
+}
+
+async function deleteNote(id, scope){
+  if(scope==='local'){
+    saveLocalNotes(localNotes().filter(n=>String(n.id)!==String(id)));
+  } else {
+    try { await api('/api/notes/'+encodeURIComponent(id),{method:'DELETE'}); }
+    catch(e){ toast('删除失败:'+e); return; }
+  }
+  if(NOTE_EDIT && String(NOTE_EDIT.id)===String(id) && NOTE_EDIT.scope===scope) resetNoteForm();
+  loadNotes();
+}
+
+// 解析知识库 web 链接 → {kb, path}。支持完整 URL 或站内 /知识库/路径。
+function parseKbUrl(u){
+  const s=(u||'').trim();
+  if(!s) return null;
+  let pathname;
+  try {
+    pathname = /^https?:\/\//i.test(s) ? new URL(s).pathname : (s.startsWith('/')?s:'/'+s);
+  } catch(e){ return null; }
+  const segs=pathname.split('/').filter(Boolean)
+    .map(x=>{ try{ return decodeURIComponent(x); }catch(e){ return x; } });
+  if(!segs.length) return null;
+  return { kb:segs[0], path:segs.slice(1).join('/') };
+}
+
+// 知识库链接点击:本页跳到目标位置(像文件名带扩展名走预览,否则当目录)
+async function gotoKbLink(kb, path){
+  document.getElementById('navNotes').classList.remove('active');
+  clearHash();
+  if(!KBS.find(k=>k.id===kb)){ toast('知识库「'+kb+'」不存在'); return; }
+  const p=(path||'').trim();
+  const last=p.split('/').pop()||'';
+  if(last.includes('.')){
+    VIEW='list';
+    previewFile(rawUrl(p,kb), last);
+  } else {
+    if(!EXPANDED.has(kb)){ EXPANDED.add(kb); await loadTree(kb); }
+    selectFolder(kb, p||'docs');
+  }
+}
+
+// 文本记事弹窗:显示完整标题 + 内容。
+function showNoteDetail(title, content){
+  const ov=document.createElement('div');
+  ov.className='note-modal-ov';
+  ov.innerHTML=`<div class="note-modal">
+    <div class="note-modal-title">${esc(title||'记事')}</div>
+    <div class="note-modal-body">${esc(content||'')}</div>
+    <div class="note-modal-foot"><button class="btn" data-close="1">关闭</button></div>
+  </div>`;
+  ov.addEventListener('click',e=>{ if(e.target===ov||e.target.dataset.close) ov.remove(); });
+  document.body.appendChild(ov);
+}
+
+document.getElementById('navNotes').addEventListener('click', ()=>showNotes());
+
 // ---------- 搜索 ----------
 const gs=document.getElementById('globalSearch');
 gs.addEventListener('keydown',e=>{ if(e.key==='Enter') doSearch(); });
+// 搜索历史(localStorage,最近 12 条)
+function searchHistory(){ try{ return JSON.parse(localStorage.getItem('ktree-search-hist'))||[]; }catch(e){ return []; } }
+function pushSearchHistory(q){
+  q=(q||'').trim(); if(!q) return;
+  const h=searchHistory().filter(x=>x!==q);
+  h.unshift(q);
+  saveLS('ktree-search-hist', h.slice(0,12));
+}
+function hideSearchHist(){ const b=document.getElementById('searchHist'); if(b) b.style.display='none'; }
+function showSearchHist(){
+  const box=document.getElementById('searchHist');
+  const h=searchHistory();
+  if(!h.length){ hideSearchHist(); return; }
+  box.innerHTML='<div class="sh-head"><span>搜索历史</span><span class="sh-clear">清空</span></div>'
+    + h.map(()=>'<div class="sh-item"></div>').join('');
+  const items=box.querySelectorAll('.sh-item');
+  h.forEach((q,i)=>{
+    items[i].textContent=q;
+    items[i].onmousedown=ev=>{ ev.preventDefault(); gs.value=q; hideSearchHist(); doSearch(); };
+  });
+  box.querySelector('.sh-clear').onmousedown=ev=>{
+    ev.preventDefault(); localStorage.removeItem('ktree-search-hist'); showSearchHist();
+  };
+  box.style.display='';
+}
+gs.addEventListener('focus', showSearchHist);
+gs.addEventListener('blur', ()=>setTimeout(hideSearchHist,150));
 async function doSearch(){
   const q=gs.value.trim();
   if(!q){ if(CUR_KB) selectFolder(CUR_KB,CUR_PATH); return; }
-  VIEW='search'; LAST_QUERY=q; renderCrumb(); renderSidebar();
+  pushSearchHistory(q);
+  hideSearchHist();
+  VIEW='search'; LAST_QUERY=q;
+  document.getElementById('navNotes').classList.remove('active');
+  document.getElementById('btnNewNote').style.display='none';
+  clearHash();
+  renderCrumb(); renderSidebar();
   document.getElementById('btnUpload').style.display='none';
   document.getElementById('btnUploadFolder').style.display='none';
   document.getElementById('btnNewFolder').style.display='none';
@@ -1249,6 +1767,11 @@ document.getElementById('listArea').addEventListener('click',e=>{
   else if(act==='fav') toggleFav(kb,path);
   else if(act==='copy') doCopyAddr(el,kb,path);
   else if(act==='more') showMoreMenu(el,kb,path,el.dataset.id,el.dataset.md,el.dataset.ref,el.dataset.isfolder==='1');
+  else if(act==='notecard'){ const n=findNote(el.dataset.id,el.dataset.scope); if(n) openNote(n); }
+  else if(act==='noteedit') startEditNote(el.dataset.id, el.dataset.scope);
+  else if(act==='notepin') togglePin(el.dataset.id, el.dataset.scope);
+  else if(act==='notecopy') copyNoteLink(el.dataset.id);
+  else if(act==='notedel') deleteNote(el.dataset.id, el.dataset.scope);
 });
 function openUrl(url,ext){
   if(PREVIEWABLE.has((ext||'').toLowerCase())){ window.open(url,'_blank'); }

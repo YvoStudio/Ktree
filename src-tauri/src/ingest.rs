@@ -8,8 +8,27 @@ use crate::convert;
 use crate::kbmeta;
 use crate::state::AppState;
 use crate::store::{Document, NewDocument};
+use crate::textproc;
 
-const SUMMARY_LEN: usize = 200;
+/// 送去算语义向量的文本上限(字符)。模型自身只吃 ~512 token,
+/// 这里截一刀只是别把整篇大文档塞进管道。
+const EMBED_TEXT_LIMIT: usize = 1500;
+
+/// 一篇文档取多少个关键词。
+const KEYWORD_COUNT: usize = 8;
+
+/// 由正文派生标签:正文非空走 jieba 关键词,为空(图片等)退化为文件名拆词。
+fn derive_tags(body: &str, stem: &str) -> Vec<String> {
+    if body.trim().is_empty() {
+        return kbmeta::extract_tags(stem);
+    }
+    let kw = textproc::keywords(body, KEYWORD_COUNT);
+    if kw.is_empty() {
+        kbmeta::extract_tags(stem)
+    } else {
+        kw
+    }
+}
 
 /// 路径组件白名单:拒绝空串、`..`、路径分隔符,防止目录穿越。
 /// 供 HTTP 上传与 MCP 上传共用(单层文件名/目录名)。
@@ -157,29 +176,30 @@ pub fn ingest_file(
                 fs::create_dir_all(parent)?;
             }
             let _ = fs::remove_file(&docs_abs); // 防止旧软链残留
-            let tags = kbmeta::extract_tags(&stem);
-            let fm = kbmeta::build_frontmatter(&stem, &category, &tags, &r.summary);
-            fs::write(&docs_abs, format!("{fm}{}", r.markdown))?;
-            (Some(format!("docs/{rel_md}")), r.markdown, r.summary, tags)
+            let body = r.markdown;
+            let summary = textproc::summarize(&state.embedder, &body);
+            let tags = derive_tags(&body, &stem);
+            let fm = kbmeta::build_frontmatter(&stem, &category, &tags, &summary);
+            fs::write(&docs_abs, format!("{fm}{body}"))?;
+            (Some(format!("docs/{rel_md}")), body, summary, tags)
         } else {
             // 文本 / 转换失败 / 不支持转换:在 docs/<rel_path> 镜像 src 原文。
             // Linux/macOS 走相对软链;Windows 普通用户回落到硬链 → 复制。
             mirror_into_docs(&kb.root, rel_path)?;
 
-            let tags = kbmeta::extract_tags(&stem);
-            let (body, summary) = if is_textual(&ext) {
+            // HTML 抽纯文本再索引(原文件不动);其它文本类原样;二进制无正文。
+            let body = if is_textual(&ext) {
                 let text = String::from_utf8_lossy(&bytes).into_owned();
-                let s: String = text
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .chars()
-                    .take(SUMMARY_LEN)
-                    .collect();
-                (text, s)
+                textproc::clean_body(&text, &ext)
             } else {
-                (String::new(), String::new())
+                String::new()
             };
+            let summary = if body.trim().is_empty() {
+                String::new()
+            } else {
+                textproc::summarize(&state.embedder, &body)
+            };
+            let tags = derive_tags(&body, &stem);
             (Some(format!("docs/{rel_path}")), body, summary, tags)
         };
 
@@ -211,6 +231,21 @@ pub fn ingest_file(
         .index
         .add_or_update(&kb.id, doc_id, &stem, &category, &body, &summary)?;
     state.index.commit()?;
+
+    // 语义向量:标题 + 正文片段编码后存进 doc_vectors。
+    // 失败不阻断入库 —— BM25 检索仍可用,向量可后续补算。
+    let embed_text: String = format!("{stem}\n{body}")
+        .chars()
+        .take(EMBED_TEXT_LIMIT)
+        .collect();
+    match state.embedder.embed(std::slice::from_ref(&embed_text), "") {
+        Ok(mut vs) => {
+            if let Some(v) = vs.pop() {
+                let _ = state.store.set_vector(doc_id, &v);
+            }
+        }
+        Err(e) => eprintln!("[ktree] 文档 #{doc_id} 向量化失败(不影响入库): {e}"),
+    }
 
     state
         .store
@@ -283,4 +318,113 @@ pub fn delete_doc(state: &AppState, kb: &KnowledgeBase, doc: &Document) -> anyho
     state.index.delete(doc.id)?;
     state.index.commit()?;
     Ok(())
+}
+
+/// 去掉文件开头的 YAML frontmatter(`---` 包起来的块)。
+fn strip_frontmatter(s: &str) -> &str {
+    if let Some(rest) = s.strip_prefix("---\n").or_else(|| s.strip_prefix("---\r\n")) {
+        for marker in ["\n---\n", "\n---\r\n"] {
+            if let Some(i) = rest.find(marker) {
+                return &rest[i + marker.len()..];
+            }
+        }
+    }
+    s
+}
+
+/// 读一篇文档的「可索引正文」:优先 docs/ 下的产物,回落到 src 原文,
+/// 去掉 frontmatter,HTML 抽纯文本。读不到(图片等二进制)返回空串。
+fn read_doc_body(kb: &KnowledgeBase, doc: &Document) -> String {
+    let raw = doc
+        .md_path
+        .as_ref()
+        .and_then(|md| fs::read_to_string(kb.root.join(md)).ok())
+        .or_else(|| fs::read_to_string(kb.root.join("src").join(&doc.rel_path)).ok())
+        .unwrap_or_default();
+    textproc::clean_body(strip_frontmatter(&raw), &doc.ext)
+}
+
+/// 取一篇文档用于嵌入的文本:「标题 + 正文」截到 `EMBED_TEXT_LIMIT`。
+/// 读不到正文(图片等二进制)时退化为只用标题。
+fn doc_embed_text(kb: &KnowledgeBase, doc: &Document) -> String {
+    format!("{}\n{}", doc.title, read_doc_body(kb, doc))
+        .chars()
+        .take(EMBED_TEXT_LIMIT)
+        .collect()
+}
+
+/// 给 summary 为空的存量文档补算摘要 / 关键词,并用纯文本重建索引 + 向量。
+/// 主要修两件事:① 缓存重建遗留的空摘要;② HTML 此前用带标签原文做索引。
+/// 启动时后台调用,返回处理篇数。
+pub fn backfill_meta(state: &AppState) -> usize {
+    let kbs = state.config.snapshot().knowledge_bases;
+    let mut done = 0usize;
+    for kb in &kbs {
+        let docs = match state.store.list_documents(&kb.id, None) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for doc in docs {
+            if !doc.summary.trim().is_empty() {
+                continue; // 已有摘要,跳过
+            }
+            let body = read_doc_body(kb, &doc);
+            if body.trim().is_empty() {
+                continue; // 图片 / 二进制,无正文可抽
+            }
+            let summary = textproc::summarize(&state.embedder, &body);
+            let tags = derive_tags(&body, &doc.title);
+            if state
+                .store
+                .update_meta(doc.id, &summary, &tags.join(","))
+                .is_err()
+            {
+                continue;
+            }
+            let category = kbmeta::category_of(&doc.rel_path);
+            let _ =
+                state
+                    .index
+                    .add_or_update(&kb.id, doc.id, &doc.title, &category, &body, &summary);
+            // 用纯文本重算向量(HTML 此前的向量含标签噪音)
+            let etext: String = format!("{}\n{}", doc.title, body)
+                .chars()
+                .take(EMBED_TEXT_LIMIT)
+                .collect();
+            if let Ok(mut vs) = state.embedder.embed(std::slice::from_ref(&etext), "") {
+                if let Some(v) = vs.pop() {
+                    let _ = state.store.set_vector(doc.id, &v);
+                }
+            }
+            done += 1;
+        }
+    }
+    if done > 0 {
+        let _ = state.index.commit();
+    }
+    done
+}
+
+/// 给 store 里还没有语义向量的文档补算并写入,返回 (成功数, 失败数)。
+/// 启动时后台调用。某篇读不到文件 / embed 失败只是跳过,不中断。
+pub fn backfill_vectors(state: &AppState) -> (usize, usize) {
+    let docs = match state.store.docs_missing_vector() {
+        Ok(d) => d,
+        Err(_) => return (0, 0),
+    };
+    let (mut done, mut failed) = (0usize, 0usize);
+    for doc in docs {
+        let Some(kb) = state.config.get_kb(&doc.kb_id) else {
+            continue; // KB 已不存在(孤儿应已清,稳妥起见仍跳过)
+        };
+        let text = doc_embed_text(&kb, &doc);
+        match state.embedder.embed(std::slice::from_ref(&text), "") {
+            Ok(mut vs) => match vs.pop() {
+                Some(v) if state.store.set_vector(doc.id, &v).is_ok() => done += 1,
+                _ => failed += 1,
+            },
+            Err(_) => failed += 1,
+        }
+    }
+    (done, failed)
 }

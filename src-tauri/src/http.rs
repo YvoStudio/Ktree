@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use axum::{
-    extract::{Multipart, Path as AxPath, Query, State as AxState},
+    extract::{ConnectInfo, Multipart, Path as AxPath, Query, State as AxState},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -52,6 +53,20 @@ fn not_found(msg: &str) -> Response {
         Json(json!({ "ok": false, "error": msg })),
     )
         .into_response()
+}
+
+/// 改配置类写操作仅允许本机(127.0.0.1 / ::1)调用 —— 拦掉局域网 / 外部写请求。
+/// 注:不信任 X-Forwarded-For,只看真实 TCP 对端;Ktree 端口若被反代需另行处理。
+fn require_local(addr: &SocketAddr) -> Result<(), Response> {
+    if addr.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "改配置操作仅限本机调用" })),
+        )
+            .into_response())
+    }
 }
 
 fn require_kb(state: &AppState, kb_id: &str) -> Result<KnowledgeBase, Response> {
@@ -142,8 +157,13 @@ pub async fn serve(state: AppState) {
         .route("/api/doc/:id/md", get(get_doc_md))
         .route("/api/doc/:id/raw", get(get_doc_raw))
         .route("/api/sync/feishu/trigger", post(feishu_trigger))
-        .route("/api/kb/:kb_id/vcs", get(list_kb_vcs))
+        .route("/api/notes", get(list_notes).post(add_note))
+        .route("/api/notes/:id", put(update_note).delete(delete_note))
+        .route("/api/kb", post(add_kb))
+        .route("/api/kb/:kb_id/feishu", put(set_kb_feishu))
+        .route("/api/kb/:kb_id/vcs", get(list_kb_vcs).post(add_kb_vcs))
         .route("/api/kb/:kb_id/vcs/sync", post(sync_kb_vcs_all))
+        .route("/api/kb/:kb_id/vcs/:idx", put(update_kb_vcs).delete(remove_kb_vcs))
         .route("/api/kb/:kb_id/vcs/:idx/sync", post(sync_kb_vcs_one))
         .route("/lib/marked.min.js", get(lib_marked))
         .route("/lib/highlight.min.js", get(lib_hljs))
@@ -155,7 +175,10 @@ pub async fn serve(state: AppState) {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    if let Err(e) = axum::serve(listener, app).await {
+    // into_make_service_with_connect_info:让 handler 能拿到调用方 IP,
+    // 用于把改配置类写操作限制为仅本机调用。
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+    if let Err(e) = axum::serve(listener, service).await {
         eprintln!("[ktree] HTTP 服务异常退出: {e}");
     }
 }
@@ -202,7 +225,11 @@ async fn api_info() -> Response {
             "GET  /api/search?kb=<id>&q=<kw>&limit=<n>",
             "GET  /api/doc/:id  /md  /raw",
             "DELETE /api/doc/:id",
-            "POST /api/sync/feishu/trigger?kb=<id>"
+            "POST /api/sync/feishu/trigger?kb=<id>",
+            "POST /api/kb  (新增知识库 {name, root?})",
+            "PUT  /api/kb/:kb_id/feishu  (配置飞书)",
+            "GET/POST /api/kb/:kb_id/vcs  (列出 / 新增 VCS 绑定)",
+            "PUT/DELETE /api/kb/:kb_id/vcs/:idx  (改 / 删 VCS 绑定)"
         ]
     }))
 }
@@ -236,7 +263,6 @@ async fn health(AxState(state): AxState<AppState>) -> Result<Response, ApiError>
         "ok": true,
         "documents": total,
         "knowledge_bases": cfg.knowledge_bases.len(),
-        "sync_interval_minutes": cfg.sync_interval_minutes,
     })))
 }
 
@@ -246,9 +272,142 @@ async fn get_config(AxState(state): AxState<AppState>) -> Result<Response, ApiEr
 
 async fn put_config(
     AxState(state): AxState<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(cfg): Json<crate::config::AppConfig>,
 ) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
     state.config.replace(cfg)?;
+    Ok(json_ok(json!({ "ok": true })))
+}
+
+// ---- 细粒度改配置:新增知识库 / 配置飞书 / 管理 VCS 绑定 ----
+// 受限接口,不含删除知识库、改端口 / 域名 —— 那些仍只走桌面设置窗。
+
+#[derive(Deserialize)]
+struct AddKbBody {
+    name: String,
+    /// 可选,知识库根目录的绝对路径;不填则放在应用数据目录下。
+    #[serde(default)]
+    root: Option<String>,
+}
+
+/// POST /api/kb —— 新增一个知识库。
+async fn add_kb(
+    AxState(state): AxState<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<AddKbBody>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
+    let root = body
+        .root
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from);
+    let kb = state.config.add_kb(&body.name, root)?;
+    Ok(json_ok(json!({
+        "ok": true,
+        "kb": { "id": kb.id, "name": kb.name, "root": kb.root },
+    })))
+}
+
+/// PUT /api/kb/:kb_id/feishu —— 覆盖某知识库的飞书配置。
+async fn set_kb_feishu(
+    AxState(state): AxState<AppState>,
+    AxPath(kb_id): AxPath<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(feishu): Json<crate::config::FeishuConfig>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
+    state.config.set_feishu(&kb_id, feishu)?;
+    Ok(json_ok(json!({ "ok": true })))
+}
+
+/// POST /api/kb/:kb_id/vcs —— 追加一条 VCS 绑定。
+async fn add_kb_vcs(
+    AxState(state): AxState<AppState>,
+    AxPath(kb_id): AxPath<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(binding): Json<crate::config::VcsBinding>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
+    let idx = state.config.add_vcs_binding(&kb_id, binding)?;
+    Ok(json_ok(json!({ "ok": true, "idx": idx })))
+}
+
+/// PUT /api/kb/:kb_id/vcs/:idx —— 覆盖第 idx 条 VCS 绑定。
+async fn update_kb_vcs(
+    AxState(state): AxState<AppState>,
+    AxPath((kb_id, idx)): AxPath<(String, usize)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(binding): Json<crate::config::VcsBinding>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
+    state.config.update_vcs_binding(&kb_id, idx, binding)?;
+    Ok(json_ok(json!({ "ok": true })))
+}
+
+/// DELETE /api/kb/:kb_id/vcs/:idx —— 删除第 idx 条 VCS 绑定。
+async fn remove_kb_vcs(
+    AxState(state): AxState<AppState>,
+    AxPath((kb_id, idx)): AxPath<(String, usize)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
+    state.config.remove_vcs_binding(&kb_id, idx)?;
+    Ok(json_ok(json!({ "ok": true })))
+}
+
+// ---- 记事板:公共记事(所有人可看 / 可增删,不限本机)----
+
+async fn list_notes(AxState(state): AxState<AppState>) -> Result<Response, ApiError> {
+    let notes = state.store.list_notes()?;
+    Ok(json_ok(json!({ "ok": true, "notes": notes })))
+}
+
+async fn add_note(
+    AxState(state): AxState<AppState>,
+    Json(n): Json<crate::store::NewNote>,
+) -> Result<Response, ApiError> {
+    if !matches!(n.note_type.as_str(), "text" | "url" | "kblink") {
+        return Ok(bad_request("note_type 必须是 text / url / kblink"));
+    }
+    if n.title.trim().is_empty() && n.content.trim().is_empty() {
+        return Ok(bad_request("记事标题和内容不能都为空"));
+    }
+    let note = state.store.add_note(&n)?;
+    Ok(json_ok(json!({ "ok": true, "note": note })))
+}
+
+async fn update_note(
+    AxState(state): AxState<AppState>,
+    AxPath(id): AxPath<i64>,
+    Json(n): Json<crate::store::NewNote>,
+) -> Result<Response, ApiError> {
+    if !matches!(n.note_type.as_str(), "text" | "url" | "kblink") {
+        return Ok(bad_request("note_type 必须是 text / url / kblink"));
+    }
+    if !state.store.update_note(id, &n)? {
+        return Ok(not_found("记事不存在"));
+    }
+    Ok(json_ok(json!({ "ok": true })))
+}
+
+async fn delete_note(
+    AxState(state): AxState<AppState>,
+    AxPath(id): AxPath<i64>,
+) -> Result<Response, ApiError> {
+    state.store.delete_note(id)?;
     Ok(json_ok(json!({ "ok": true })))
 }
 
@@ -630,16 +789,24 @@ async fn search(
     Query(q): Query<SearchQuery>,
 ) -> Result<Response, ApiError> {
     let limit = q.limit.unwrap_or(20).min(100);
-    let index = state.index.clone();
+    let st = state.clone();
     let query = q.q.clone();
     let kb = if q.kb.is_empty() {
         None
     } else {
         Some(q.kb.clone())
     };
-    let hits = tokio::task::spawn_blocking(move || index.search(kb.as_deref(), &query, limit))
-        .await
-        .map_err(|e| anyhow::anyhow!("搜索任务失败: {e}"))??;
+    // 指定了知识库就先校验存在 —— 不存在直接报错,而不是返回空结果。
+    if let Some(ref kb_id) = kb {
+        if state.config.get_kb(kb_id).is_none() {
+            return Ok(not_found("知识库不存在"));
+        }
+    }
+    let hits = tokio::task::spawn_blocking(move || {
+        crate::search::hybrid(&st, kb.as_deref(), &query, limit)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("搜索任务失败: {e}"))??;
     // 为每条 hit 补上 store 里的 ext / rel_path / md_path / kb_id,
     // 前端就能按真实类型走 preview(html → iframe, md → markdown, 图片 → 图片浏览…)。
     let store = state.store.clone();
@@ -771,6 +938,7 @@ async fn list_kb_vcs(
                 "vcs_type": b.vcs_type,
                 "url": b.url,
                 "sub_dir": b.sub_dir,
+                "repo_sub_path": b.repo_sub_path,
                 "branch": b.branch,
                 "has_credentials": !b.username.is_empty() || !b.password.is_empty(),
                 "sync_interval_minutes": b.sync_interval_minutes,

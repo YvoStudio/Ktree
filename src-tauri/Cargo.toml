@@ -28,6 +28,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tantivy = "0.22"
 tantivy-jieba = "0.11.0"
+jieba-rs = "0.7"
 axum = { version = "0.7", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tokio = { version = "1", features = ["full"] }

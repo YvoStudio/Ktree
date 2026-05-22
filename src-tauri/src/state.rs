@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::config::ConfigStore;
+use crate::embed::Embedder;
 use crate::index::SearchIndex;
 use crate::store::Store;
 
@@ -11,6 +12,8 @@ pub struct AppState {
     pub config: Arc<ConfigStore>,
     pub store: Arc<Store>,
     pub index: Arc<SearchIndex>,
+    /// 语义向量嵌入客户端(常驻 embed sidecar)。
+    pub embedder: Arc<Embedder>,
     /// HTTP 服务实际绑定的端口(启动后由 http::serve 写入),供前端 GUI 拼接 API 地址。
     pub http_port: Arc<Mutex<Option<u16>>>,
 }

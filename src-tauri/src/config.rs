@@ -28,6 +28,11 @@ pub struct VcsBinding {
     /// 仅 git:checkout 的分支
     #[serde(default)]
     pub branch: String,
+    /// 仅 git:只同步仓库内的这个子目录(空 = 整个仓库)。
+    /// 用稀疏检出实现,内容扁平映射到 src 子目录,不带这一层路径。
+    /// 启用时必须同时指定 sub_dir(svn 不用此字段,直接把 url 指到子目录即可)。
+    #[serde(default)]
+    pub repo_sub_path: String,
     /// 自动同步间隔(分钟);0 = 不自动
     #[serde(default)]
     pub sync_interval_minutes: u64,
@@ -43,6 +48,9 @@ pub struct FeishuConfig {
     /// 共享文件夹 token
     #[serde(default)]
     pub folder_token: String,
+    /// 自动同步间隔(分钟);0 = 不自动
+    #[serde(default)]
+    pub sync_interval_minutes: u64,
 }
 
 impl FeishuConfig {
@@ -76,9 +84,6 @@ pub struct AppConfig {
     /// HTTP 服务端口。0 = 自动(优先 80,失败回退 8080)
     #[serde(default)]
     pub http_port: u16,
-    /// 飞书自动同步间隔(分钟)。0 = 不自动同步
-    #[serde(default)]
-    pub sync_interval_minutes: u64,
     /// 对外访问的自定义域名(如 `https://kb.example.com`),空表示不启用 ——
     /// 设置窗口的「web 界面」与 web UI 的「复制地址」会优先用它替代 `http://<ip>:<port>`。
     /// 不带 scheme 默认补 `http://`;末尾的 `/` 会被去掉。
@@ -93,7 +98,6 @@ impl AppConfig {
     fn with_default_kb(data_dir: &std::path::Path) -> Self {
         Self {
             http_port: 0,
-            sync_interval_minutes: 0,
             custom_domain: String::new(),
             knowledge_bases: vec![KnowledgeBase {
                 id: String::new(),
@@ -152,6 +156,8 @@ fn ensure_kb_dirs(kb: &KnowledgeBase) -> std::io::Result<()> {
 pub struct ConfigStore {
     inner: Mutex<AppConfig>,
     file: PathBuf,
+    /// 应用数据目录 —— 新增知识库未指定 root 时落在这里。
+    data_dir: PathBuf,
 }
 
 impl ConfigStore {
@@ -184,6 +190,7 @@ impl ConfigStore {
         Ok(Self {
             inner: Mutex::new(cfg),
             file,
+            data_dir,
         })
     }
 
@@ -211,6 +218,105 @@ impl ConfigStore {
         fs::write(&self.file, serde_json::to_string_pretty(&new_cfg)?)?;
         *self.inner.lock().unwrap() = new_cfg;
         Ok(())
+    }
+
+    // ----- 受限的细粒度改配置接口(供 REST / MCP 给 AI 用)-----
+    // 只允许:新增知识库、配置知识库的飞书 / VCS / 同步;
+    // 不允许:删除知识库、改 HTTP 端口、改自定义域名 —— 那些仍只走桌面设置窗。
+
+    /// VcsBinding 最小校验:类型必须 git/svn,url 非空。
+    fn validate_vcs(b: &VcsBinding) -> anyhow::Result<()> {
+        if b.vcs_type != "git" && b.vcs_type != "svn" {
+            anyhow::bail!("VCS 类型必须是 git 或 svn,收到「{}」", b.vcs_type);
+        }
+        if b.url.trim().is_empty() {
+            anyhow::bail!("VCS 仓库 URL 不能为空");
+        }
+        Ok(())
+    }
+
+    /// 新增一个知识库。`root` 为 None 时落在应用数据目录下的 `kb-<name>`。
+    /// 仅新增,不提供删除。
+    pub fn add_kb(&self, name: &str, root: Option<PathBuf>) -> anyhow::Result<KnowledgeBase> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("知识库名称不能为空");
+        }
+        let root = root.unwrap_or_else(|| self.data_dir.join(format!("kb-{name}")));
+        let mut cfg = self.snapshot();
+        cfg.knowledge_bases.push(KnowledgeBase {
+            id: String::new(),
+            name: name.clone(),
+            root,
+            feishu: FeishuConfig::default(),
+            vcs_bindings: Vec::new(),
+        });
+        self.replace(cfg)?; // 内含 validate_kbs(查重 / 保留字)+ 建目录 + 落盘
+        self.get_kb(&name)
+            .ok_or_else(|| anyhow::anyhow!("新增知识库后无法读回"))
+    }
+
+    /// 覆盖某知识库的飞书配置。
+    pub fn set_feishu(&self, kb_id: &str, feishu: FeishuConfig) -> anyhow::Result<()> {
+        let mut cfg = self.snapshot();
+        let kb = cfg
+            .knowledge_bases
+            .iter_mut()
+            .find(|k| k.id == kb_id)
+            .ok_or_else(|| anyhow::anyhow!("知识库「{kb_id}」不存在"))?;
+        kb.feishu = feishu;
+        self.replace(cfg)
+    }
+
+    /// 给某知识库追加一条 VCS 绑定,返回新绑定的下标。
+    pub fn add_vcs_binding(&self, kb_id: &str, b: VcsBinding) -> anyhow::Result<usize> {
+        Self::validate_vcs(&b)?;
+        let mut cfg = self.snapshot();
+        let kb = cfg
+            .knowledge_bases
+            .iter_mut()
+            .find(|k| k.id == kb_id)
+            .ok_or_else(|| anyhow::anyhow!("知识库「{kb_id}」不存在"))?;
+        kb.vcs_bindings.push(b);
+        let idx = kb.vcs_bindings.len() - 1;
+        self.replace(cfg)?;
+        Ok(idx)
+    }
+
+    /// 覆盖某知识库第 `idx` 条 VCS 绑定。
+    pub fn update_vcs_binding(
+        &self,
+        kb_id: &str,
+        idx: usize,
+        b: VcsBinding,
+    ) -> anyhow::Result<()> {
+        Self::validate_vcs(&b)?;
+        let mut cfg = self.snapshot();
+        let kb = cfg
+            .knowledge_bases
+            .iter_mut()
+            .find(|k| k.id == kb_id)
+            .ok_or_else(|| anyhow::anyhow!("知识库「{kb_id}」不存在"))?;
+        if idx >= kb.vcs_bindings.len() {
+            anyhow::bail!("VCS 绑定下标 {idx} 越界(共 {} 条)", kb.vcs_bindings.len());
+        }
+        kb.vcs_bindings[idx] = b;
+        self.replace(cfg)
+    }
+
+    /// 删除某知识库第 `idx` 条 VCS 绑定(只是不再同步,不动磁盘上已入库的内容)。
+    pub fn remove_vcs_binding(&self, kb_id: &str, idx: usize) -> anyhow::Result<()> {
+        let mut cfg = self.snapshot();
+        let kb = cfg
+            .knowledge_bases
+            .iter_mut()
+            .find(|k| k.id == kb_id)
+            .ok_or_else(|| anyhow::anyhow!("知识库「{kb_id}」不存在"))?;
+        if idx >= kb.vcs_bindings.len() {
+            anyhow::bail!("VCS 绑定下标 {idx} 越界(共 {} 条)", kb.vcs_bindings.len());
+        }
+        kb.vcs_bindings.remove(idx);
+        self.replace(cfg)
     }
 }
 
