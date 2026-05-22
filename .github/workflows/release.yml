@@ -70,7 +70,11 @@ jobs:
       - name: Build Node sidecar binaries
         # 把 sidecar/convert.js / feishu-sync.js 打包成自包含二进制,
         # 写入 src-tauri/binaries/,Tauri externalBin 在 tauri build 时自动打包进应用。
-        run: node sidecar/build.js
+        # macOS 交叉编译两个架构,需按 matrix 的 --target 给 build.js 指定对应 triple。
+        shell: bash
+        run: |
+          TRIPLE=$(echo "${{ matrix.args }}" | sed -n 's/.*--target \([^ ]*\).*/\1/p')
+          node sidecar/build.js $TRIPLE
 
       - name: Generate changelog from commits
         id: changelog
