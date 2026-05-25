@@ -83,8 +83,10 @@ pub async fn run(state: AppState) {
             let kb_name = kb.name.clone();
             let kb_id = kb.id.clone();
             let url = kb.vcs_bindings[idx].url.clone();
-            let result =
-                tokio::task::spawn_blocking(move || vcs::sync_binding(&st, &kb, idx)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                vcs::sync_binding_with_record(&st, &kb, idx, "auto")
+            })
+            .await;
             match result {
                 Ok(Ok(r)) => println!(
                     "[ktree] VCS 定时同步「{kb_name}#{idx}」({url}): \

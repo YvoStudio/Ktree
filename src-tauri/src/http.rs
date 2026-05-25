@@ -928,11 +928,16 @@ async fn list_kb_vcs(
     let Some(kb) = state.config.get_kb(&kb_id) else {
         return Ok(not_found("知识库不存在"));
     };
+    let last_map = state.last_vcs_sync.lock().ok();
     let arr: Vec<Value> = kb
         .vcs_bindings
         .iter()
         .enumerate()
         .map(|(i, b)| {
+            let last = last_map
+                .as_ref()
+                .and_then(|m| m.get(&(kb_id.clone(), i)))
+                .cloned();
             json!({
                 "idx": i,
                 "vcs_type": b.vcs_type,
@@ -942,6 +947,7 @@ async fn list_kb_vcs(
                 "branch": b.branch,
                 "has_credentials": !b.username.is_empty() || !b.password.is_empty(),
                 "sync_interval_minutes": b.sync_interval_minutes,
+                "last_sync": last,
             })
         })
         .collect();
@@ -960,9 +966,11 @@ async fn sync_kb_vcs_one(
         return Ok(bad_request("VCS 绑定 idx 越界"));
     }
     let st = state.clone();
-    let report = tokio::task::spawn_blocking(move || crate::vcs::sync_binding(&st, &kb, idx))
-        .await
-        .map_err(|e| anyhow::anyhow!("VCS 同步任务失败: {e}"))??;
+    let report = tokio::task::spawn_blocking(move || {
+        crate::vcs::sync_binding_with_record(&st, &kb, idx, "manual")
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("VCS 同步任务失败: {e}"))??;
     Ok(json_ok(json!({ "ok": true, "report": report })))
 }
 
@@ -978,9 +986,11 @@ async fn sync_kb_vcs_all(
         return Ok(json_ok(json!({ "ok": true, "reports": [], "errors": [] })));
     }
     let st = state.clone();
-    let outcomes = tokio::task::spawn_blocking(move || crate::vcs::sync_kb_all(&st, &kb))
-        .await
-        .map_err(|e| anyhow::anyhow!("VCS 同步任务失败: {e}"))?;
+    let outcomes = tokio::task::spawn_blocking(move || {
+        crate::vcs::sync_kb_all_with_record(&st, &kb, "manual")
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("VCS 同步任务失败: {e}"))?;
     let mut reports = Vec::new();
     let mut errors = Vec::new();
     for (i, r) in outcomes.into_iter().enumerate() {

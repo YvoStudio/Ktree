@@ -40,12 +40,20 @@
   .ops-kb-head .badge { font-size:11px; color:#888; font-weight:400; }
   .ops-actions { display:flex; flex-wrap:wrap; gap:6px; }
   .ops-actions .btn { padding:4px 10px; font-size:12px; font-weight:500; }
-  .ops-vcs-row { display:flex; align-items:center; gap:8px; padding:6px 0;
+  .ops-vcs-row { display:flex; flex-direction:column; gap:4px; padding:6px 0;
     font-size:12.5px; color:#555; border-top:1px dashed #ececec; }
+  .ops-vcs-row .vcs-line { display:flex; align-items:center; gap:8px; }
   .ops-vcs-row .vcs-info { flex:1; min-width:0; overflow:hidden;
     text-overflow:ellipsis; white-space:nowrap; }
   .ops-vcs-row .vcs-info code { background:#ececec; padding:1px 6px; border-radius:3px;
     font-size:11px; }
+  .ops-vcs-row .vcs-last { font-size:11.5px; color:#888; padding-left:2px; }
+  .ops-vcs-row .vcs-last.empty { color:#bbb; }
+  .ops-vcs-row .vcs-last.fail { color:#c0392b; }
+  .ops-vcs-row .vcs-last .tag { background:#eee; color:#666; padding:1px 5px;
+    border-radius:3px; font-size:10.5px; margin-right:4px; }
+  .ops-vcs-row .vcs-last .tag.auto { background:#e8f1fb; color:#2a6cb3; }
+  .ops-vcs-row .vcs-last .tag.manual { background:#f0eef9; color:#6849c7; }
   .ops-empty { color:#aaa; font-size:12px; padding:6px 0; }
   .ops-report { font-size:12px; color:#555; padding:8px 10px; background:#f5f5f5;
     border-radius:6px; margin-top:8px; white-space:pre-wrap; word-break:break-all;
@@ -883,43 +891,51 @@ async function renderOpsList(host){
         show(formatFeishuReport(r.report));
       }catch(e){ show('飞书同步失败:'+e); }
     });
+    // 加载 vcs bindings(可重复调用,用于同步完成后刷新 last_sync)
+    const vcsHost=block.querySelector('[data-vcs-host]');
+    async function reloadVcs(){
+      try{
+        const r=await api(`/api/kb/${encodeURIComponent(kb.id)}/vcs`);
+        const bindings=r.bindings||[];
+        if(!bindings.length){
+          vcsHost.innerHTML='<div class="ops-empty">未配置 VCS 绑定。手动编辑 config.json 的 <code>vcs_bindings</code> 字段。</div>';
+          return;
+        }
+        vcsHost.innerHTML='';
+        bindings.forEach(b=>{
+          const row=document.createElement('div'); row.className='ops-vcs-row';
+          const sub=b.sub_dir?`src/${esc(b.sub_dir)}`:'src';
+          row.innerHTML=`
+            <div class="vcs-line">
+              <div class="vcs-info">
+                <code>${esc(b.vcs_type)}</code> · ${sub} ← ${esc(b.url)}${b.repo_sub_path?(' :: '+esc(b.repo_sub_path)):''}
+                ${b.branch?` <span style="color:#aaa">[${esc(b.branch)}]</span>`:''}
+                ${b.has_credentials?' <span style="color:#888;font-size:11px">(自定义凭证)</span>':''}
+              </div>
+              <button class="btn ghost sm">同步</button>
+            </div>
+            <div class="vcs-last">${renderVcsLast(b.last_sync, b.sync_interval_minutes)}</div>`;
+          row.querySelector('button').addEventListener('click',async ()=>{
+            show(`同步 ${b.vcs_type}: ${b.url} …`);
+            try{
+              const rr=await api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/${b.idx}/sync`,{method:'POST'});
+              show(formatVcsReport(rr.report));
+            }catch(e){ show('同步失败:'+e); }
+            reloadVcs();
+          });
+          vcsHost.appendChild(row);
+        });
+      }catch(e){ vcsHost.innerHTML='<div class="ops-empty">VCS 绑定加载失败:'+esc(e)+'</div>'; }
+    }
     block.querySelector('[data-act="vcs-all"]').addEventListener('click',async ()=>{
       show('同步所有 VCS 绑定…');
       try{
         const r=await api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/sync`,{method:'POST'});
         show(formatVcsReports(r.reports||[], r.errors||[]));
       }catch(e){ show('VCS 同步失败:'+e); }
+      reloadVcs();
     });
-    // 加载 vcs bindings
-    const vcsHost=block.querySelector('[data-vcs-host]');
-    try{
-      const r=await api(`/api/kb/${encodeURIComponent(kb.id)}/vcs`);
-      const bindings=r.bindings||[];
-      if(!bindings.length){
-        vcsHost.innerHTML='<div class="ops-empty">未配置 VCS 绑定。手动编辑 config.json 的 <code>vcs_bindings</code> 字段。</div>';
-      } else {
-        vcsHost.innerHTML='';
-        bindings.forEach(b=>{
-          const row=document.createElement('div'); row.className='ops-vcs-row';
-          const sub=b.sub_dir?`src/${esc(b.sub_dir)}`:'src';
-          row.innerHTML=`
-            <div class="vcs-info">
-              <code>${esc(b.vcs_type)}</code> · ${sub} ← ${esc(b.url)}${b.repo_sub_path?(' :: '+esc(b.repo_sub_path)):''}
-              ${b.branch?` <span style="color:#aaa">[${esc(b.branch)}]</span>`:''}
-              ${b.has_credentials?' <span style="color:#888;font-size:11px">(自定义凭证)</span>':''}
-            </div>
-            <button class="btn ghost sm">同步</button>`;
-          row.querySelector('button').addEventListener('click',async ()=>{
-            show(`同步 ${b.vcs_type}: ${b.url} …`);
-            try{
-              const r=await api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/${b.idx}/sync`,{method:'POST'});
-              show(formatVcsReport(r.report));
-            }catch(e){ show('同步失败:'+e); }
-          });
-          vcsHost.appendChild(row);
-        });
-      }
-    }catch(e){ vcsHost.innerHTML='<div class="ops-empty">VCS 绑定加载失败:'+esc(e)+'</div>'; }
+    await reloadVcs();
     host.appendChild(block);
   }
 }
@@ -933,6 +949,36 @@ function formatFeishuReport(r){
   (r.messages||[]).forEach(m=>lines.push('  '+m));
   return lines.join('\n');
 }
+// 单条 VCS 绑定的"最近一次同步"摘要,显示在绑定行下方。
+// last 可能为 null(后端从未同步过) → 看 interval 决定提示"待自动同步"还是"未同步"。
+function renderVcsLast(last, intervalMinutes){
+  if(!last){
+    if(intervalMinutes>0) return `<span class="empty">暂无同步记录 · 自动每 ${intervalMinutes} 分钟</span>`;
+    return `<span class="empty">暂无同步记录</span>`;
+  }
+  const ago=fmtAgo(last.at_unix_ms);
+  const srcTag=last.source==='auto'
+    ? `<span class="tag auto">自动</span>`
+    : `<span class="tag manual">手动</span>`;
+  if(!last.ok){
+    const err=last.error?(' · '+esc(String(last.error).slice(0,120))):'';
+    return `<span class="fail">${srcTag}${esc(ago)} · 失败${err}</span>`;
+  }
+  const rev=last.revision?` · 修订 ${esc(String(last.revision).slice(0,12))}`:'';
+  const failTail=last.failed>0?` · 失败 ${last.failed}`:'';
+  const intervalTail=intervalMinutes>0?` · 自动每 ${intervalMinutes} 分钟`:'';
+  return `${srcTag}${esc(ago)}${rev} · +${last.added} ~${last.updated} -${last.deleted}${failTail}${intervalTail}`;
+}
+function fmtAgo(unixMs){
+  if(!unixMs) return '刚刚';
+  const diff=Date.now()-unixMs;
+  if(diff<0) return '刚刚';
+  if(diff<60_000) return '刚刚';
+  if(diff<3600_000) return Math.floor(diff/60_000)+' 分钟前';
+  if(diff<86400_000) return Math.floor(diff/3600_000)+' 小时前';
+  return Math.floor(diff/86400_000)+' 天前';
+}
+
 function formatVcsReport(r){
   if(!r) return '(无报告)';
   const sub=r.sub_dir?('src/'+r.sub_dir):'src';

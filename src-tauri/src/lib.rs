@@ -73,6 +73,7 @@ pub fn run() {
                 index: search_index,
                 embedder: Arc::new(embed::Embedder::new()),
                 http_port: Arc::new(Mutex::new(None)),
+                last_vcs_sync: Arc::new(Mutex::new(std::collections::HashMap::new())),
             };
             app.manage(app_state.clone());
 

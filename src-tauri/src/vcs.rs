@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::config::{KnowledgeBase, VcsBinding};
 use crate::ingest::{self, safe_rel_path};
-use crate::state::AppState;
+use crate::state::{AppState, LastVcsSync};
 
 /// 一次 VCS 同步的结果汇总。
 #[derive(Debug, Clone, Serialize)]
@@ -481,9 +481,59 @@ pub fn sync_binding(
     Ok(report)
 }
 
-/// 对一个 KB 的所有绑定依次同步。任意一个失败不影响其它。
-pub fn sync_kb_all(state: &AppState, kb: &KnowledgeBase) -> Vec<anyhow::Result<VcsSyncReport>> {
+/// 调 `sync_binding`,无论成败都把结果记到 `state.last_vcs_sync`,供 webui 展示。
+///
+/// `source`:"auto"(scheduler 定时)或 "manual"(用户/REST 触发)。
+/// 这是定时与手动同步的统一收口;直接调 `sync_binding` 不会更新 last_sync,
+/// 所以新增调用方必须走这个函数。
+pub fn sync_binding_with_record(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    binding_idx: usize,
+    source: &str,
+) -> anyhow::Result<VcsSyncReport> {
+    let result = sync_binding(state, kb, binding_idx);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let entry = match &result {
+        Ok(r) => LastVcsSync {
+            at_unix_ms: now_ms,
+            source: source.to_string(),
+            ok: true,
+            revision: r.revision.clone(),
+            added: r.added.len(),
+            updated: r.updated.len(),
+            deleted: r.deleted.len(),
+            failed: r.failed.len(),
+            error: None,
+        },
+        Err(e) => LastVcsSync {
+            at_unix_ms: now_ms,
+            source: source.to_string(),
+            ok: false,
+            revision: String::new(),
+            added: 0,
+            updated: 0,
+            deleted: 0,
+            failed: 0,
+            error: Some(e.to_string()),
+        },
+    };
+    if let Ok(mut m) = state.last_vcs_sync.lock() {
+        m.insert((kb.id.clone(), binding_idx), entry);
+    }
+    result
+}
+
+/// 同 `sync_kb_all`,但每条绑定都走 `sync_binding_with_record`。
+pub fn sync_kb_all_with_record(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    source: &str,
+) -> Vec<anyhow::Result<VcsSyncReport>> {
     (0..kb.vcs_bindings.len())
-        .map(|i| sync_binding(state, kb, i))
+        .map(|i| sync_binding_with_record(state, kb, i, source))
         .collect()
 }
