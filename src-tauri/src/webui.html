@@ -126,12 +126,14 @@
   .note-act.on { color:#5b21b6; }
   .note-card.pinned { border-color:#d8c9ee; }
   @keyframes noteSelPulse {
-    0%   { box-shadow:0 0 0 2px rgba(91,33,182,.55), 0 0 0 4px rgba(91,33,182,.22); }
-    70%  { box-shadow:0 0 0 2px rgba(91,33,182,.55), 0 0 0 13px rgba(91,33,182,0); }
-    100% { box-shadow:0 0 0 2px rgba(91,33,182,.55), 0 0 0 13px rgba(91,33,182,0); }
+    0%   { box-shadow:0 0 0 3px rgba(91,33,182,.85), 0 0 0 7px rgba(91,33,182,.4),  0 6px 18px rgba(91,33,182,.3); }
+    70%  { box-shadow:0 0 0 3px rgba(91,33,182,.7),  0 0 0 22px rgba(91,33,182,0),  0 6px 18px rgba(91,33,182,.22); }
+    100% { box-shadow:0 0 0 3px rgba(91,33,182,.7),  0 0 0 22px rgba(91,33,182,0),  0 6px 18px rgba(91,33,182,.22); }
   }
-  .note-card.selected { border-color:#5b21b6;
-    animation:noteSelPulse 1.8s ease-out infinite; }
+  .note-card.selected { border-color:#5b21b6; outline:2px solid #5b21b6; outline-offset:1px;
+    animation:noteSelPulse 1.4s ease-out infinite; }
+  .note-card.selected::before { content:''; position:absolute; left:-1px; top:-1px; bottom:-1px;
+    width:5px; background:#5b21b6; border-radius:9px 0 0 9px; }
   .note-pin-mark { display:inline-flex; vertical-align:-2px; margin-right:4px; color:#5b21b6; }
   .note-pin-mark svg { width:13px; height:13px; }
   .nf-mode { font-size:13px; font-weight:600; color:#666; }
@@ -321,7 +323,7 @@
   /* 收藏抽屉(照搬 Haystack)*/
   .drawer-overlay { position:fixed; inset:0; background:rgba(0,0,0,.2); display:none; z-index:80; }
   .drawer-overlay.show { display:block; }
-  .drawer { position:fixed; top:0; right:-45%; width:45%; min-width:380px;
+  .drawer { position:fixed; top:0; right:-60%; width:60%; min-width:480px; max-width:900px;
     height:100vh; background:#fff; box-shadow:-4px 0 20px rgba(0,0,0,.1);
     z-index:90; transition:right .25s ease; display:flex; flex-direction:column; }
   .drawer.show { right:0; }
@@ -1419,6 +1421,11 @@ function parseHash(){
 function clearHash(){
   if(location.hash) history.replaceState(null,'',location.pathname+location.search);
 }
+// 页面已加载后,地址栏 hash 变化(粘贴 #note/<id> 回车、前进后退)也要路由到记事板。
+window.addEventListener('hashchange', ()=>{
+  const route=parseHash();
+  if(route) showNotes(route.id||undefined);
+});
 async function copyNoteLink(id){
   const url=(CUSTOM_DOMAIN||location.origin)+'/#note/'+encodeURIComponent(id);
   toast(await copyText(url) ? '已复制记事链接' : ('复制失败:'+url));
@@ -1470,6 +1477,16 @@ function showNotes(focusId){
     </div>`;
   bindNoteForm();
   loadNotes();
+  if(NOTE_SELECTED) armClearNoteSelection();
+}
+
+// 用户在记事板上做任意一次点击后,清掉链接选中态的高亮(脉冲、外发光、左色条)。
+function armClearNoteSelection(){
+  const handler=()=>{
+    NOTE_SELECTED=null;
+    document.querySelectorAll('.note-card.selected').forEach(el=>el.classList.remove('selected'));
+  };
+  document.addEventListener('click', handler, { once:true, capture:true });
 }
 
 function syncNoteType(){
