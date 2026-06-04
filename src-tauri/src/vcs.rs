@@ -103,6 +103,17 @@ fn run_cmd(mut cmd: Command, ctx: &str) -> anyhow::Result<String> {
     Ok(stdout)
 }
 
+fn run_cmd_bytes(mut cmd: Command, ctx: &str) -> anyhow::Result<Vec<u8>> {
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("{ctx}:启动失败: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("{ctx} 失败: {stderr}");
+    }
+    Ok(out.stdout)
+}
+
 /// git 子目录同步用的隐藏工作副本目录 —— 放 `.ktree/vcs-cache/` 下,`.git` 不进 src。
 /// 按 绑定名+url+branch+repo_sub_path 取哈希,改了任一项就换一个目录,互不干扰。
 fn git_cache_dir(kb: &KnowledgeBase, b: &VcsBinding) -> PathBuf {
@@ -327,7 +338,7 @@ fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<Strin
             if msg.contains("E155") {
                 eprintln!("[ktree] svn 工作副本损坏({e}),清掉重新 checkout");
                 fs::remove_dir_all(target)?;
-                svn_checkout(target, b)?;
+                svn_checkout_or_export(target, b)?;
             } else {
                 return Err(e);
             }
@@ -335,8 +346,13 @@ fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<Strin
             // 严格镜像:清掉 unversioned 文件(svn status 第一列 '?')
             svn_clean_unversioned(target);
         }
+    } else if svn_export_marker(target).exists() {
+        svn_export_without_workcopy(target, b)?;
     } else {
-        svn_checkout(target, b)?;
+        svn_checkout_or_export(target, b)?;
+    }
+    if !target.join(".svn").exists() {
+        return svn_remote_revision(b);
     }
     let mut info = Command::new("svn");
     info.current_dir(target)
@@ -346,19 +362,42 @@ fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<Strin
     Ok(run_cmd(info, "svn info revision")?.trim().to_string())
 }
 
-fn svn_update(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
-    let mut up = Command::new("svn");
-    up.current_dir(target)
-        .arg("update")
-        .arg("--non-interactive");
+fn svn_add_auth(cmd: &mut Command, b: &VcsBinding) {
+    cmd.arg("--non-interactive");
     if !b.username.is_empty() {
-        up.arg("--username").arg(&b.username);
+        cmd.arg("--username").arg(&b.username);
     }
     if !b.password.is_empty() {
-        up.arg("--password").arg(&b.password);
+        cmd.arg("--password").arg(&b.password);
     }
+}
+
+fn svn_update(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
+    let mut up = Command::new("svn");
+    up.current_dir(target).arg("update");
+    svn_add_auth(&mut up, b);
     run_cmd(up, "svn update")?;
     Ok(())
+}
+
+fn svn_checkout_or_export(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
+    if target.exists() && !target.join(".svn").exists() {
+        fs::remove_dir_all(target)?;
+    }
+    match svn_checkout(target, b) {
+        Ok(()) => {
+            let _ = fs::remove_file(svn_export_marker(target));
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if !msg.contains("E155") {
+                return Err(e);
+            }
+            eprintln!("[ktree] svn checkout 遇到 Windows 非法路径({e}),改用无工作副本导出");
+            svn_export_without_workcopy(target, b)
+        }
+    }
 }
 
 fn svn_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
@@ -368,15 +407,120 @@ fn svn_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
     let mut co = Command::new("svn");
     co.arg("checkout")
         .arg(&b.url)
-        .arg(target)
-        .arg("--non-interactive");
-    if !b.username.is_empty() {
-        co.arg("--username").arg(&b.username);
-    }
-    if !b.password.is_empty() {
-        co.arg("--password").arg(&b.password);
-    }
+        .arg(target);
+    svn_add_auth(&mut co, b);
     run_cmd(co, "svn checkout")?;
+    Ok(())
+}
+
+fn svn_export_marker(target: &Path) -> PathBuf {
+    target.join(".ktree-svn-export-fallback")
+}
+
+fn svn_remote_revision(b: &VcsBinding) -> anyhow::Result<String> {
+    let mut info = Command::new("svn");
+    info.arg("info")
+        .arg("--show-item")
+        .arg("revision")
+        .arg(&b.url);
+    svn_add_auth(&mut info, b);
+    Ok(run_cmd(info, "svn info revision")?.trim().to_string())
+}
+
+fn svn_list_recursive(b: &VcsBinding) -> anyhow::Result<String> {
+    let mut ls = Command::new("svn");
+    ls.arg("list").arg("-R").arg(&b.url);
+    svn_add_auth(&mut ls, b);
+    run_cmd(ls, "svn list")
+}
+
+fn svn_cat(b: &VcsBinding, rel: &str) -> anyhow::Result<Vec<u8>> {
+    let mut cat = Command::new("svn");
+    cat.arg("cat").arg(svn_url_with_rel(&b.url, rel));
+    svn_add_auth(&mut cat, b);
+    run_cmd_bytes(cat, "svn cat")
+}
+
+fn svn_url_with_rel(base: &str, rel: &str) -> String {
+    format!("{}/{}", base.trim_end_matches('/'), percent_encode_svn_path(rel))
+}
+
+fn percent_encode_svn_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn windows_reserved_component(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return true;
+    }
+    if name.ends_with(' ') || name.ends_with('.') {
+        return true;
+    }
+    if name
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*') || c.is_control())
+    {
+        return true;
+    }
+    let base = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && matches!(base.as_bytes()[3], b'1'..=b'9'))
+}
+
+fn svn_export_rel_path(rel: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for part in rel.split('/') {
+        if windows_reserved_component(part) {
+            return None;
+        }
+        out.push(part);
+    }
+    Some(out)
+}
+
+fn svn_export_without_workcopy(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
+    let _ = fs::remove_dir_all(target);
+    fs::create_dir_all(target)?;
+    let mut skipped = Vec::new();
+    for line in svn_list_recursive(b)?.lines() {
+        let rel = line.trim_end_matches('\r');
+        if rel.is_empty() || rel.ends_with('/') {
+            continue;
+        }
+        let Some(dst_rel) = svn_export_rel_path(rel) else {
+            skipped.push(rel.to_string());
+            continue;
+        };
+        let dst = target.join(dst_rel);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if dst.is_dir() {
+            let _ = fs::remove_dir_all(&dst);
+        } else {
+            let _ = fs::remove_file(&dst);
+        }
+        fs::write(dst, svn_cat(b, rel)?)?;
+    }
+    let marker = format!(
+        "SVN working copy fallback export. Skipped Windows-invalid paths:\n{}\n",
+        skipped.join("\n")
+    );
+    fs::write(svn_export_marker(target), marker)?;
+    if !skipped.is_empty() {
+        eprintln!("[ktree] svn 跳过 Windows 非法路径: {}", skipped.join(", "));
+    }
     Ok(())
 }
 
