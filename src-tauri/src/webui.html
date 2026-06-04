@@ -719,6 +719,10 @@ function readableRawUrl(path,kb){
   const segs=String(path).split('/').filter(Boolean).map(readablePathPart).join('/');
   return `/${readablePathPart(kb||CUR_KB)}/${segs}`;
 }
+function readableDirUrl(path,kb){
+  const segs=[readablePathPart(kb||CUR_KB), ...String(path||'').split('/').filter(Boolean).map(readablePathPart)];
+  return '/#/'+segs.join('/');
+}
 async function api(path,opts){
   const r=await fetch(path,opts);
   const ct=r.headers.get('content-type')||'';
@@ -1340,6 +1344,12 @@ function actionsHtml(kb,rp,ext,docId,mdPath,assetsDir){
       data-md="${esc(mdPath||'')}" data-ref="${esc(assetsDir||'')}">⋯</button>
   </div>`;
 }
+function folderActionsHtml(sub){
+  return `<div class="file-actions">
+    <button class="act-btn" data-act="copy" data-path="${esc(sub)}" data-isfolder="1">${ICO.link}复制地址</button>
+    <button class="btn-more" data-act="more" data-path="${esc(sub)}" data-isfolder="1">⋯</button>
+  </div>`;
+}
 function colorDotHtml(kb,rp){
   const c=COLORS[fkey(kb,rp)];
   return c?`<span class="color-dot" style="background:${c}"></span>`:'';
@@ -1391,9 +1401,7 @@ function folderCard(kb,sub,f){
   return `<div class="thumb-card" data-act="enter" data-path="${esc(sub)}">
     <div class="tc-img">${folderIcon(sub)}</div>
     <div class="tc-name">${esc(f.name)}${dot}</div>
-    <div class="file-actions">
-      <button class="btn-more" data-act="more" data-path="${esc(sub)}" data-isfolder="1">⋯</button>
-    </div>
+    ${folderActionsHtml(sub)}
   </div>`;
 }
 // 排序:文件夹永远按名称;文件按当前 SORT
@@ -1444,9 +1452,7 @@ async function loadDir(){
           <div class="file-icon">${folderIcon(sub)}</div>
           <div class="file-name-wrap">
             <span class="file-name">${esc(f.name)}</span>${dot}
-            <div class="file-actions">
-              <button class="btn-more" data-act="more" data-path="${esc(sub)}" data-isfolder="1">⋯</button>
-            </div>
+            ${folderActionsHtml(sub)}
           </div>
           <div class="file-meta file-size"></div>
           <div class="file-meta file-date">${fmtDate(f.modified)}</div>
@@ -2091,7 +2097,7 @@ document.getElementById('listArea').addEventListener('click',e=>{
   else if(act==='viewmd') showMarkdownPreview(`/api/doc/${el.dataset.id}/md`, el.dataset.name);
   else if(act==='del') delDoc(+el.dataset.id);
   else if(act==='fav') toggleFav(kb,path);
-  else if(act==='copy') doCopyAddr(el,kb,path);
+  else if(act==='copy') doCopyAddr(el,kb,path,el.dataset.isfolder==='1');
   else if(act==='more') showMoreMenu(el,kb,path,el.dataset.id,el.dataset.md,el.dataset.ref,el.dataset.isfolder==='1');
   else if(act==='notecard'){ const n=findNote(el.dataset.id,el.dataset.scope); if(n) openNote(n); }
   else if(act==='noteedit') startEditNote(el.dataset.id, el.dataset.scope);
@@ -2151,8 +2157,8 @@ function toggleFav(kb,rp,isFolder){
   refreshDrawer();
   if(VIEW==='list') loadDir();
 }
-async function doCopyAddr(btn,kb,rp){
-  const url=(CUSTOM_DOMAIN||location.origin)+readableRawUrl(rp,kb);
+async function doCopyAddr(btn,kb,rp,isFolder){
+  const url=(CUSTOM_DOMAIN||location.origin)+(isFolder?readableDirUrl(rp,kb):readableRawUrl(rp,kb));
   const ok=await copyText(url);
   if(ok){
     btn.classList.add('copied');
