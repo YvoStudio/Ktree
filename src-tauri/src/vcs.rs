@@ -47,6 +47,79 @@ fn binding_target_dir(kb: &KnowledgeBase, b: &VcsBinding) -> anyhow::Result<(Pat
     Ok((target, prefix))
 }
 
+fn vcs_command(program: &str) -> Command {
+    Command::new(resolve_vcs_program(program))
+}
+
+fn resolve_vcs_program(program: &str) -> PathBuf {
+    let direct = Path::new(program);
+    if direct.components().count() > 1 {
+        return direct.to_path_buf();
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(program);
+            if candidate.exists() {
+                return candidate;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let candidate = dir.join(format!("{program}.exe"));
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    // macOS GUI apps do not inherit the user's shell PATH, so Homebrew tools
+    // are often invisible unless we probe the common install locations.
+    #[cfg(target_os = "macos")]
+    for candidate in [
+        format!("/opt/homebrew/bin/{program}"),
+        format!("/usr/local/bin/{program}"),
+        format!("/usr/bin/{program}"),
+        format!("/bin/{program}"),
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return path;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    for candidate in match program {
+        "git" => [
+            r"C:\Program Files\Git\cmd\git.exe",
+            r"C:\Program Files\Git\bin\git.exe",
+            r"C:\Program Files (x86)\Git\cmd\git.exe",
+            r"C:\Program Files (x86)\Git\bin\git.exe",
+            "",
+            "",
+        ],
+        "svn" => [
+            r"C:\Program Files\TortoiseSVN\bin\svn.exe",
+            r"C:\Program Files\SlikSvn\bin\svn.exe",
+            r"C:\Program Files\Subversion\bin\svn.exe",
+            r"C:\Program Files (x86)\TortoiseSVN\bin\svn.exe",
+            r"C:\Program Files (x86)\SlikSvn\bin\svn.exe",
+            r"C:\Program Files (x86)\Subversion\bin\svn.exe",
+        ],
+        _ => ["", "", "", "", "", ""],
+    } {
+        if candidate.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return path;
+        }
+    }
+
+    PathBuf::from(program)
+}
+
 /// 把可选凭证注入到 https://… 形式的 URL 里(git 用)。
 /// 已经带 user:pass 的 URL 不动。其他形式(ssh://、git@host:…)也不动,留给系统凭证。
 fn git_url_with_creds(url: &str, user: &str, pass: &str) -> String {
@@ -163,14 +236,14 @@ fn git_sparse_checkout(workdir: &Path, b: &VcsBinding, repo_sub: &str) -> anyhow
     let branch = b.branch.trim();
     if workdir.join(".git").exists() {
         // 已有工作副本:刷新稀疏集合(repo_sub 可能改过)→ fetch → reset 到上游
-        let mut sp = Command::new("git");
+        let mut sp = vcs_command("git");
         sp.current_dir(workdir)
             .args(["sparse-checkout", "set", repo_sub]);
         run_cmd(sp, "git sparse-checkout set")?;
-        let mut fetch = Command::new("git");
+        let mut fetch = vcs_command("git");
         fetch.current_dir(workdir).args(["fetch", "--prune"]);
         run_cmd(fetch, "git fetch")?;
-        let mut reset = Command::new("git");
+        let mut reset = vcs_command("git");
         reset.current_dir(workdir).arg("reset").arg("--hard");
         if branch.is_empty() {
             reset.arg("@{u}");
@@ -187,22 +260,22 @@ fn git_sparse_checkout(workdir: &Path, b: &VcsBinding, repo_sub: &str) -> anyhow
             let _ = fs::remove_dir_all(workdir);
             git_sparse_clone(&url, workdir, branch, false)?;
         }
-        let mut sp = Command::new("git");
+        let mut sp = vcs_command("git");
         sp.current_dir(workdir)
             .args(["sparse-checkout", "set", repo_sub]);
         run_cmd(sp, "git sparse-checkout set")?;
-        let mut co = Command::new("git");
+        let mut co = vcs_command("git");
         co.current_dir(workdir).arg("checkout");
         run_cmd(co, "git checkout")?;
     }
-    let mut head = Command::new("git");
+    let mut head = vcs_command("git");
     head.current_dir(workdir).args(["rev-parse", "HEAD"]);
     Ok(run_cmd(head, "git rev-parse HEAD")?.trim().to_string())
 }
 
 /// 一次稀疏 clone(不检出工作树)。`partial=true` 时带 `--filter=blob:none`。
 fn git_sparse_clone(url: &str, workdir: &Path, branch: &str, partial: bool) -> anyhow::Result<()> {
-    let mut clone = Command::new("git");
+    let mut clone = vcs_command("git");
     clone.args(["clone", "--no-checkout", "--sparse"]);
     if partial {
         clone.arg("--filter=blob:none");
@@ -282,10 +355,10 @@ fn git_whole_repo(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
         } else {
             Some(b.branch.trim().to_string())
         };
-        let mut fetch = Command::new("git");
+        let mut fetch = vcs_command("git");
         fetch.current_dir(target).arg("fetch").arg("--prune");
         run_cmd(fetch, "git fetch")?;
-        let mut reset = Command::new("git");
+        let mut reset = vcs_command("git");
         reset.current_dir(target).arg("reset").arg("--hard");
         if let Some(br) = &branch {
             reset.arg(format!("origin/{br}"));
@@ -294,7 +367,7 @@ fn git_whole_repo(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
         }
         let _ = run_cmd(reset, "git reset --hard");
         // 严格镜像:untracked 文件 / 目录全部清掉
-        let mut clean = Command::new("git");
+        let mut clean = vcs_command("git");
         clean.current_dir(target).args(["clean", "-fd"]);
         let _ = run_cmd(clean, "git clean -fd");
     } else {
@@ -306,7 +379,7 @@ fn git_whole_repo(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
         {
             fs::remove_dir_all(target)?;
         }
-        let mut clone = Command::new("git");
+        let mut clone = vcs_command("git");
         clone.arg("clone").arg(&url).arg(target);
         if !b.branch.trim().is_empty() {
             clone.arg("--branch").arg(b.branch.trim());
@@ -314,7 +387,7 @@ fn git_whole_repo(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
         run_cmd(clone, "git clone")?;
     }
     // 取当前 HEAD sha 当 revision
-    let mut head = Command::new("git");
+    let mut head = vcs_command("git");
     head.current_dir(target).arg("rev-parse").arg("HEAD");
     Ok(run_cmd(head, "git rev-parse HEAD")?.trim().to_string())
 }
@@ -323,7 +396,7 @@ fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<Strin
     if target.join(".svn").exists() {
         // 上次 checkout / update 中断会留下锁(E155004),先 cleanup 再 update。
         // cleanup 自身失败不管,让 update 报真实错误。
-        let mut cleanup = Command::new("svn");
+        let mut cleanup = vcs_command("svn");
         cleanup
             .current_dir(target)
             .arg("cleanup")
@@ -358,7 +431,7 @@ fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<Strin
     if !target.join(".svn").exists() {
         return svn_remote_revision(b);
     }
-    let mut info = Command::new("svn");
+    let mut info = vcs_command("svn");
     info.current_dir(target)
         .arg("info")
         .arg("--show-item")
@@ -377,7 +450,7 @@ fn svn_add_auth(cmd: &mut Command, b: &VcsBinding) {
 }
 
 fn svn_update(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
-    let mut up = Command::new("svn");
+    let mut up = vcs_command("svn");
     up.current_dir(target).arg("update");
     svn_add_auth(&mut up, b);
     run_cmd(up, "svn update")?;
@@ -408,7 +481,7 @@ fn svn_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut co = Command::new("svn");
+    let mut co = vcs_command("svn");
     co.arg("checkout")
         .arg(&b.url)
         .arg(target);
@@ -432,7 +505,7 @@ fn svn_export_marker_revision(target: &Path) -> Option<String> {
 }
 
 fn svn_remote_revision(b: &VcsBinding) -> anyhow::Result<String> {
-    let mut info = Command::new("svn");
+    let mut info = vcs_command("svn");
     info.arg("info")
         .arg("--show-item")
         .arg("revision")
@@ -442,7 +515,7 @@ fn svn_remote_revision(b: &VcsBinding) -> anyhow::Result<String> {
 }
 
 fn svn_list_recursive_files(b: &VcsBinding) -> anyhow::Result<Vec<String>> {
-    let mut ls = Command::new("svn");
+    let mut ls = vcs_command("svn");
     ls.arg("list").arg("--xml").arg("-R").arg(&b.url);
     svn_add_auth(&mut ls, b);
     parse_svn_list_xml_files(&run_cmd(ls, "svn list --xml")?)
@@ -515,7 +588,7 @@ fn xml_unescape(s: &str) -> anyhow::Result<String> {
 }
 
 fn svn_cat(b: &VcsBinding, rel: &str) -> anyhow::Result<Vec<u8>> {
-    let mut cat = Command::new("svn");
+    let mut cat = vcs_command("svn");
     cat.arg("cat").arg(svn_url_with_rel(&b.url, rel));
     svn_add_auth(&mut cat, b);
     run_cmd_bytes(cat, "svn cat")
@@ -606,7 +679,7 @@ fn svn_export_without_workcopy(target: &Path, b: &VcsBinding) -> anyhow::Result<
 
 /// 删除 svn 工作副本里所有 unversioned 的文件 / 目录(`svn status` 的 '?' 行)。
 fn svn_clean_unversioned(target: &Path) {
-    let mut status = Command::new("svn");
+    let mut status = vcs_command("svn");
     status.current_dir(target).arg("status");
     let Ok(out) = run_cmd(status, "svn status") else {
         return;
