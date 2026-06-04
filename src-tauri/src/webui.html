@@ -1362,9 +1362,18 @@ function fileIconHtml(kb,f,thumbSm){
   }
   return fileIcon(f.name);
 }
+function previewPathOf(f){
+  const rel=String(f.rel_path||'');
+  const md=String(f.md_path||'');
+  if(!md) return rel;
+  // md_path 只是 docs/ 下的同名镜像时,预览直接走 src 原文件;真正转换出来的 md 仍走 md_path。
+  if(rel.startsWith('src/') && md==='docs/'+rel.slice(4)) return rel;
+  if(!rel.startsWith('src/') && !rel.startsWith('docs/') && md==='docs/'+rel) return 'src/'+rel;
+  return md||rel;
+}
 function fileRow(kb,f){
   // f: {name, rel_path, ext, size, modified, doc_id, md_path}
-  const previewPath=f.md_path||f.rel_path;
+  const previewPath=previewPathOf(f);
   const previewName=previewPath.split('/').pop();
   const isThumbSm=VIEW_MODE==='thumb-sm';
   return `<div class="file-item${isThumbSm?' thumb-sm':''}" data-act="view" data-kb="${esc(kb)}"
@@ -1380,7 +1389,7 @@ function fileRow(kb,f){
 }
 function fileCard(kb,f){
   // 大缩略图卡片
-  const previewPath=f.md_path||f.rel_path;
+  const previewPath=previewPathOf(f);
   const previewName=previewPath.split('/').pop();
   const ext=(f.ext||extOf(f.name||'')).toLowerCase();
   const isImg=IMG_EXT.has(ext);
@@ -2057,11 +2066,10 @@ async function doSearch(){
     box.innerHTML=hits.map(h=>{
       // 优先用真实 md_path / rel_path 走 'view' 分发(html → iframe, md → markdown, 图片 → 图片浏览)
       // 旧索引/missing 字段则回落到 'viewmd' 读转换后的 md(用 lossy 解码)
-      const previewPath=h.md_path||h.rel_path||'';
+      const previewPath=previewPathOf(h);
       const previewName=previewPath?previewPath.split('/').pop():(h.title+'.md');
       if(previewPath && h.kb_id){
-        // 文件所在目录:指向 docs 阅读视图(检索是为了找内容读;预览打开的也是 docs 下的文件)。
-        // src 是上传/同步的文件管理区,不作为阅读入口。
+        // 文件所在目录仍指向 docs 阅读视图;预览路径由 previewPathOf 决定。
         const relP=h.rel_path||'';
         const dirRel=relP.includes('/')?relP.substring(0,relP.lastIndexOf('/')):'';
         const dirPath=dirRel?('docs/'+dirRel):'docs';
