@@ -90,21 +90,24 @@ REST API 与 `/mcp` 绑 `0.0.0.0`,局域网可访问,**默认无鉴权,面向可
 `PUT /api/config`,以及对应的 MCP 写工具)**仅限本机 `127.0.0.1` 调用**,局域网调用会被拒。
 检索 / 读取 / 上传文档等不受此限。公网暴露请自行在前置网关加鉴权。
 
-## MCP 接入(让 AI 直接读知识库)
+## MCP 接入(Claude / Codex)
 
-Ktree 在 `/mcp` 暴露 MCP Server(Streamable HTTP transport),工具:
+Ktree 在 `http://<host>:<port>/mcp` 暴露 Streamable HTTP MCP Server。AI 客户端接入后即可直接检索、读取和写入知识库:
 
-- **检索 / 读取** — `kb_list`、`kb_search`、`kb_get_doc`、`kb_list_docs`、`kb_get_config`
-- **写入内容** — `kb_upload`
-- **配置管理(仅本机)** — `kb_create`、`kb_set_feishu`、`kb_add_vcs`、`kb_update_vcs`、`kb_remove_vcs`
+- **检索 / 读取**:`kb_list`、`kb_search`、`kb_get_doc`、`kb_list_docs`、`kb_get_config`
+- **写入内容**:`kb_upload`
+- **配置管理(仅本机)**:`kb_create`、`kb_add_vcs`、`kb_update_vcs`、`kb_remove_vcs`
+- **记事板**:`kb_list_notes`、`kb_add_note`
 
-### Claude Code
+`<host>` 按使用场景替换:同机用 `127.0.0.1`,局域网其它机器用 Ktree 控制台 / 设置页显示的 IP。
+
+### Claude
 
 ```bash
 claude mcp add --transport http ktree http://192.168.1.10:8080/mcp
 ```
 
-或写进项目的 `.mcp.json`:
+也可以写进项目 `.mcp.json` 或 Claude Desktop 配置:
 
 ```json
 {
@@ -117,22 +120,7 @@ claude mcp add --transport http ktree http://192.168.1.10:8080/mcp
 }
 ```
 
-### Claude Desktop
-
-新版 Claude Desktop 支持 HTTP MCP,在 `claude_desktop_config.json` 写:
-
-```json
-{
-  "mcpServers": {
-    "ktree": {
-      "type": "http",
-      "url": "http://192.168.1.10:8080/mcp"
-    }
-  }
-}
-```
-
-只支持 stdio 的旧客户端,可用 `mcp-remote` 桥接:
+旧客户端如果不支持 HTTP MCP,用 `mcp-remote` 桥接:
 
 ```json
 {
@@ -145,7 +133,22 @@ claude mcp add --transport http ktree http://192.168.1.10:8080/mcp
 }
 ```
 
-接入后,直接让 AI「搜一下知识库里关于 X 的文档」即可。配置管理类工具需 AI 与 Ktree 在同一台机器上才能调用。
+### Codex
+
+推荐用 Codex CLI 添加(配置会被 Codex CLI / IDE Extension 共享):
+
+```bash
+codex mcp add ktree --url http://127.0.0.1:8080/mcp
+```
+
+也可以手动写入 `~/.codex/config.toml`,或可信项目的 `.codex/config.toml`:
+
+```toml
+[mcp_servers.ktree]
+url = "http://127.0.0.1:8080/mcp"
+```
+
+接入后可直接对 Claude / Codex 说:「用 Ktree 搜一下知识库里关于 X 的文档」。配置管理类工具仅允许本机调用,所以 AI 客户端和 Ktree 不在同一台机器时只能检索 / 读取 / 上传内容。
 
 ## 飞书同步
 

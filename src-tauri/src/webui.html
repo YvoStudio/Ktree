@@ -905,7 +905,7 @@ function showOpsDialog(initialTab){
 }
 
 // ---------- AI 接入说明 ----------
-// 给 Claude Code / Claude Desktop / 其它 MCP 客户端、以及 curl/REST 调用方提供一键复制的接入参数。
+// 给 Claude / Codex / 其它 MCP 客户端提供一键复制的接入参数。
 // URL 直接用当前浏览器访问 webui 的 origin,这样在哪个地址打开页面就给哪个地址,
 // 同一局域网内其他机器把 hostname 换成本机 LAN IP 即可。
 function renderAiBlock(){
@@ -913,20 +913,18 @@ function renderAiBlock(){
   const isLocal=/^(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(location.host);
   const restBase=`${origin}/api`;
   const mcpUrl=`${origin}/mcp`;
-  const cliCmd=`claude mcp add --transport http ktree ${mcpUrl}`;
-  const jsonCfg=JSON.stringify({
+  const claudeCmd=`claude mcp add --transport http ktree ${mcpUrl}`;
+  const codexCmd=`codex mcp add ktree --url ${mcpUrl}`;
+  const claudeCfg=JSON.stringify({
     mcpServers:{ ktree:{ type:'http', url:mcpUrl } }
   }, null, 2);
-  const stdioCfg=JSON.stringify({
-    mcpServers:{ ktree:{ command:'npx', args:['-y','mcp-remote',mcpUrl] } }
-  }, null, 2);
+  const codexCfg=`[mcp_servers.ktree]\nurl = "${mcpUrl}"`;
   const restSample=`curl "${restBase}/search?q=关键字&limit=10"`;
   return `
     <div class="ops-ai-block">
       <div class="ops-ai-intro">
-        知识库已在 <b>${esc(origin)}</b> 提供 REST + MCP 接口。
-        把下方 URL 配进 Claude Code / Claude Desktop / 任意 MCP 客户端,
-        AI 即可检索本知识库;同一局域网其它机器把 hostname 改成本机 IP 即可访问。
+        Ktree 已在 <b>${esc(origin)}</b> 提供 MCP 接口。接入 Claude / Codex 后,
+        直接说「用 Ktree 搜一下关于 X 的文档」即可。
       </div>
       <div class="ops-ai-row">
         <span class="lbl">REST API</span>
@@ -940,35 +938,43 @@ function renderAiBlock(){
       </div>
       <div class="ops-ai-cmd">
         <div class="ops-ai-cmd-head">
-          <span>Claude Code 一键接入</span>
-          <button class="btn ghost sm" data-ai-copy="${esc(cliCmd)}">复制</button>
+          <span>Claude 一键接入</span>
+          <button class="btn ghost sm" data-ai-copy="${esc(claudeCmd)}">复制</button>
         </div>
-        <code class="ops-ai-cmd-body">${esc(cliCmd)}</code>
+        <code class="ops-ai-cmd-body">${esc(claudeCmd)}</code>
       </div>
       <div class="ops-ai-cmd">
         <div class="ops-ai-cmd-head">
-          <span>Claude Desktop / 新版客户端(HTTP transport)</span>
-          <button class="btn ghost sm" data-ai-copy="${esc(jsonCfg)}">复制</button>
+          <span>Codex 一键接入</span>
+          <button class="btn ghost sm" data-ai-copy="${esc(codexCmd)}">复制</button>
         </div>
-        <pre class="ops-ai-cmd-body">${esc(jsonCfg)}</pre>
+        <code class="ops-ai-cmd-body">${esc(codexCmd)}</code>
       </div>
       <div class="ops-ai-cmd">
         <div class="ops-ai-cmd-head">
-          <span>只支持 stdio 的旧客户端(用 mcp-remote 桥接)</span>
-          <button class="btn ghost sm" data-ai-copy="${esc(stdioCfg)}">复制</button>
+          <span>Claude 手动配置(.mcp.json / Desktop)</span>
+          <button class="btn ghost sm" data-ai-copy="${esc(claudeCfg)}">复制</button>
         </div>
-        <pre class="ops-ai-cmd-body">${esc(stdioCfg)}</pre>
+        <pre class="ops-ai-cmd-body">${esc(claudeCfg)}</pre>
       </div>
       <div class="ops-ai-cmd">
         <div class="ops-ai-cmd-head">
-          <span>REST 调用示例(脚本 / 客户端)</span>
+          <span>Codex 手动配置(config.toml)</span>
+          <button class="btn ghost sm" data-ai-copy="${esc(codexCfg)}">复制</button>
+        </div>
+        <pre class="ops-ai-cmd-body">${esc(codexCfg)}</pre>
+      </div>
+      <div class="ops-ai-cmd">
+        <div class="ops-ai-cmd-head">
+          <span>REST 调用示例</span>
           <button class="btn ghost sm" data-ai-copy="${esc(restSample)}">复制</button>
         </div>
         <code class="ops-ai-cmd-body">${esc(restSample)}</code>
       </div>
       <div class="ops-ai-hint">
-        MCP 工具:<code>kb_search</code> / <code>kb_get_doc</code> / <code>kb_list_categories</code> /
-        <code>kb_list_docs</code> / <code>kb_upload</code>。
+        MCP 工具:<code>kb_search</code> / <code>kb_get_doc</code> / <code>kb_list_docs</code> /
+        <code>kb_upload</code> / <code>kb_list_notes</code>。
+        旧客户端不支持 HTTP MCP 时,可用 <code>npx -y mcp-remote ${esc(mcpUrl)}</code> 桥接。
         ${isLocal?'<br>当前访问的是 <code>'+esc(location.hostname)+'</code>,给其它机器用时请把 hostname 换成本机 LAN IP。':''}
       </div>
     </div>`;
