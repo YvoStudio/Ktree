@@ -427,11 +427,77 @@ fn svn_remote_revision(b: &VcsBinding) -> anyhow::Result<String> {
     Ok(run_cmd(info, "svn info revision")?.trim().to_string())
 }
 
-fn svn_list_recursive(b: &VcsBinding) -> anyhow::Result<String> {
+fn svn_list_recursive_files(b: &VcsBinding) -> anyhow::Result<Vec<String>> {
     let mut ls = Command::new("svn");
-    ls.arg("list").arg("-R").arg(&b.url);
+    ls.arg("list").arg("--xml").arg("-R").arg(&b.url);
     svn_add_auth(&mut ls, b);
-    run_cmd(ls, "svn list")
+    parse_svn_list_xml_files(&run_cmd(ls, "svn list --xml")?)
+}
+
+fn parse_svn_list_xml_files(xml: &str) -> anyhow::Result<Vec<String>> {
+    let mut files = Vec::new();
+    let mut rest = xml;
+    while let Some(entry_start) = rest.find("<entry") {
+        rest = &rest[entry_start..];
+        let Some(entry_end) = rest.find("</entry>") else {
+            anyhow::bail!("svn list --xml 输出不完整:缺少 </entry>");
+        };
+        let entry = &rest[..entry_end + "</entry>".len()];
+        if entry.contains("kind=\"file\"") {
+            let name_start = entry
+                .find("<name>")
+                .ok_or_else(|| anyhow::anyhow!("svn list --xml 输出不完整:缺少 <name>"))?
+                + "<name>".len();
+            let name_end = entry[name_start..]
+                .find("</name>")
+                .ok_or_else(|| anyhow::anyhow!("svn list --xml 输出不完整:缺少 </name>"))?
+                + name_start;
+            files.push(xml_unescape(&entry[name_start..name_end])?);
+        }
+        rest = &rest[entry_end + "</entry>".len()..];
+    }
+    Ok(files)
+}
+
+fn xml_unescape(s: &str) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos + 1..];
+        let Some(end) = rest.find(';') else {
+            anyhow::bail!("XML 转义不完整");
+        };
+        let entity = &rest[..end];
+        match entity {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ if entity.starts_with("#x") => {
+                let code = u32::from_str_radix(&entity[2..], 16)
+                    .map_err(|_| anyhow::anyhow!("非法 XML 字符引用: &{entity};"))?;
+                out.push(
+                    char::from_u32(code)
+                        .ok_or_else(|| anyhow::anyhow!("非法 XML 字符引用: &{entity};"))?,
+                );
+            }
+            _ if entity.starts_with('#') => {
+                let code = entity[1..]
+                    .parse::<u32>()
+                    .map_err(|_| anyhow::anyhow!("非法 XML 字符引用: &{entity};"))?;
+                out.push(
+                    char::from_u32(code)
+                        .ok_or_else(|| anyhow::anyhow!("非法 XML 字符引用: &{entity};"))?,
+                );
+            }
+            _ => anyhow::bail!("未知 XML 实体: &{entity};"),
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 fn svn_cat(b: &VcsBinding, rel: &str) -> anyhow::Result<Vec<u8>> {
@@ -493,13 +559,12 @@ fn svn_export_without_workcopy(target: &Path, b: &VcsBinding) -> anyhow::Result<
     let _ = fs::remove_dir_all(target);
     fs::create_dir_all(target)?;
     let mut skipped = Vec::new();
-    for line in svn_list_recursive(b)?.lines() {
-        let rel = line.trim_end_matches('\r');
+    for rel in svn_list_recursive_files(b)? {
         if rel.is_empty() || rel.ends_with('/') {
             continue;
         }
-        let Some(dst_rel) = svn_export_rel_path(rel) else {
-            skipped.push(rel.to_string());
+        let Some(dst_rel) = svn_export_rel_path(&rel) else {
+            skipped.push(rel);
             continue;
         };
         let dst = target.join(dst_rel);
@@ -511,7 +576,7 @@ fn svn_export_without_workcopy(target: &Path, b: &VcsBinding) -> anyhow::Result<
         } else {
             let _ = fs::remove_file(&dst);
         }
-        fs::write(dst, svn_cat(b, rel)?)?;
+        fs::write(dst, svn_cat(b, &rel)?)?;
     }
     let marker = format!(
         "SVN working copy fallback export. Skipped Windows-invalid paths:\n{}\n",
