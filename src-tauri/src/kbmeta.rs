@@ -76,10 +76,28 @@ pub fn extract_tags(stem: &str) -> Vec<String> {
 // ============ frontmatter ============
 
 /// 取 rel_path 的顶层目录作为分类;根目录下文档归为「未分类」。
+///
+/// rel_path 带区前缀(upload/、vcs/、cloud/<provider>/),分类时跳过这层
+/// 「来源渠道」前缀,取内容本身的顶层目录:
+///   upload/策划/需求.docx        → 策划
+///   upload/需求.docx             → 未分类
+///   vcs/策划文档/子目录/需求.md   → 策划文档(绑定名)
+///   cloud/feishu/产品需求/xx.md  → 产品需求(绑定名)
 pub fn category_of(rel_path: &str) -> String {
-    match rel_path.split('/').next() {
-        Some(first) if rel_path.contains('/') && !first.is_empty() => first.to_string(),
-        _ => "未分类".to_string(),
+    let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+    let rest: &[&str] = match parts.first() {
+        Some(&"upload") => &parts[1..],
+        // vcs 区:绑定名就是分类
+        Some(&"vcs") => &parts[1..],
+        // cloud 区:跳过 cloud/<provider>,绑定名就是分类
+        Some(&"cloud") if parts.len() > 2 => &parts[2..],
+        Some(&"cloud") => &parts[1..],
+        _ => &parts[..],
+    };
+    if rest.len() > 1 && !rest[0].is_empty() {
+        rest[0].to_string()
+    } else {
+        "未分类".to_string()
     }
 }
 
@@ -144,7 +162,7 @@ pub fn regenerate_meta(kb: &KnowledgeBase, docs: &[Document]) -> anyhow::Result<
             .or_default()
             .push(d);
     }
-    let mut idx = String::from("# 知识库索引\n\n> 每篇文档一行。按关键词查找请看 KEYWORDS.md。勿手动编辑,由 Ktree 自动生成。\n");
+    let mut idx = String::from("# 知识库索引\n\n> 每篇文档一行(路径 — 摘要 [标签])。勿手动编辑,由 Ktree 自动生成。\n");
     for (cat, list) in &by_cat {
         idx.push_str(&format!("\n## {cat}\n\n"));
         for d in list {
@@ -158,21 +176,8 @@ pub fn regenerate_meta(kb: &KnowledgeBase, docs: &[Document]) -> anyhow::Result<
     }
     fs::write(meta_dir.join("INDEX.md"), idx)?;
 
-    // ---- KEYWORDS.md:标签 → 文档路径 倒排 ----
-    let mut kw: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for d in docs {
-        for tag in d.tags.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            kw.entry(tag.to_string())
-                .or_default()
-                .push(d.rel_path.clone());
-        }
-    }
-    let mut kws = String::from("# 关键词索引\n\n> 关键词 → 文档路径。勿手动编辑,由 Ktree 自动生成。\n\n");
-    for (tag, paths) in &kw {
-        let refs: Vec<String> = paths.iter().map(|p| format!("`{p}`")).collect();
-        kws.push_str(&format!("**{}**: {}\n", tag, refs.join(", ")));
-    }
-    fs::write(meta_dir.join("KEYWORDS.md"), kws)?;
+    // KEYWORDS.md 已废弃(无人读,标签倒排价值被混合检索覆盖):存量库里若残留则顺手删掉。
+    let _ = fs::remove_file(meta_dir.join("KEYWORDS.md"));
 
     Ok(())
 }

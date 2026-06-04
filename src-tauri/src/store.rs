@@ -146,6 +146,13 @@ impl Store {
                 pinned      INTEGER NOT NULL DEFAULT 0,
                 created_at  INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS sync_state (
+                kind        TEXT NOT NULL,
+                kb_id       TEXT NOT NULL,
+                binding_idx INTEGER NOT NULL,
+                data        TEXT NOT NULL,
+                PRIMARY KEY (kind, kb_id, binding_idx)
+            );
             "#,
         )?;
         // 老库补列(已存在则忽略报错)
@@ -361,6 +368,54 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    // ----- 同步状态(sync_state):绑定的最近一次同步结果,JSON 存储 -----
+
+    /// 保存某绑定的最近一次同步状态(LastSync 的 JSON)。kind:"vcs" | "cloud"。
+    pub fn save_sync_state(
+        &self,
+        kind: &str,
+        kb_id: &str,
+        binding_idx: usize,
+        data_json: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (kind, kb_id, binding_idx, data) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(kind, kb_id, binding_idx) DO UPDATE SET data = ?4",
+            params![kind, kb_id, binding_idx as i64, data_json],
+        )?;
+        Ok(())
+    }
+
+    /// 载入某类绑定的全部同步状态:(kb_id, binding_idx, json)。
+    pub fn load_sync_states(&self, kind: &str) -> anyhow::Result<Vec<(String, usize, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT kb_id, binding_idx, data FROM sync_state WHERE kind = ?1")?;
+        let rows = stmt.query_map(params![kind], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as usize,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 删除某绑定的同步状态(删除绑定时清理)。
+    pub fn delete_sync_state(&self, kind: &str, kb_id: &str, binding_idx: usize) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE kind = ?1 AND kb_id = ?2 AND binding_idx = ?3",
+            params![kind, kb_id, binding_idx as i64],
+        )?;
+        Ok(())
     }
 
     // ----- 记事板(notes)-----

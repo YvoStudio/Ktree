@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -53,6 +54,23 @@ pub(crate) fn safe_rel_path(s: &str) -> Option<String> {
     } else {
         Some(parts.join("/"))
     }
+}
+
+/// 判断 src/ 下的相对路径是否落在用户上传区(src/upload/)内。
+/// vcs/、cloud/ 区只读,一切写操作(上传 / 建目录 / 删除)只允许 upload 区。
+pub(crate) fn in_upload_area(src_rel: &str) -> bool {
+    src_rel == crate::config::AREA_UPLOAD
+        || src_rel.starts_with(&format!("{}/", crate::config::AREA_UPLOAD))
+}
+
+/// 文档 md 的伴生资源目录(相对 docs/ 的路径):`<父目录>/<文件名去扩展名>.assets`。
+/// 转换出的图片附件都放这里,md 内用同目录相对路径 `<stem>.assets/xxx.png` 引用。
+pub(crate) fn assets_rel_of(rel_path: &str) -> String {
+    let stem = Path::new(rel_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("untitled");
+    with_name(rel_path, &format!("{stem}.assets"))
 }
 
 /// 文本类扩展名:不转换时直接把原文当作可索引正文。
@@ -137,13 +155,22 @@ pub fn ingest_file(
         .to_string();
     let category = kbmeta::category_of(rel_path);
 
-    // 增量:manifest md5 未变且 SQLite 已有 → 跳过
+    // 增量:manifest md5 未变 且 SQLite 已有 且 docs 产物文件仍在 → 跳过。
+    // 多加一道"docs 产物存在性"检查:换 URL / 改结构 / 软链断裂等导致 docs 失步时,
+    // 不能因 md5 匹配就短路 —— 那样缺失的 docs 产物永远补不回来。docs 不在则重新生成。
     let mut manifest = kbmeta::load_manifest(&kb.root);
     if !force {
         if let Some(entry) = manifest.get(rel_path) {
             if entry.md5 == md5 {
                 if let Some(doc) = state.store.get_by_path(&kb.id, rel_path)? {
-                    return Ok(doc);
+                    let docs_ok = doc
+                        .md_path
+                        .as_ref()
+                        .map(|md| kb.root.join(md).exists())
+                        .unwrap_or(true);
+                    if docs_ok {
+                        return Ok(doc);
+                    }
                 }
             }
         }
@@ -151,16 +178,15 @@ pub fn ingest_file(
 
     // docs/ 下的 md 相对路径:rel_path 换扩展名为 .md
     let rel_md = with_name(rel_path, &format!("{stem}.md"));
-    // ref/ 下的资源目录相对路径:rel_path 去掉扩展名
-    let rel_ref = with_name(rel_path, &stem);
+    // 图片附件的伴生资源目录(放 md 旁边):docs/<父目录>/<stem>.assets/
+    let rel_assets = assets_rel_of(rel_path);
 
     // 优先尝试转换(非文本可转换格式)。失败/不支持时回落到「软链镜像」。
     let converted = if !is_textual(&ext) && convert_md {
-        let ref_abs = kb.root.join("ref").join(&rel_ref);
-        let depth = rel_md.matches('/').count();
-        let up = "../".repeat(depth + 1);
-        let ref_prefix = format!("{up}ref/{rel_ref}");
-        match convert::convert_file(&src_abs, &ext, &ref_abs, &ref_prefix) {
+        let assets_abs = kb.root.join("docs").join(&rel_assets);
+        // md 与 .assets 同目录,引用前缀就是目录名本身
+        let assets_prefix = format!("{stem}.assets");
+        match convert::convert_file(&src_abs, &ext, &assets_abs, &assets_prefix) {
             Ok(r) if r.ok => Some(r),
             _ => None,
         }
@@ -253,14 +279,94 @@ pub fn ingest_file(
         .ok_or_else(|| anyhow::anyhow!("入库后无法读回文档 id={doc_id}"))
 }
 
-/// 从 SQLite 全量重算某知识库的 .ktree/INDEX.md 与 KEYWORDS.md。
+/// 严格镜像收尾:清理 docs/<prefix> 区下不属于当前 store 文档的孤儿文件与空目录。
+/// vcs/cloud 区是只读镜像,docs 产物应与 store 严格一一对应;基于 store diff 的
+/// delete_doc 清不掉"store 已无记录"的历史失步残留,这里以 store 为真相兜底自愈。
+/// `prefix` 是相对 src/ 的区前缀(如 "vcs/svn"、"cloud/feishu/xxx")。返回清理的文件数。
+pub fn prune_docs_orphans(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    prefix: &str,
+) -> anyhow::Result<usize> {
+    // 当前 store 里该区的全部文档 → 合法的 docs 产物路径(相对 docs/)+ .assets 目录
+    let docs = state.store.list_documents(&kb.id, Some(prefix))?;
+    let mut keep_files: HashSet<String> = HashSet::new();
+    let mut keep_assets: HashSet<String> = HashSet::new();
+    for d in &docs {
+        if let Some(md) = &d.md_path {
+            if let Some(rel) = md.strip_prefix("docs/") {
+                keep_files.insert(rel.to_string());
+            }
+        }
+        keep_assets.insert(assets_rel_of(&d.rel_path)); // 相对 docs/ 的 .assets 目录
+    }
+
+    let docs_base = kb.root.join("docs");
+    let scan_root = docs_base.join(prefix);
+    if !scan_root.is_dir() {
+        return Ok(0);
+    }
+
+    // 递归收集 docs/<prefix> 下所有文件(相对 docs/ 的正斜杠路径)
+    fn walk(base: &Path, rel: &str, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(base.join(rel)) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            match e.file_type() {
+                Ok(t) if t.is_dir() => walk(base, &child, out),
+                Ok(_) => out.push(child),
+                _ => {}
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&docs_base, prefix, &mut files);
+
+    let mut removed = 0;
+    for f in files {
+        if keep_files.contains(&f) {
+            continue;
+        }
+        // 在某个合法 .assets 目录下的资源文件 → 保留
+        if keep_assets.iter().any(|a| f.starts_with(&format!("{a}/"))) {
+            continue;
+        }
+        if fs::remove_file(docs_base.join(&f)).is_ok() {
+            removed += 1;
+        }
+    }
+
+    // 自底向上删空目录(scan_root 本身若空也删,下次同步会重建)
+    fn rm_empty(dir: &Path) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                if e.path().is_dir() {
+                    rm_empty(&e.path());
+                }
+            }
+        }
+        let _ = fs::remove_dir(dir); // 非空会失败,忽略
+    }
+    rm_empty(&scan_root);
+
+    Ok(removed)
+}
+
+/// 从 SQLite 全量重算某知识库的 .ktree/INDEX.md。
 pub fn refresh_kb_meta(state: &AppState, kb: &KnowledgeBase) -> anyhow::Result<()> {
     let docs = state.store.list_documents(&kb.id, None)?;
     kbmeta::regenerate_meta(kb, &docs)
 }
 
-/// 递归删除 src/ 下的一个文件夹及其在 docs/ ref/ manifest SQLite tantivy 里的所有关联。
-/// `src_rel` 是相对 src 的子路径(如 "T1/sub"),不能为空(避免误删整个 src)。
+/// 递归删除 src/ 下的一个文件夹及其在 docs/ manifest SQLite tantivy 里的所有关联。
+/// `src_rel` 是相对 src 的子路径(如 "upload/T1/sub"),不能为空(避免误删整个 src)。
 pub fn delete_folder(
     state: &AppState,
     kb: &KnowledgeBase,
@@ -280,10 +386,9 @@ pub fn delete_folder(
         let _ = state.index.commit();
     }
 
-    // 清理三个真实目录(不存在也不报错)
+    // 清理两个真实目录(不存在也不报错)。docs 目录里的 .assets 伴生目录一并删掉。
     let _ = fs::remove_dir_all(kb.root.join("src").join(src_rel));
     let _ = fs::remove_dir_all(kb.root.join("docs").join(src_rel));
-    let _ = fs::remove_dir_all(kb.root.join("ref").join(src_rel));
 
     // 清理 manifest:删掉所有 key 以 src_rel/ 开头或等于 src_rel 的条目
     let mut manifest = kbmeta::load_manifest(&kb.root);
@@ -294,21 +399,17 @@ pub fn delete_folder(
     Ok(count)
 }
 
-/// 从知识库删除一个文档:删 src 原件、docs 转换产物、ref 资源、manifest 条目、
-/// SQLite + tantivy 缓存。
+/// 从知识库删除一个文档:删 src 原件、docs 转换产物及其 .assets 伴生资源、
+/// manifest 条目、SQLite + tantivy 缓存。
 pub fn delete_doc(state: &AppState, kb: &KnowledgeBase, doc: &Document) -> anyhow::Result<()> {
     let _ = fs::remove_file(kb.root.join("src").join(&doc.rel_path));
     if let Some(md) = &doc.md_path {
         let _ = fs::remove_file(kb.root.join(md));
     }
-    let stem = Path::new(&doc.rel_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    if !stem.is_empty() {
-        let rel_ref = with_name(&doc.rel_path, stem);
-        let _ = fs::remove_dir_all(kb.root.join("ref").join(&rel_ref));
-    }
+    // 伴生资源目录:docs/<父目录>/<stem>.assets/
+    let _ = fs::remove_dir_all(
+        kb.root.join("docs").join(assets_rel_of(&doc.rel_path)),
+    );
 
     let mut manifest = kbmeta::load_manifest(&kb.root);
     manifest.remove(&doc.rel_path);

@@ -58,6 +58,12 @@
   .ops-report { font-size:12px; color:#555; padding:8px 10px; background:#f5f5f5;
     border-radius:6px; margin-top:8px; white-space:pre-wrap; word-break:break-all;
     max-height:280px; overflow-y:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  /* 操作弹窗 - tab 切换 */
+  .ops-tabs { display:flex; gap:2px; margin:10px 0 14px; border-bottom:1px solid var(--line); }
+  .ops-tab { background:none; border:none; padding:8px 16px; font-size:13.5px; color:#888;
+    cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-1px; font-weight:500; }
+  .ops-tab:hover { color:#333; }
+  .ops-tab.active { color:var(--accent); border-bottom-color:var(--accent); font-weight:600; }
   /* 操作弹窗 - AI 接入区块 */
   .ops-sec-title { font-size:11px; font-weight:600; color:#999; letter-spacing:.06em;
     text-transform:uppercase; margin:10px 2px 6px; }
@@ -113,6 +119,9 @@
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .note-line { font-size:12.5px; color:#8a8a8a;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* 失效的知识库链接(目标库已改名/删除) */
+  .note-broken { color:#c0392b; background:#fdf0ee; padding:1px 6px;
+    border-radius:4px; font-size:11px; }
   .note-actions { position:absolute; top:5px; right:6px; display:flex; gap:1px;
     opacity:0; transition:opacity .12s ease; }
   .note-card:hover .note-actions { opacity:1; }
@@ -173,7 +182,18 @@
     cursor:pointer; color:#555; font-size:13px; }
   .tree-item:hover { background:#efefef; color:#111; }
   .tree-item.active { background:var(--accent-bg); color:var(--accent); font-weight:500; }
-  .tree-ico { width:15px; height:15px; flex-shrink:0; }
+  .tree-ico { width:15px; height:15px; flex-shrink:0; position:relative; }
+  /* 系统分区目录(upload/vcs/cloud)的齿轮角标 */
+  .gear-badge { position:absolute; right:-4px; bottom:-4px; width:10px; height:10px;
+    background:#fff; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    box-shadow:0 0 0 1px rgba(0,0,0,.06); }
+  .gear-badge svg { width:8px; height:8px; }
+  .tc-img .gear-badge { width:18px; height:18px; right:8px; bottom:8px; }
+  .tc-img .gear-badge svg { width:14px; height:14px; }
+  /* 系统目录的说明文字(· 阅读视图 / · 上传文件 …):淡灰、不加粗 */
+  .dir-desc { color:#b8b7c0; font-weight:400; font-size:.92em; }
+  .tree-item.active .dir-desc { color:#a99cc9; }
+  .breadcrumb .cur .dir-desc, .breadcrumb a .dir-desc { color:#b8b7c0; }
   .side-status { padding:8px 20px 12px; font-size:12px; color:var(--muted);
     border-top:1px solid var(--line); }
 
@@ -197,6 +217,13 @@
   .search-input:focus { width:260px; background:#fff; box-shadow:0 0 0 1.5px #c7b8e0; }
   .search-input::placeholder { color:#aaa; }
   .search-wrap { position:relative; }
+  .search-clear { position:absolute; right:6px; top:50%; transform:translateY(-50%);
+    width:18px; height:18px; border:none; border-radius:50%; background:#d5d5dc; color:#fff;
+    font-size:13px; line-height:1; cursor:pointer; display:flex;
+    align-items:center; justify-content:center; padding:0; }
+  .search-clear:hover { background:#b9b6cb; }
+  /* 有清空按钮时给输入文字留出右边距 */
+  .search-input { padding-right:28px; }
   .search-hist { position:absolute; top:calc(100% + 4px); left:0; right:0;
     background:#fff; border:1px solid #e2e2e2; border-radius:8px;
     box-shadow:0 8px 26px rgba(0,0,0,.14); z-index:60; overflow:hidden;
@@ -219,8 +246,10 @@
     border-bottom:1px solid #f3f3f3; transition:background .1s; }
   .file-item:hover { background:#fafafa; margin:0 -12px; padding:11px 12px; border-radius:8px; }
   .file-icon { width:26px; height:26px; margin-right:12px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; }
+    display:flex; align-items:center; justify-content:center; position:relative; }
   .file-icon svg { width:26px; height:26px; }
+  .file-icon .gear-badge { width:13px; height:13px; right:-3px; bottom:-1px; }
+  .file-icon .gear-badge svg { width:10px; height:10px; }
   /* 小缩略图模式:file-icon 变成 48×48 带图片预览 */
   .file-item.thumb-sm .file-icon { width:48px; height:48px; margin-right:14px;
     border-radius:4px; overflow:hidden; background:#f5f5f5; }
@@ -299,6 +328,8 @@
   .sr-row .t { font-weight:600; color:#333; display:flex; align-items:center; gap:8px; }
   .sr-row:hover .t { color:var(--link); }
   .sr-row .m { color:var(--muted); font-size:12px; }
+  .sr-row .m .sr-path { color:#9b96c4; cursor:pointer; }
+  .sr-row .m .sr-path:hover { color:var(--accent); text-decoration:underline; }
   .sr-row .s { color:#666; font-size:13px; margin-top:2px; }
   .tag { background:var(--accent-bg); color:var(--accent); padding:1px 7px; border-radius:4px;
     font-size:11px; font-weight:500; }
@@ -447,6 +478,7 @@
         <button class="btn" id="btnNewNote" style="display:none">＋ 新增记事</button>
         <div class="search-wrap">
           <input type="text" id="globalSearch" class="search-input" placeholder="搜索… (回车)" autocomplete="off" />
+          <button class="search-clear" id="searchClear" style="display:none" title="清空搜索">×</button>
           <div class="search-hist" id="searchHist" style="display:none"></div>
         </div>
         <div class="vs-wrap">
@@ -516,12 +548,56 @@ const PREVIEWABLE = new Set([...MD_EXT,...HTML_EXT,...TEXT_EXT,...CODE_EXT,...IM
 // 色点调色板(参考 Haystack)
 const PALETTE = ['#ef4444','#f97316','#eab308','#22c55e','#3b82f6','#a855f7','#6b7280'];
 
-// 文件夹按所属区上色:docs 蓝、src 绿、ref/.ktree 黄
+// 齿轮角标:系统管理的分区目录(upload / vcs / cloud)加在文件夹图标右下角
+const GEAR_SVG=`<svg viewBox="0 0 24 24" fill="none"><path d="M12 15a3 3 0 100-6 3 3 0 000 6z" fill="#666"/><path d="M19.4 13a1.7 1.7 0 00.34 1.87l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.7 1.7 0 00-1.87-.34 1.7 1.7 0 00-1.03 1.56V19a2 2 0 11-4 0v-.09a1.7 1.7 0 00-1.11-1.56 1.7 1.7 0 00-1.87.34l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.7 1.7 0 004.54 13a1.7 1.7 0 00-1.56-1.03H2.9a2 2 0 110-4h.09A1.7 1.7 0 004.55 6.9a1.7 1.7 0 00-.34-1.87l-.06-.06A2 2 0 116.98 2.14l.06.06a1.7 1.7 0 001.87.34h.08A1.7 1.7 0 0010 1a2 2 0 014 0v.09a1.7 1.7 0 001.03 1.56 1.7 1.7 0 001.87-.34l.06-.06a2 2 0 112.83 2.83l-.06.06a1.7 1.7 0 00-.34 1.87v.08c.26.63.87 1.04 1.56 1.03H21a2 2 0 110 4h-.09a1.7 1.7 0 00-1.51.88z" fill="#888"/></svg>`;
+// 哪些路径是"系统分区目录":src/docs 下的 upload / vcs / cloud 一级目录
+function isAreaDir(path){
+  return /^(src|docs)\/(upload|vcs|cloud)$/.test(String(path||''));
+}
+// 文件夹按所属区上色:docs 蓝、src 绿、.ktree 黄;src 下的 vcs/cloud 镜像区用只读色。
+// 分区目录(upload/vcs/cloud)叠加齿轮角标,提示"系统管理的特殊目录"。
 function folderIcon(path){
-  const first=String(path||'').split('/')[0];
-  if(first==='src') return SVG.folderSrc;
-  if(first==='ref' || first==='.ktree') return SVG.folderRO;
-  return SVG.folder;
+  const p=String(path||'');
+  const first=p.split('/')[0];
+  let icon;
+  if(first==='src'){
+    // 仓库同步区 / 云文档区:只读镜像 → 用只读图标
+    icon=(p==='src/vcs'||p.startsWith('src/vcs/')||p==='src/cloud'||p.startsWith('src/cloud/'))
+      ? SVG.folderRO : SVG.folderSrc;
+  }
+  else icon=SVG.folder;
+  if(isAreaDir(p)) icon+=`<span class="gear-badge">${GEAR_SVG}</span>`;
+  return icon;
+}
+// 系统目录的中文说明(树 / 面包屑用);非系统目录无说明。
+// (.ktree 元数据目录对用户隐藏,不在此列)
+const AREA_LABELS={
+  'docs':'阅读视图',
+  'src':'源文件',
+  'src/upload':'上传文件',
+  'src/vcs':'仓库同步',
+  'src/cloud':'云文档',
+};
+// VCS 绑定的最近同步时间:key = kbId,value = { 绑定名: at_unix_ms }。loadTree 时拉取。
+let VCS_SYNC_TIMES={};
+// 目录显示 HTML:目录名(正常色)+ 说明文字(淡灰)。返回值是已转义的 HTML。
+// kbId 传入时,vcs 绑定目录((src|docs)/vcs/<名>)会附带最近同步时间。
+function dirLabelHtml(path,name,kbId){
+  const base=esc(name||String(path||'').split('/').pop());
+  const desc=AREA_LABELS[path];
+  if(desc) return `${base}<span class="dir-desc"> · ${esc(desc)}</span>`;
+  // vcs 绑定目录:显示最近同步时间
+  const m=String(path||'').match(/^(?:src|docs)\/vcs\/([^/]+)$/);
+  if(m && kbId){
+    const ms=(VCS_SYNC_TIMES[kbId]||{})[m[1]];
+    if(ms) return `${base}<span class="dir-desc"> · ${esc(fmtAgo(ms))}更新</span>`;
+  }
+  return base;
+}
+// 该路径是否在只读镜像区(vcs/cloud)内
+function inMirrorArea(path){
+  const p=String(path||'');
+  return p==='src/vcs'||p.startsWith('src/vcs/')||p==='src/cloud'||p.startsWith('src/cloud/');
 }
 function fileIcon(name){
   const ext=(name.split('.').pop()||'').toLowerCase();
@@ -664,12 +740,15 @@ function renderCrumb(){
     let acc='';
     parts.forEach((p,idx)=>{
       acc=acc?acc+'/'+p:p;
+      const label=dirLabelHtml(acc,p,kb.id); // 已转义 HTML(含淡灰说明/同步时间)
       h+='<span class="sep">/</span>';
       h+=(idx===parts.length-1)
-        ? `<span class="cur">${esc(p)}</span>`
-        : `<a data-nav data-kb="${esc(kb.id)}" data-path="${esc(acc)}">${esc(p)}</a>`;
+        ? `<span class="cur">${label}</span>`
+        : `<a data-nav data-kb="${esc(kb.id)}" data-path="${esc(acc)}">${label}</a>`;
     });
-    if(!WRITABLE && CUR_PATH) h+='<span class="ro">只读</span>';
+    if(!WRITABLE && CUR_PATH){
+      h+=inMirrorArea(CUR_PATH)?'<span class="ro">只读 · 同步维护</span>':'<span class="ro">只读</span>';
+    }
   }
   bc.innerHTML=h;
   bc.querySelectorAll('a[data-nav]').forEach(a=>a.addEventListener('click',()=>{
@@ -758,8 +837,18 @@ buildVSMenu();
 // 这里只触发同步并展示报告。
 document.getElementById('btnOps').addEventListener('click', showOpsDialog);
 
-function showOpsDialog(){
-  const ov=document.createElement('div'); ov.className='dlg-overlay';
+// 操作弹窗。initialTab:'ops'(知识库操作,默认)或 'ai'(AI 接入)。
+// 打开时地址栏同步为 #ops / #ops/ai,可直接复制分享;关闭时还原为当前视图的地址。
+function showOpsDialog(initialTab){
+  const tab0=(initialTab==='ai')?'ai':'ops';
+  // 已打开 → 只切换 tab,不重复创建
+  const existed=document.getElementById('opsDlgOv');
+  if(existed){
+    const t=existed.querySelector(`.ops-tab[data-tab="${tab0}"]`);
+    if(t) t.click();
+    return;
+  }
+  const ov=document.createElement('div'); ov.className='dlg-overlay'; ov.id='opsDlgOv';
   const box=document.createElement('div'); box.className='dlg-box';
   // 默认 dlg-box width:520px 不够 — AI 区块的命令行很长,加宽到 920px 并按视口收缩
   box.style.width='920px';
@@ -771,19 +860,46 @@ function showOpsDialog(){
       <span>操作</span>
       <button class="btn ghost sm" data-act="close" style="font-size:18px;line-height:1;padding:2px 8px">×</button>
     </div>
-    <div class="ops-sec-title">让 AI 接入知识库</div>
-    ${renderAiBlock()}
-    <div class="ops-sec-title" style="margin-top:14px">知识库操作</div>
-    <div class="ops-dlg-list" id="opsList"><div class="empty">加载中…</div></div>
+    <div class="ops-tabs">
+      <button class="ops-tab ${tab0==='ops'?'active':''}" data-tab="ops">知识库操作</button>
+      <button class="ops-tab ${tab0==='ai'?'active':''}" data-tab="ai">AI 接入</button>
+    </div>
+    <div class="ops-tab-page" data-page="ops" ${tab0==='ops'?'':'style="display:none"'}>
+      <div class="ops-dlg-list" id="opsList"><div class="empty">加载中…</div></div>
+    </div>
+    <div class="ops-tab-page" data-page="ai" ${tab0==='ai'?'':'style="display:none"'}>
+      ${renderAiBlock()}
+    </div>
     <div class="dlg-actions" style="margin-top:6px">
       <button class="btn ghost" data-act="close">关闭</button>
     </div>`;
   ov.appendChild(box); document.body.appendChild(ov);
-  function close(){ ov.remove(); document.removeEventListener('keydown',onkey); }
+  // 地址栏同步(replaceState 不触发 hashchange,不会循环)
+  function syncHash(tab){
+    const h = tab==='ai' ? '#ops/ai' : '#ops';
+    history.replaceState(null,'',location.pathname+location.search+h);
+  }
+  // 关闭时还原为当前视图的地址(目录 / 记事板 / 空)
+  function restoreHash(){
+    let h='';
+    if(VIEW==='list' && CUR_KB) h=dirHash(CUR_KB,CUR_PATH);
+    else if(VIEW==='notes') h='#notes';
+    history.replaceState(null,'',location.pathname+location.search+h);
+  }
+  syncHash(tab0);
+  function close(){ ov.remove(); document.removeEventListener('keydown',onkey); restoreHash(); }
   function onkey(e){ if(e.key==='Escape') close(); }
   box.querySelectorAll('[data-act="close"]').forEach(b=>b.addEventListener('click',close));
   ov.addEventListener('click',e=>{ if(e.target===ov) close(); });
   document.addEventListener('keydown',onkey);
+  // tab 切换:知识库操作 / AI 接入(地址栏跟着变)
+  box.querySelectorAll('.ops-tab').forEach(t=>t.addEventListener('click',()=>{
+    box.querySelectorAll('.ops-tab').forEach(x=>x.classList.toggle('active',x===t));
+    box.querySelectorAll('.ops-tab-page').forEach(p=>{
+      p.style.display = p.dataset.page===t.dataset.tab ? '' : 'none';
+    });
+    syncHash(t.dataset.tab);
+  }));
   wireAiBlock(box);
   renderOpsList(document.getElementById('opsList'));
 }
@@ -867,6 +983,8 @@ function wireAiBlock(box){
   });
 }
 
+// 知识库操作面板:只做「查看绑定 + 手动同步」。
+// 绑定的添加 / 修改 / 删除在桌面端「Ktree → 设置」窗口里配置。
 async function renderOpsList(host){
   host.innerHTML='';
   if(!KBS.length){ host.innerHTML='<div class="empty">还没有知识库</div>'; return; }
@@ -878,82 +996,119 @@ async function renderOpsList(host){
         <span class="badge">${kb.documents||0} 篇 · ${esc(kb.root||'')}</span>
       </div>
       <div class="ops-actions">
-        ${kb.feishu_configured?'<button class="btn ghost" data-act="feishu">同步飞书</button>':''}
-        <button class="btn ghost" data-act="vcs-all">同步全部 VCS</button>
-        <button class="btn ghost" data-act="rescan" title="还没实现:扫描 src/ 把漏掉的文件补入索引">重扫 src(占位)</button>
+        <button class="btn ghost" data-act="vcs-all">同步全部仓库</button>
+        <span class="hint" style="align-self:center">绑定的添加 / 删除请在桌面端「Ktree → 设置」中配置</span>
       </div>
-      <div class="vcs-list" data-vcs-host="1"><div class="ops-empty">加载 VCS 绑定…</div></div>
+      <div class="vcs-list" data-vcs-host="1"><div class="ops-empty">加载仓库绑定…</div></div>
       <div class="ops-report" data-report="1" style="display:none"></div>`;
     const reportBox=block.querySelector('[data-report]');
     function show(msg){ reportBox.style.display='block'; reportBox.textContent=msg; }
-    block.querySelector('[data-act="feishu"]')?.addEventListener('click',async ()=>{
-      show('飞书同步中…');
-      try{
-        const r=await api(`/api/sync/feishu/trigger?kb=${encodeURIComponent(kb.id)}`,{method:'POST'});
-        show(formatFeishuReport(r.report));
-      }catch(e){ show('飞书同步失败:'+e); }
-    });
-    // 加载 vcs bindings(可重复调用,用于同步完成后刷新 last_sync)
+
+    // ---- 仓库(VCS)绑定:列表 + 手动同步 ----
     const vcsHost=block.querySelector('[data-vcs-host]');
     async function reloadVcs(){
       try{
         const r=await api(`/api/kb/${encodeURIComponent(kb.id)}/vcs`);
         const bindings=r.bindings||[];
         if(!bindings.length){
-          vcsHost.innerHTML='<div class="ops-empty">未配置 VCS 绑定。手动编辑 config.json 的 <code>vcs_bindings</code> 字段。</div>';
+          vcsHost.innerHTML='<div class="ops-empty">未绑定仓库。在桌面端「Ktree → 设置」添加后,内容将镜像到 src/vcs/&lt;名字&gt;/(只读)。</div>';
           return;
         }
         vcsHost.innerHTML='';
         bindings.forEach(b=>{
           const row=document.createElement('div'); row.className='ops-vcs-row';
-          const sub=b.sub_dir?`src/${esc(b.sub_dir)}`:'src';
           row.innerHTML=`
             <div class="vcs-line">
               <div class="vcs-info">
-                <code>${esc(b.vcs_type)}</code> · ${sub} ← ${esc(b.url)}${b.repo_sub_path?(' :: '+esc(b.repo_sub_path)):''}
+                <code>${esc(b.vcs_type)}</code> · src/vcs/${esc(b.name)} ← ${esc(b.url)}${b.repo_sub_path?(' :: '+esc(b.repo_sub_path)):''}
                 ${b.branch?` <span style="color:#aaa">[${esc(b.branch)}]</span>`:''}
                 ${b.has_credentials?' <span style="color:#888;font-size:11px">(自定义凭证)</span>':''}
               </div>
-              <button class="btn ghost sm">同步</button>
+              <button class="btn ghost sm" ${b.syncing?'disabled':''}>${b.syncing?'同步中…':'同步'}</button>
             </div>
-            <div class="vcs-last">${renderVcsLast(b.last_sync, b.sync_interval_minutes)}</div>`;
-          row.querySelector('button').addEventListener('click',async ()=>{
-            show(`同步 ${b.vcs_type}: ${b.url} …`);
-            try{
-              const rr=await api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/${b.idx}/sync`,{method:'POST'});
-              show(formatVcsReport(rr.report));
-            }catch(e){ show('同步失败:'+e); }
-            reloadVcs();
+            <div class="vcs-last">${renderVcsLast(b.last_sync, b.sync_interval_minutes, b.syncing)}</div>`;
+          row.querySelector('button').addEventListener('click',()=>{
+            show(`同步 ${b.vcs_type}: ${b.url} …(大仓库首次同步可能较久,可关闭此窗口,后台会继续)`);
+            // 不 await 到底 —— 大仓库同步可能要几十分钟,连接断了服务端也会继续跑;
+            // 完成与否靠下方轮询刷新状态。
+            api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/${b.idx}/sync`,{method:'POST'})
+              .then(rr=>{ if(rr&&rr.report){ show(formatVcsReport(rr.report)); } reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm(rr&&rr.report?[rr.report]:[]); })
+              .catch(()=>{});
+            reloadVcs(); startSyncPolling();
           });
           vcsHost.appendChild(row);
         });
-      }catch(e){ vcsHost.innerHTML='<div class="ops-empty">VCS 绑定加载失败:'+esc(e)+'</div>'; }
+        if(bindings.some(b=>b.syncing)) startSyncPolling();
+      }catch(e){ vcsHost.innerHTML='<div class="ops-empty">仓库绑定加载失败:'+esc(e)+'</div>'; }
     }
-    block.querySelector('[data-act="vcs-all"]').addEventListener('click',async ()=>{
-      show('同步所有 VCS 绑定…');
-      try{
-        const r=await api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/sync`,{method:'POST'});
-        show(formatVcsReports(r.reports||[], r.errors||[]));
-      }catch(e){ show('VCS 同步失败:'+e); }
-      reloadVcs();
+
+    // (云文档绑定功能已封存:后端 API 保留,操作面板暂不展示;以后有需求再恢复)
+
+    // ---- 同步中轮询:每 5s 刷新绑定状态与文档数,直到没有进行中的同步 ----
+    let pollTimer=null;
+    function startSyncPolling(){
+      if(pollTimer) return;
+      pollTimer=setInterval(async ()=>{
+        // 操作弹窗已关闭 → 停止轮询
+        if(!document.body.contains(block)){ clearInterval(pollTimer); pollTimer=null; return; }
+        await reloadVcs(); loadKbs();
+        if(!block.querySelector('.vcs-line button[disabled]')){
+          clearInterval(pollTimer); pollTimer=null;
+        }
+      },5000);
+    }
+
+    block.querySelector('[data-act="vcs-all"]').addEventListener('click',()=>{
+      show('同步所有仓库绑定…(可关闭此窗口,后台会继续)');
+      api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/sync`,{method:'POST'})
+        .then(r=>{ if(r) show(formatVcsReports(r.reports||[], r.errors||[])); reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm((r&&r.reports)||[]); })
+        .catch(()=>{});
+      reloadVcs(); startSyncPolling();
     });
+
     await reloadVcs();
     host.appendChild(block);
   }
 }
 
-function formatFeishuReport(r){
-  if(!r) return '(无报告)';
-  const lines=[
-    `飞书同步完成 - ${r.kb_id}`,
-    `  入库 ${r.ingested}  跳过 ${r.skipped}  删除 ${r.deleted}  失败 ${r.failed}`,
-  ];
-  (r.messages||[]).forEach(m=>lines.push('  '+m));
-  return lines.join('\n');
+// 重新拉某知识库的 VCS 绑定同步时间,刷新左侧树(同步完成后"X 分钟前更新"立即更新,
+// 不必刷新整页 —— 满足"无内容变化但时间已变"的场景)。
+async function refreshVcsTimes(kbId){
+  try{
+    const r=await api(`/api/kb/${encodeURIComponent(kbId)}/vcs`);
+    const times={};
+    (r.bindings||[]).forEach(b=>{ if(b.last_sync) times[b.name]=b.last_sync.at_unix_ms; });
+    VCS_SYNC_TIMES[kbId]=times;
+    renderSidebar();
+  }catch(e){}
 }
-// 单条 VCS 绑定的"最近一次同步"摘要,显示在绑定行下方。
+// 同步完成后弹确认框,汇总新增/更新/删除条数;点「刷新页面查看」reload(树的更新时间、
+// 目录内容随之刷新),点「留在本页」只在后台静默刷新绑定状态。
+async function afterSyncConfirm(reports){
+  if(!reports || !reports.length) return;
+  let added=0, updated=0, deleted=0, failed=0;
+  const samples=[];
+  for(const r of reports){
+    added+=(r.added||[]).length; updated+=(r.updated||[]).length;
+    deleted+=(r.deleted||[]).length; failed+=(r.failed||[]).length;
+    [...(r.added||[]).map(f=>'+ '+f), ...(r.updated||[]).map(f=>'~ '+f), ...(r.deleted||[]).map(f=>'- '+f)]
+      .slice(0,8).forEach(s=>samples.push(s));
+  }
+  // 无任何变化就不打扰(避免每次"已是最新"都弹框)
+  if(added+updated+deleted+failed===0) return;
+  const head=`同步完成:新增 ${added} · 更新 ${updated} · 删除 ${deleted}`+(failed?` · 失败 ${failed}`:'');
+  const detail=samples.length?(samples.length<8?samples:[...samples,`… 等共 ${added+updated+deleted} 项`]):null;
+  const ok=await confirmDialog(head,{detail,okText:'刷新页面查看'});
+  if(ok) location.reload();
+}
+
+// 单条绑定的"最近一次同步"摘要,显示在绑定行下方。
+// syncing=true 表示后端正在同步 → 优先显示进行中状态。
 // last 可能为 null(后端从未同步过) → 看 interval 决定提示"待自动同步"还是"未同步"。
-function renderVcsLast(last, intervalMinutes){
+function renderVcsLast(last, intervalMinutes, syncing){
+  if(syncing){
+    return `<span class="empty">⏳ 同步进行中…(首次同步大仓库较久:拉取完成后才开始逐个转换入库,docs 会随之逐步出现)</span>`;
+  }
   if(!last){
     if(intervalMinutes>0) return `<span class="empty">暂无同步记录 · 自动每 ${intervalMinutes} 分钟</span>`;
     return `<span class="empty">暂无同步记录</span>`;
@@ -983,9 +1138,8 @@ function fmtAgo(unixMs){
 
 function formatVcsReport(r){
   if(!r) return '(无报告)';
-  const sub=r.sub_dir?('src/'+r.sub_dir):'src';
   const lines=[
-    `[${r.vcs_type}] ${r.url}${r.repo_sub_path?(' :: '+r.repo_sub_path):''} → ${sub}`,
+    `[${r.vcs_type}] ${r.url}${r.repo_sub_path?(' :: '+r.repo_sub_path):''} → src/vcs/${r.name}`,
     `  修订: ${r.revision||'(空)'}`,
     `  新增 ${r.added.length}  更新 ${r.updated.length}  删除 ${r.deleted.length}  失败 ${r.failed.length}`,
   ];
@@ -1013,11 +1167,17 @@ async function boot(){
   try { CUSTOM_DOMAIN=(await api('/api/env')).custom_domain||''; } catch(e){ CUSTOM_DOMAIN=''; }
   restoreTreeState(); // 刷新后恢复折叠 / 展开 / 当前目录
   await loadKbs();
-  // web 链接直达记事板 / 某条公共记事
-  const noteRoute=parseHash();
-  if(noteRoute){ showNotes(noteRoute.id||undefined); return; }
+  // web 链接直达:记事板 / 某条公共记事 / 某个目录 / 操作弹窗
+  const route=parseHash();
+  if(route && route.type==='note'){ showNotes(route.id||undefined); return; }
+  if(route && route.type==='dir' && KBS.some(k=>k.id===route.kb)){
+    await gotoDir(route.kb, route.path);
+    return;
+  }
+  // #ops / #ops/ai:先按常规流程载入底层视图,最后再弹操作窗
+  const opsTab=(route && route.type==='ops') ? (route.tab==='ai'?'ai':'ops') : null;
   // 首次打开默认进记事板,知识库目录保持合上
-  if(FIRST_VISIT){ showNotes(); return; }
+  if(FIRST_VISIT && !opsTab){ showNotes(); return; }
   if(KBS.length){
     if(!FIRST_VISIT && CUR_KB && KBS.some(k=>k.id===CUR_KB)){
       // 刷新:回到上次停留的位置,加载所有展开过的知识库的树
@@ -1041,6 +1201,8 @@ async function boot(){
     document.getElementById('listArea').innerHTML=
       '<div class="empty">还没有知识库,请在桌面端菜单栏「Ktree → 设置」中添加</div>';
   }
+  // 带 #ops 链接打开:底层视图加载完后弹出操作窗
+  if(opsTab) showOpsDialog(opsTab);
 }
 function updateFavCount(){
   const n=Object.keys(FAVS).length;
@@ -1070,7 +1232,7 @@ function renderSidebar(){
       return false;
     }
     const body=folders.filter(f=>!ancestorCollapsed(f)).map(f=>{
-      const depth=f.split('/').length, nm=f.split('/').pop();
+      const depth=f.split('/').length, nm=dirLabelHtml(f, f.split('/').pop(), kb.id); // 已转义 HTML
       const on=VIEW==='list'&&CUR_KB===kb.id&&CUR_PATH===f;
       const has=hasChild.has(f);
       const collapsed=COLLAPSED.has(kb.id+'|'+f);
@@ -1078,7 +1240,7 @@ function renderSidebar(){
         ? `<span class="t-caret">${collapsed?'▶':'▼'}</span>`
         : `<span style="display:inline-block;width:12px;flex-shrink:0"></span>`;
       return `<div class="tree-item ${on?'active':''}" data-kb="${esc(kb.id)}" data-path="${esc(f)}"
-        style="padding-left:${6+(depth-1)*14}px">${caret}<span class="tree-ico">${folderIcon(f)}</span>${esc(nm)}</div>`;
+        style="padding-left:${6+(depth-1)*14}px">${caret}<span class="tree-ico">${folderIcon(f)}</span>${nm}</div>`;
     }).join('');
     return `<div class="kb-node ${open?'open':''}" data-kb="${esc(kb.id)}">
       <div class="kb-head ${open?'open':''}" data-kb="${esc(kb.id)}">
@@ -1121,6 +1283,13 @@ async function toggleKb(kbId){
 async function loadTree(kbId){
   try { TREES[kbId]=(await api('/api/tree?kb='+encodeURIComponent(kbId))).folders||[]; }
   catch(e){ TREES[kbId]=[]; }
+  // 拉 VCS 绑定的最近同步时间,树里 vcs/<名> 目录后面显示"X 前更新"
+  try {
+    const r=await api(`/api/kb/${encodeURIComponent(kbId)}/vcs`);
+    const times={};
+    (r.bindings||[]).forEach(b=>{ if(b.last_sync) times[b.name]=b.last_sync.at_unix_ms; });
+    VCS_SYNC_TIMES[kbId]=times;
+  } catch(e){ VCS_SYNC_TIMES[kbId]={}; }
   if(FIRST_VISIT) applyFirstVisitCollapse(kbId);
 }
 
@@ -1129,19 +1298,30 @@ function selectFolder(kbId,path){
   VIEW='list'; CUR_KB=kbId; CUR_PATH=path||'src';
   document.getElementById('navNotes').classList.remove('active');
   document.getElementById('btnNewNote').style.display='none';
-  clearHash();
+  // 侧栏树跟随:展开知识库节点 + 当前目录的所有祖先,让树一路显示并高亮到当前层。
+  // (从面包屑 / 搜索路径 / URL 进到深层目录时,树需要自动展开到位)
+  EXPANDED.add(kbId);
+  const parts=(CUR_PATH||'').split('/').filter(Boolean);
+  for(let i=1;i<parts.length;i++){
+    COLLAPSED.delete(kbId+'|'+parts.slice(0,i).join('/'));
+  }
+  // 地址栏同步当前目录 → 复制地址栏 URL 即可分享此目录。
+  // 用 location.hash 赋值(产生历史记录),浏览器前进/后退可在目录间导航;
+  // hashchange 回调里有"已在目标目录"判断,不会重复加载。
+  const target=dirHash(kbId,CUR_PATH);
+  if(location.hash!==target) location.hash=target;
   saveTreeState();
   loadDir();
 }
 
 // ---------- 文件行渲染(收藏/复制地址/色点/…)----------
-function actionsHtml(kb,rp,ext,docId,mdPath,refDir){
+function actionsHtml(kb,rp,ext,docId,mdPath,assetsDir){
   const did=(docId!=null)?docId:'';
   return `<div class="file-actions">
     <button class="act-btn" data-act="open" data-path="${esc(rp)}" data-ext="${esc(ext)}">${ICO.open}打开</button>
     <button class="act-btn" data-act="copy" data-path="${esc(rp)}">${ICO.link}复制地址</button>
     <button class="btn-more" data-act="more" data-path="${esc(rp)}" data-id="${did}"
-      data-md="${esc(mdPath||'')}" data-ref="${esc(refDir||'')}">⋯</button>
+      data-md="${esc(mdPath||'')}" data-ref="${esc(assetsDir||'')}">⋯</button>
   </div>`;
 }
 function colorDotHtml(kb,rp){
@@ -1166,7 +1346,7 @@ function fileRow(kb,f){
     <div class="file-icon">${fileIconHtml(kb,f,isThumbSm)}</div>
     <div class="file-name-wrap">
       <span class="file-name">${esc(f.name)}</span>${colorDotHtml(kb,f.rel_path)}
-      ${actionsHtml(kb,f.rel_path,f.ext,f.doc_id,f.md_path,f.ref_dir)}
+      ${actionsHtml(kb,f.rel_path,f.ext,f.doc_id,f.md_path,f.assets_dir)}
     </div>
     <div class="file-meta file-size">${fmtSize(f.size)}</div>
     <div class="file-meta file-date">${fmtDate(f.modified)}</div>
@@ -1186,7 +1366,7 @@ function fileCard(kb,f){
       data-path="${esc(previewPath)}" data-name="${esc(previewName)}">
     <div class="tc-img">${inner}${sizeTag}</div>
     <div class="tc-name">${esc(f.name)}${colorDotHtml(kb,f.rel_path)}</div>
-    ${actionsHtml(kb,f.rel_path,f.ext,f.doc_id,f.md_path,f.ref_dir)}
+    ${actionsHtml(kb,f.rel_path,f.ext,f.doc_id,f.md_path,f.assets_dir)}
   </div>`;
 }
 function folderCard(kb,sub,f){
@@ -1409,22 +1589,56 @@ const NOTE_IC = {
 function localNotes(){ try{ return JSON.parse(localStorage.getItem(NOTES_LS))||[]; }catch(e){ return []; } }
 function saveLocalNotes(arr){ saveLS(NOTES_LS, arr); }
 
-// 解析 URL hash:#notes → 记事板;#note/<id> → 记事板并定位某条公共记事。
+// 解析 URL hash:
+//   #notes / #note/<id>   → 记事板 / 定位某条公共记事
+//   #ops / #ops/ai        → 操作弹窗(知识库操作 / AI 接入 tab)
+//   #/<知识库>/<目录路径>   → 目录(地址栏可直接复制分享)
 function parseHash(){
   const h=(location.hash||'').replace(/^#/,'');
-  if(h==='notes') return { id:null };
+  if(h==='notes') return { type:'note', id:null };
   const m=h.match(/^note\/(.+)$/);
-  if(m){ try{ return { id:decodeURIComponent(m[1]) }; }catch(e){ return { id:m[1] }; } }
+  if(m){ try{ return { type:'note', id:decodeURIComponent(m[1]) }; }catch(e){ return { type:'note', id:m[1] }; } }
+  // 操作弹窗路由
+  if(h==='ops') return { type:'ops', tab:'ops' };
+  const mo=h.match(/^ops\/(\w+)$/);
+  if(mo) return { type:'ops', tab:mo[1] };
+  // 目录路由:#/<kb>/<path…>(每段 URL 编码)
+  if(h.startsWith('/')){
+    const segs=h.slice(1).split('/').filter(Boolean).map(s=>{
+      try{ return decodeURIComponent(s); }catch(e){ return s; }
+    });
+    if(segs.length) return { type:'dir', kb:segs[0], path:segs.slice(1).join('/') };
+  }
   return null;
+}
+// 目录的分享 hash:#/<kb>/<path>(分段编码,中文目录名也能进 URL)
+function dirHash(kb,path){
+  const segs=[kb,...String(path||'').split('/').filter(Boolean)].map(encodeURIComponent);
+  return '#/'+segs.join('/');
 }
 // 离开记事板时清掉 hash,避免刷新又跳回记事板。
 function clearHash(){
   if(location.hash) history.replaceState(null,'',location.pathname+location.search);
 }
-// 页面已加载后,地址栏 hash 变化(粘贴 #note/<id> 回车、前进后退)也要路由到记事板。
+// 跳转到 hash 指定的目录:展开对应知识库的树后进入。
+async function gotoDir(kb,path){
+  if(!KBS.some(k=>k.id===kb)){ toast('知识库「'+kb+'」不存在'); return; }
+  EXPANDED.add(kb);
+  if(!TREES[kb]) await loadTree(kb);
+  renderSidebar();
+  selectFolder(kb, path||'docs');
+}
+// 页面已加载后,地址栏 hash 变化(粘贴链接回车、前进后退)路由到记事板 / 目录 / 操作弹窗。
 window.addEventListener('hashchange', ()=>{
   const route=parseHash();
-  if(route) showNotes(route.id||undefined);
+  if(!route) return;
+  if(route.type==='note'){ showNotes(route.id||undefined); return; }
+  if(route.type==='ops'){ showOpsDialog(route.tab==='ai'?'ai':'ops'); return; }
+  if(route.type==='dir'){
+    // selectFolder 自己更新 hash 也会触发本事件 → 已在目标目录就不重复加载
+    if(VIEW==='list' && CUR_KB===route.kb && CUR_PATH===(route.path||'docs')) return;
+    gotoDir(route.kb, route.path);
+  }
 });
 async function copyNoteLink(id){
   const url=(CUSTOM_DOMAIN||location.origin)+'/#note/'+encodeURIComponent(id);
@@ -1616,7 +1830,13 @@ function findNote(id, scope){
 function noteCard(n, scope){
   let line;
   if(n.note_type==='url') line='<span class="note-ic">'+NOTE_IC.url+'</span>'+esc(n.content);
-  else if(n.note_type==='kblink') line='<span class="note-ic">'+NOTE_IC.kb+'</span>'+esc(n.kb_id)+' / '+esc(n.content||'(根目录)');
+  else if(n.note_type==='kblink'){
+    line='<span class="note-ic">'+NOTE_IC.kb+'</span>'+esc(n.kb_id)+' / '+esc(n.content||'(根目录)');
+    // 目标知识库已不存在(改名/删除):标记失效,提示编辑修正
+    if(!KBS.some(k=>k.id===n.kb_id)){
+      line+=' <span class="note-broken">链接失效:知识库「'+esc(n.kb_id)+'」不存在,请编辑修正</span>';
+    }
+  }
   else line=esc((n.content||'').replace(/\s+/g,' '));
   const pinned = !!n.pinned;
   const selCls = (scope==='public' && NOTE_SELECTED!=null
@@ -1642,7 +1862,14 @@ function noteCard(n, scope){
 // 卡片点击:文本弹窗显示全文,网络链接新标签打开,知识库链接本页跳转。
 function openNote(n){
   if(n.note_type==='url'){ if(n.content) window.open(n.content,'_blank'); }
-  else if(n.note_type==='kblink'){ gotoKbLink(n.kb_id, n.content); }
+  else if(n.note_type==='kblink'){
+    // 失效链接:不跳转,提示编辑修正(知识库改名/删除会导致旧链接失效)
+    if(!KBS.some(k=>k.id===n.kb_id)){
+      toast(`知识库「${n.kb_id}」不存在(可能已改名),请编辑该记事修正链接`);
+      return;
+    }
+    gotoKbLink(n.kb_id, n.content);
+  }
   else showNoteDetail(n.title, n.content);
 }
 
@@ -1746,6 +1973,18 @@ document.getElementById('navNotes').addEventListener('click', ()=>showNotes());
 // ---------- 搜索 ----------
 const gs=document.getElementById('globalSearch');
 gs.addEventListener('keydown',e=>{ if(e.key==='Enter') doSearch(); });
+// 快速清空:有内容时显示 ×,点击清空并退出搜索视图(回到当前目录)
+const gsClear=document.getElementById('searchClear');
+function syncSearchClear(){ gsClear.style.display = gs.value ? '' : 'none'; }
+gs.addEventListener('input', syncSearchClear);
+gsClear.addEventListener('click', ()=>{
+  gs.value='';
+  syncSearchClear();
+  hideSearchHist();
+  // 正在看搜索结果 → 退回当前目录;否则只是清空文本
+  if(VIEW==='search' && CUR_KB) selectFolder(CUR_KB, CUR_PATH);
+  gs.focus();
+});
 // 搜索历史(localStorage,最近 12 条)
 function searchHistory(){ try{ return JSON.parse(localStorage.getItem('ktree-search-hist'))||[]; }catch(e){ return []; } }
 function pushSearchHistory(q){
@@ -1764,7 +2003,7 @@ function showSearchHist(){
   const items=box.querySelectorAll('.sh-item');
   h.forEach((q,i)=>{
     items[i].textContent=q;
-    items[i].onmousedown=ev=>{ ev.preventDefault(); gs.value=q; hideSearchHist(); doSearch(); };
+    items[i].onmousedown=ev=>{ ev.preventDefault(); gs.value=q; syncSearchClear(); hideSearchHist(); doSearch(); };
   });
   box.querySelector('.sh-clear').onmousedown=ev=>{
     ev.preventDefault(); localStorage.removeItem('ktree-search-hist'); showSearchHist();
@@ -1799,10 +2038,17 @@ async function doSearch(){
       const previewPath=h.md_path||h.rel_path||'';
       const previewName=previewPath?previewPath.split('/').pop():(h.title+'.md');
       if(previewPath && h.kb_id){
+        // 文件所在目录:指向 docs 阅读视图(检索是为了找内容读;预览打开的也是 docs 下的文件)。
+        // src 是上传/同步的文件管理区,不作为阅读入口。
+        const relP=h.rel_path||'';
+        const dirRel=relP.includes('/')?relP.substring(0,relP.lastIndexOf('/')):'';
+        const dirPath=dirRel?('docs/'+dirRel):'docs';
+        const pathHtml=` · <span class="sr-path" data-act="goto-dir" data-kb="${esc(h.kb_id)}"
+          data-dir="${esc(dirPath)}" title="跳转到所在目录">${esc(dirPath)}/</span>`;
         return `<div class="sr-row" data-act="view" data-kb="${esc(h.kb_id)}"
             data-path="${esc(previewPath)}" data-name="${esc(previewName)}">
           <div class="t">${esc(h.title)} <span class="tag">${esc(h.category||'未分类')}</span></div>
-          <div class="m">#${h.doc_id} · 相关度 ${h.score.toFixed(2)}</div>
+          <div class="m">#${h.doc_id} · 相关度 ${h.score.toFixed(2)}${pathHtml}</div>
           <div class="s">${esc(h.summary)}</div>
         </div>`;
       }
@@ -1823,6 +2069,7 @@ document.getElementById('listArea').addEventListener('click',e=>{
   const kb=el.dataset.kb||CUR_KB;
   const path=el.dataset.path;
   if(act==='enter') selectFolder(CUR_KB, path);
+  else if(act==='goto-dir'){ gotoDir(el.dataset.kb||CUR_KB, el.dataset.dir); }
   else if(act==='view') previewFile(rawUrl(path,kb), el.dataset.name);
   else if(act==='open') openUrl(rawUrl(path,kb), el.dataset.ext);
   else if(act==='viewmd') showMarkdownPreview(`/api/doc/${el.dataset.id}/md`, el.dataset.name);
@@ -1841,12 +2088,12 @@ function openUrl(url,ext){
   else { const a=document.createElement('a'); a.href=url; a.download=''; document.body.appendChild(a); a.click(); a.remove(); }
 }
 async function delFolder(kb, rp){
-  // rp 形如 "src/T1/sub";展示三个会被删的对应目录路径
+  // rp 形如 "src/upload/T1/sub";展示会被删的对应目录路径
   const name = rp.split('/').pop();
   const sub = rp.startsWith('src/') ? rp.slice(4) : rp;
   const ok = await confirmDialog(
     '确认删除文件夹「' + name + '」?\n将一并删除以下目录及其全部内容:',
-    { detail: [rp+'/', 'docs/'+sub+'/', 'ref/'+sub+'/'], okText:'删除', danger:true });
+    { detail: [rp+'/', 'docs/'+sub+'/(含转换产物与 .assets 资源)'], okText:'删除', danger:true });
   if(!ok) return;
   try {
     const r = await api(`/api/folder?kb=${encodeURIComponent(kb)}&path=${encodeURIComponent(rp)}`,
@@ -1863,13 +2110,13 @@ async function delFolder(kb, rp){
   } catch(e){ toast('删除失败:'+e); }
 }
 
-async function delDoc(id,name,relPath,mdPath,refDir){
+async function delDoc(id,name,relPath,mdPath,assetsDir){
   const label=name?`「${name}」`:('文档 #'+id);
   let detail=null;
   if(relPath){
     detail=[relPath];
     if(mdPath) detail.push(mdPath);
-    if(refDir) detail.push(refDir+'/');
+    if(assetsDir) detail.push(assetsDir+'/');
   }
   const ok=await confirmDialog(
     '确认删除 '+label+' ?\n将删除以下文件:',
@@ -1897,7 +2144,7 @@ async function doCopyAddr(btn,kb,rp){
     setTimeout(()=>{ btn.classList.remove('copied'); btn.innerHTML=ICO.link+'复制地址'; },1500);
   } else toast('复制失败,可手动复制:'+url);
 }
-function showMoreMenu(btn,kb,rp,docId,mdPath,refDir,isFolder){
+function showMoreMenu(btn,kb,rp,docId,mdPath,assetsDir,isFolder){
   closeMoreMenu();
   const menu=document.createElement('div');
   menu.className='more-menu'; menu.id='moreMenu';
@@ -1928,7 +2175,7 @@ function showMoreMenu(btn,kb,rp,docId,mdPath,refDir,isFolder){
   if(delEl) delEl.addEventListener('click',()=>{
     closeMoreMenu();
     if(isFolder) delFolder(kb, rp);
-    else delDoc(+docId, rp.split('/').pop(), rp, mdPath, refDir);
+    else delDoc(+docId, rp.split('/').pop(), rp, mdPath, assetsDir);
   });
   menu.querySelectorAll('.colors .c').forEach(c=>c.addEventListener('click',()=>{
     setColor(kb,rp,c.dataset.color,isFolder); closeMoreMenu();
@@ -2146,7 +2393,7 @@ function showBinaryPreview(url,name){
 
 // ---------- 新建文件夹 / 上传 ----------
 document.getElementById('btnNewFolder').addEventListener('click',async()=>{
-  if(!WRITABLE){ toast('只有 src 目录下可新建文件夹'); return; }
+  if(!WRITABLE){ toast('只有上传区(src/upload)下可新建文件夹'); return; }
   const name=((await promptDialog('在「'+CUR_PATH+'」下新建文件夹:'))||'').trim();
   if(!name) return;
   if(badName(name)){ toast('文件夹名不能含 / \\ ..'); return; }
@@ -2159,11 +2406,11 @@ document.getElementById('btnNewFolder').addEventListener('click',async()=>{
 });
 const fileInput=document.getElementById('fileInput');
 document.getElementById('btnUpload').addEventListener('click',()=>{
-  if(!WRITABLE){ toast('只有 src 目录下可上传'); return; }
+  if(!WRITABLE){ toast('只有上传区(src/upload)下可上传'); return; }
   fileInput.click();
 });
 document.getElementById('btnUploadFolder').addEventListener('click',()=>{
-  if(!WRITABLE){ toast('只有 src 目录下可上传'); return; }
+  if(!WRITABLE){ toast('只有上传区(src/upload)下可上传'); return; }
   showFolderDropDialog();
 });
 fileInput.addEventListener('change',()=>{ if(fileInput.files.length) uploadFiles([...fileInput.files]); fileInput.value=''; });

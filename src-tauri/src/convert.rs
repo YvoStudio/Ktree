@@ -102,10 +102,18 @@ pub fn convert_file(
         );
     }
 
-    let result: ConvertResult = serde_json::from_slice(&output.stdout).map_err(|e| {
+    // 第三方转换库(pdf.js 等)可能往 stdout 混入警告行,结果 JSON 约定在最后一行 ——
+    // 这里只解析最后一行非空内容,而不是整个 stdout。
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last_line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    let result: ConvertResult = serde_json::from_str(last_line.trim()).map_err(|e| {
         anyhow::anyhow!(
             "解析 sidecar 输出失败: {e}; 原始输出: {}",
-            String::from_utf8_lossy(&output.stdout)
+            &stdout[..stdout.len().min(500)]
         )
     })?;
     Ok(result)

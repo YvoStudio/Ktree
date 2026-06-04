@@ -144,11 +144,14 @@ function confirmDialog(message,{okText='确定',danger=false}={}){
 }
 function esc(s){ return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
+// HTTP 服务端口:绑定的删除 / 同步要调本机 REST API(带本地数据清理),从状态轮询里取。
+let SERVICE_PORT = 0;
 async function loadStatus(){
   try {
     const info = await invoke('get_service_info');
     const ip = await invoke('get_local_ip').catch(()=>'127.0.0.1');
     const port = info.http_port;
+    SERVICE_PORT = port || 0;
     document.getElementById('stDot').className = 'dot ' + (port ? 'on' : 'off');
     document.getElementById('stPort').textContent = port ? (':'+port) : '启动中…';
     document.getElementById('stKbs').textContent = info.knowledge_bases;
@@ -174,7 +177,17 @@ async function loadConfig(){
   portInp.dataset.actualPort = actualPort;
   portInp.dataset.configured  = configured;
   document.getElementById('cfgDomain').value = CFG.custom_domain ?? '';
+  snapshotSavedCounts();
   renderKbs();
+}
+// 加载配置时各 KB 已保存的绑定条数 —— 用来区分「已保存」(名字只读、删除走 API 清数据)
+// 和「新增未保存」(名字可填、删除只是移除行)。绑定只会 append,所以 idx < 已保存数 = 已保存。
+let SAVED_COUNTS = [];
+function snapshotSavedCounts(){
+  SAVED_COUNTS = (CFG.knowledge_bases||[]).map(kb=>({
+    vcs:(kb.vcs_bindings||[]).length,
+    cloud:(kb.cloud_bindings||[]).length,
+  }));
 }
 function renderKbs(){
   const box = document.getElementById('kbSections');
@@ -192,109 +205,75 @@ function renderKbs(){
           <input type="text" data-i="${i}" data-f="root" value="${esc(kb.root||'')}" />
         </label>
       </div>
-      ${renderFeishu(kb, i)}
-      <div class="vcs-section" data-vcs-kb="${i}">
+      <div class="vcs-section">
         <div class="vcs-head">
-          <span class="vcs-title">VCS 绑定(git / svn)</span>
+          <span class="vcs-title">仓库绑定(git / svn)→ src/vcs/&lt;名字&gt;/(只读镜像,严格同步)</span>
           <button class="btn ghost sm" data-act="vcs-add" data-i="${i}">＋ 添加绑定</button>
         </div>
         <div class="vcs-list">${renderVcsList(kb.vcs_bindings||[], i)}</div>
       </div>
     </div>`).join('') || '<p class="hint" style="margin-bottom:14px">还没有知识库,点下方「添加知识库」。</p>';
 }
-// 哪些知识库的飞书配置当前处于展开态(仅 UI 状态,不持久化)
-const feishuExpanded = new Set();
-// 飞书同步配置块 —— 跟 VCS 一样做成可选:没配过就折叠,点「配置飞书」才展开。
-function renderFeishu(kb, i){
-  const f = kb.feishu || {};
-  const has = !!(f.app_id || f.app_secret || f.folder_token);
-  const open = has || feishuExpanded.has(i);
-  const head = `
-    <div class="vcs-head">
-      <span class="vcs-title">飞书同步(可选)</span>
-      ${open
-        ? `<button class="btn ghost sm" data-act="feishu-clear" data-i="${i}">清除配置</button>`
-        : `<button class="btn ghost sm" data-act="feishu-add" data-i="${i}">＋ 配置飞书</button>`}
-    </div>`;
-  const body = open ? `
-    <div class="row" style="margin-bottom:8px">
-      <label class="field" style="flex:1;min-width:120px">飞书 App ID
-        <input type="text" data-i="${i}" data-f="app_id" value="${esc(f.app_id||'')}" />
-      </label>
-      <label class="field" style="flex:1;min-width:120px">App Secret
-        <input type="password" data-i="${i}" data-f="app_secret" value="${esc(f.app_secret||'')}" />
-      </label>
-      <label class="field" style="flex:1;min-width:120px">文件夹 Token
-        <input type="text" data-i="${i}" data-f="folder_token" value="${esc(f.folder_token||'')}" />
-      </label>
-    </div>
-    <div class="row" style="margin-bottom:0">
-      <label class="field" style="width:170px">自动同步间隔(分钟,0=关)
-        <input type="number" min="0" data-i="${i}" data-f="sync_interval_minutes" value="${f.sync_interval_minutes||0}" />
-      </label>
-      <button class="btn ghost sm" data-act="sync" data-id="${esc(kb.id||'')}">立即同步飞书</button>
-      <span class="hint">${kb.id ? '' : '(填好名称并保存后才能同步)'}</span>
-    </div>`
-    : `<p class="hint" style="margin:4px 0 0">未配置飞书同步。点上方「配置飞书」启用。</p>`;
-  return `<div class="vcs-section">${head}<div class="vcs-list">${body}</div></div>`;
+// idx < 已保存数 → 已保存绑定:名字只读;删除走 REST API,连本地镜像数据一起清。
+function isSavedBinding(kbIdx, kind, bIdx){
+  const c = SAVED_COUNTS[kbIdx];
+  return !!c && bIdx < (kind==='vcs' ? c.vcs : c.cloud);
 }
 function renderVcsList(list, kbIdx){
-  if(!list.length) return '<p class="hint" style="margin:4px 0 0">未配置 VCS 绑定。点上方「添加绑定」。</p>';
-  return list.map((b,j)=>`
-    <div class="vcs-row${b.vcs_type==='svn'?' is-svn':''}" data-vi="${kbIdx}-${j}">
+  if(!list.length) return '<p class="hint" style="margin:4px 0 0">未绑定仓库。点上方「添加绑定」,保存配置后在 web 界面同步。</p>';
+  return list.map((b,j)=>{
+    const saved=isSavedBinding(kbIdx,'vcs',j);
+    return `
+    <div class="vcs-row${b.vcs_type==='svn'?' is-svn':''}">
       <button class="btn danger sm vcs-del-btn" data-act="vcs-del" data-vi="${kbIdx}-${j}">删除</button>
       <div class="row" style="margin-bottom:6px">
-        <label class="field" style="width:120px">类型
+        <label class="field" style="flex:1;min-width:130px">绑定名(= 目录名,创建后不可改)
+          <input type="text" data-vi="${kbIdx}-${j}" data-vf="name" value="${esc(b.name||'')}"
+            placeholder="如:策划文档" ${saved?'readonly style="background:#f3f3f3;color:#888"':''} />
+        </label>
+        <label class="field" style="width:100px">类型
           <select data-vi="${kbIdx}-${j}" data-vf="vcs_type">
             <option value="git" ${b.vcs_type==='git'?'selected':''}>git</option>
             <option value="svn" ${b.vcs_type==='svn'?'selected':''}>svn</option>
           </select>
         </label>
-        <label class="field" style="flex:2;min-width:180px">仓库 URL
+        <label class="field" style="flex:2;min-width:200px">仓库 URL
           <input type="text" data-vi="${kbIdx}-${j}" data-vf="url" value="${esc(b.url||'')}" placeholder="https://… 或 git@host:repo.git / svn://…" />
-        </label>
-        <label class="field vcs-git-only" style="flex:1;min-width:120px">仓库子目录(仅 git)
-          <input type="text" data-vi="${kbIdx}-${j}" data-vf="repo_sub_path" value="${esc(b.repo_sub_path||'')}" placeholder="空=整仓,如 packages/core" />
-        </label>
-        <label class="field" style="flex:1;min-width:110px">src 子目录(空=src 根)
-          <input type="text" data-vi="${kbIdx}-${j}" data-vf="sub_dir" value="${esc(b.sub_dir||'')}" placeholder="code 或 spec/v1" />
         </label>
       </div>
       <div class="row" style="margin-bottom:0">
         <label class="field vcs-git-only" style="flex:1;min-width:90px">分支(仅 git)
-          <input type="text" data-vi="${kbIdx}-${j}" data-vf="branch" value="${esc(b.branch||'')}" placeholder="main / master" />
+          <input type="text" data-vi="${kbIdx}-${j}" data-vf="branch" value="${esc(b.branch||'')}" placeholder="main" />
         </label>
-        <label class="field" style="flex:1;min-width:100px">用户名(留空走系统凭证)
+        <label class="field vcs-git-only" style="flex:1;min-width:130px">仓库子目录(仅 git,空=整仓)
+          <input type="text" data-vi="${kbIdx}-${j}" data-vf="repo_sub_path" value="${esc(b.repo_sub_path||'')}" placeholder="如 docs/design" />
+        </label>
+        <label class="field" style="flex:1;min-width:100px">用户名(空=系统凭证)
           <input type="text" data-vi="${kbIdx}-${j}" data-vf="username" value="${esc(b.username||'')}" />
         </label>
         <label class="field" style="flex:1;min-width:100px">密码 / token
           <input type="password" data-vi="${kbIdx}-${j}" data-vf="password" value="${esc(b.password||'')}" />
         </label>
-        <label class="field" style="width:110px">同步间隔(分钟,0=关)
+        <label class="field" style="width:120px">同步间隔(分钟,0=关)
           <input type="number" min="0" data-vi="${kbIdx}-${j}" data-vf="sync_interval_minutes" value="${b.sync_interval_minutes||0}" />
         </label>
       </div>
-      <p class="hint" style="margin:6px 0 0">git 填「仓库子目录」= 只稀疏检出该目录,内容扁平同步到 src 子目录(留空则同步到 src 根);svn 不用此项,直接把 URL 指到子目录即可。</p>
-    </div>`).join('');
+    </div>`;}).join('');
 }
+// (云文档绑定功能已封存:后端 API 保留,设置窗口暂不提供配置入口;以后有需求再恢复)
 function collect(){
-  // KB 基本字段 + 飞书
+  // KB 基本字段
   document.querySelectorAll('#kbSections input[data-i]').forEach(inp=>{
     const i=+inp.dataset.i, f=inp.dataset.f, kb=CFG.knowledge_bases[i];
     if(!kb) return;
     if(f==='name') kb.name=inp.value.trim();
     else if(f==='root') kb.root=inp.value.trim();
-    else if(f==='sync_interval_minutes'){ kb.feishu=kb.feishu||{}; kb.feishu[f]=parseInt(inp.value)||0; }
-    else { kb.feishu=kb.feishu||{}; kb.feishu[f]=inp.value.trim(); }
   });
-  // VCS 绑定:input + select 都 collect。data-vi 是 "<kbIdx>-<bIdx>"
-  document.querySelectorAll('#kbSections [data-vi]').forEach(inp=>{
-    if(!inp.dataset.vf) return; // 跳过 vcs-row 容器本身
+  // 仓库绑定字段(input + select)
+  document.querySelectorAll('#kbSections [data-vi][data-vf]').forEach(inp=>{
     const [ki,bi] = inp.dataset.vi.split('-').map(Number);
     const kb = CFG.knowledge_bases[ki];
-    if(!kb) return;
-    kb.vcs_bindings = kb.vcs_bindings || [];
-    if(!kb.vcs_bindings[bi]) return;
+    if(!kb || !kb.vcs_bindings || !kb.vcs_bindings[bi]) return;
     const f = inp.dataset.vf;
     if(f==='sync_interval_minutes') kb.vcs_bindings[bi][f] = parseInt(inp.value)||0;
     else kb.vcs_bindings[bi][f] = inp.value.trim();
@@ -308,72 +287,100 @@ function collect(){
   CFG.custom_domain = document.getElementById('cfgDomain').value.trim();
 }
 
+// 删除「已保存」的绑定:走 Tauri invoke(本机直连后端),连同本地镜像目录 + 已入库内容一起清掉。
+// 不绕 HTTP 到 127.0.0.1 —— 那个地址可能被其它进程(如安卓模拟器)占用导致删除失败。
+async function apiDeleteBinding(kind, kbId, idx){
+  try{
+    const purged = await invoke('delete_binding', { kind, kbId, idx });
+    toast(`已删除绑定,清理本地镜像 ${purged||0} 篇文档`);
+    return true;
+  }catch(e){ toast('删除失败:'+e); return false; }
+}
+
 document.getElementById('kbSections').addEventListener('click', async e=>{
   const el = e.target.closest('[data-act]');
   if(!el) return;
-  if(el.dataset.act==='del'){
+  const act = el.dataset.act;
+  if(act==='del'){
     const ok=await confirmDialog('从配置中移除该知识库?\n(不会删除磁盘上的文件)',{okText:'移除',danger:true});
     if(!ok) return;
     collect(); CFG.knowledge_bases.splice(+el.dataset.i,1); renderKbs();
-  } else if(el.dataset.act==='vcs-add'){
+  } else if(act==='vcs-add'){
     collect();
-    const i = +el.dataset.i;
-    const kb = CFG.knowledge_bases[i];
+    const kb = CFG.knowledge_bases[+el.dataset.i];
     kb.vcs_bindings = kb.vcs_bindings || [];
-    kb.vcs_bindings.push({ vcs_type:'git', url:'', sub_dir:'', repo_sub_path:'', branch:'', username:'', password:'', sync_interval_minutes:0 });
+    kb.vcs_bindings.push({ name:'', vcs_type:'git', url:'', repo_sub_path:'', branch:'', username:'', password:'', sync_interval_minutes:0 });
     renderKbs();
-  } else if(el.dataset.act==='vcs-del'){
-    const ok=await confirmDialog('删除此 VCS 绑定?\n(不会影响磁盘上的工作副本和已入库内容,只是不再自动同步)',{okText:'删除',danger:true});
-    if(!ok) return;
-    collect();
+  } else if(act==='vcs-del'){
     const [ki,bi] = el.dataset.vi.split('-').map(Number);
-    CFG.knowledge_bases[ki].vcs_bindings.splice(bi,1);
-    renderKbs();
-  } else if(el.dataset.act==='feishu-add'){
     collect();
-    feishuExpanded.add(+el.dataset.i);
-    renderKbs();
-  } else if(el.dataset.act==='feishu-clear'){
-    const ok=await confirmDialog('清除该知识库的飞书配置?\n(App ID / Secret / 文件夹 Token 都会清空)',{okText:'清除',danger:true});
-    if(!ok) return;
-    collect();
-    const i=+el.dataset.i;
-    CFG.knowledge_bases[i].feishu={app_id:'',app_secret:'',folder_token:'',sync_interval_minutes:0};
-    feishuExpanded.delete(i);
-    renderKbs();
-  } else if(el.dataset.act==='sync'){
-    const id = el.dataset.id;
-    if(!id){ toast('请先保存配置以分配 id'); return; }
-    el.disabled=true; el.textContent='同步中…';
-    try {
-      const rp = await invoke('trigger_feishu_sync', { kbId: id });
-      toast(`同步完成:入库 ${rp.ingested||0} / 跳过 ${rp.skipped||0} / 删除 ${rp.deleted||0} / 失败 ${rp.failed||0}`);
-      loadStatus();
-    } catch(err){ toast('同步失败:'+err); }
-    finally { el.disabled=false; el.textContent='立即同步飞书'; }
+    const kb = CFG.knowledge_bases[ki];
+    const arr = kb.vcs_bindings;
+    const b = arr[bi];
+    if(isSavedBinding(ki, 'vcs', bi)){
+      // 已保存:走 API,连本地镜像数据一起清
+      const ok=await confirmDialog(
+        `删除绑定「${b.name}」?\n将一并删除本地镜像 src/vcs/${b.name}/ 及其已入库内容。\n(远端仓库不受影响,重新绑定可再拉回)`,
+        {okText:'删除',danger:true});
+      if(!ok) return;
+      if(await apiDeleteBinding('vcs', kb.id, bi)){ await loadConfig(); await loadStatus(); }
+    } else {
+      // 新增未保存:直接移除行
+      arr.splice(bi,1);
+      renderKbs();
+    }
   }
 });
-// 切换 VCS 绑定类型时,git 专属字段(仓库子目录)随 svn / git 显隐
+// 从仓库 URL 猜测 VCS 类型:svn:// 或路径里带 /svn/ → svn;.git 结尾或 git@ 开头 → git;
+// 其它(纯 https 域名等)猜不出来返回 null,保持用户所选。
+function guessVcsType(url){
+  const s=String(url||'').trim();
+  if(!s) return null;
+  if(/^svn:\/\//.test(s) || /\/svn\//.test(s)) return 'svn';
+  if(/\.git$/.test(s) || /^git@/.test(s) || /github\.com|gitlab|gitee/.test(s)) return 'git';
+  return null;
+}
 document.getElementById('kbSections').addEventListener('change', e=>{
+  // 填完仓库 URL:按 URL 特征自动切换 git / svn 类型,防止"svn 地址 + git 类型"配错
+  const urlInp = e.target.closest('input[data-vf="url"]');
+  if(urlInp){
+    const guessed = guessVcsType(urlInp.value);
+    if(guessed){
+      const sel = document.querySelector(`select[data-vi="${urlInp.dataset.vi}"][data-vf="vcs_type"]`);
+      if(sel && sel.value !== guessed){
+        sel.value = guessed;
+        const row = sel.closest('.vcs-row');
+        if(row) row.classList.toggle('is-svn', guessed==='svn');
+        toast(`已根据 URL 自动切换类型为 ${guessed}`);
+      }
+    }
+    return;
+  }
+  // 切换 VCS 类型时,git 专属字段显隐
   const sel = e.target.closest('select[data-vf="vcs_type"]');
-  if(!sel) return;
-  const row = sel.closest('.vcs-row');
-  if(row) row.classList.toggle('is-svn', sel.value==='svn');
+  if(sel){
+    const row = sel.closest('.vcs-row');
+    if(row) row.classList.toggle('is-svn', sel.value==='svn');
+  }
 });
 document.getElementById('btnAddKb').addEventListener('click', ()=>{
   collect();
   CFG.knowledge_bases = CFG.knowledge_bases || [];
-  CFG.knowledge_bases.push({ id:'', name:'新知识库', root:'', feishu:{app_id:'',app_secret:'',folder_token:'',sync_interval_minutes:0}, vcs_bindings:[] });
+  CFG.knowledge_bases.push({ id:'', name:'新知识库', root:'', vcs_bindings:[], cloud_bindings:[] });
   renderKbs();
 });
 document.getElementById('btnSave').addEventListener('click', async ()=>{
   collect();
   for(const kb of CFG.knowledge_bases){
     if(!kb.name || !kb.root){ toast('每个知识库都要填名称和根目录'); return; }
+    for(const b of (kb.vcs_bindings||[])){
+      if(!b.name){ toast(`知识库「${kb.name}」有仓库绑定没填绑定名`); return; }
+      if(!b.url){ toast(`仓库绑定「${b.name}」没填 URL`); return; }
+    }
   }
   try {
     await invoke('set_config', { config: CFG });
-    toast('配置已保存');
+    toast('配置已保存。同步操作请到 web 界面的「知识库操作」里执行');
     await loadConfig(); await loadStatus();
   } catch(e){ toast('保存失败:'+e); }
 });

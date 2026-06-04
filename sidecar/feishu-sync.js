@@ -1,16 +1,24 @@
 #!/usr/bin/env node
-// Ktree 飞书同步 sidecar
+// Ktree 飞书同步 sidecar(云文档绑定)
 //
 // 协议:从 stdin 读一行 JSON,向 stdout 写一行 JSON。
-//   入:  { "app_id": "...", "app_secret": "...", "folder_token": "...",
-//          "kb_root": "/abs/path", "mode": "full" | "sync" }
-//   出成功:{ "ok": true, "documents": [ { "rel_path", "title", "category" } ],
+//   入:  { "app_id": "...", "app_secret": "...",
+//          "target_type": "folder" | "doc", "target_token": "...",
+//          "kb_root": "/abs/path", "dest_prefix": "cloud/feishu/<绑定名>",
+//          "mode": "full" | "sync" }
+//   出成功:{ "ok": true,
+//            "documents": [ { "rel_path", "title" } ],   // 本轮有变化、需要 ingest 的
+//            "present": [ "rel_path", ... ],              // 同步后实际存在的全部文档
 //            "skipped": 3, "errors": [ { "doc", "error" } ] }
 //   出失败:{ "ok": false, "error": "..." }
 //
-// 行为:递归遍历飞书共享文件夹,把每个文档(docx / bitable / 画板)转成 Markdown,
-//      写入 <kb_root>/raw/feishu/<飞书文件夹层级>/<文档名>.md。
-//      图片/附件下载到 markdown 同目录下的 assets 子目录。
+// 行为:
+//   - target_type=folder:递归遍历飞书共享文件夹,把每个文档(docx / bitable)转成 Markdown
+//   - target_type=doc:只同步这一篇文档(docx 或 bitable,自动识别)
+//   - md 写入 <kb_root>/src/<dest_prefix>/<层级>/<文档名>.md(rel_path 相对 src/)
+//   - 图片/附件写入 <kb_root>/docs/<dest_prefix>/<层级>/<文档名>.assets/,
+//     md 内用同目录相对路径 `<文档名>.assets/xxx.png` 引用
+//   - 严格镜像:src/<dest_prefix>/ 下不属于本轮飞书内容的文件一律删除
 //
 // 日志全部走 stderr,stdout 只输出最后一行 JSON。
 //
@@ -1423,12 +1431,13 @@ function stateKey(relPath, name) {
   return relPath ? `feishu://${relPath}/${name}` : `feishu://${name}`;
 }
 
-// 增量状态文件读写(放在知识库根的 .ktree/ 下)
-function syncStatePath(kbRoot) {
-  return path.join(kbRoot, '.ktree', '.feishu-sync-state.json');
+// 增量状态文件读写(放在知识库根的 .ktree/ 下,每个绑定一份,按 dest_prefix 区分)
+function syncStatePath(kbRoot, destPrefix) {
+  const name = destPrefix.split('/').join('_');
+  return path.join(kbRoot, '.ktree', `.cloud-sync-${name}.json`);
 }
-function loadSyncState(kbRoot) {
-  const statePath = syncStatePath(kbRoot);
+function loadSyncState(kbRoot, destPrefix) {
+  const statePath = syncStatePath(kbRoot, destPrefix);
   try {
     if (fs.existsSync(statePath)) {
       return JSON.parse(fs.readFileSync(statePath, 'utf8'));
@@ -1439,42 +1448,43 @@ function loadSyncState(kbRoot) {
   return {};
 }
 
-function saveSyncState(kbRoot, state) {
-  const statePath = syncStatePath(kbRoot);
+function saveSyncState(kbRoot, destPrefix, state) {
+  const statePath = syncStatePath(kbRoot, destPrefix);
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
 }
 
-// 同步单个文件,返回 { rel_path, title, category } 或抛错。
-// 产出:md → <kb_root>/src/feishu/<层级>/<name>.md;图片资源 → <kb_root>/ref/feishu/<层级>/<name>/
+// 同步单个文件,返回 { rel_path, title } 或抛错。
+// 产出:
+//   md       → <kb_root>/src/<dest_prefix>/<层级>/<name>.md
+//   图片附件 → <kb_root>/docs/<dest_prefix>/<层级>/<name>.assets/
+// md 内用同目录相对路径 `<name>.assets/xxx.png` 引用资源 ——
+// ingest 会把 md 软链镜像到 docs/ 同位置,引用恰好命中旁边的 .assets/。
 // 不写 frontmatter —— 交给 Ktree 的 ingest 统一加。
-async function syncFile(client, fileInfo, kbRoot) {
+async function syncFile(client, fileInfo, kbRoot, destPrefix) {
   const name = fileInfo.name;
   const ftype = fileInfo.type;
   const token = fileInfo.token;
   const relPath = fileInfo.relative_path;
 
-  // md 写到 src/feishu/<层级>/<name>.md
+  // md 写到 src/<dest_prefix>/<层级>/<name>.md
   const srcDir = relPath
-    ? path.join(kbRoot, 'src', 'feishu', relPath)
-    : path.join(kbRoot, 'src', 'feishu');
+    ? path.join(kbRoot, 'src', destPrefix, relPath)
+    : path.join(kbRoot, 'src', destPrefix);
   fs.mkdirSync(srcDir, { recursive: true });
   const outputPath = path.join(srcDir, `${name}.md`);
 
-  // 图片资源写到 ref/feishu/<层级>/<name>/
+  // 图片附件写到 docs/<dest_prefix>/<层级>/<name>.assets/
   const assetsDir = relPath
-    ? path.join(kbRoot, 'ref', 'feishu', relPath, name)
-    : path.join(kbRoot, 'ref', 'feishu', name);
+    ? path.join(kbRoot, 'docs', destPrefix, relPath, `${name}.assets`)
+    : path.join(kbRoot, 'docs', destPrefix, `${name}.assets`);
+  // md 与 .assets 同目录,引用前缀就是目录名本身
+  const assetsRef = `${name}.assets`;
 
-  // md 经 ingest 会落到 docs/feishu/<层级>/<name>.md,引用 ref 用相对 docs 的路径
-  const mdRelPath = relPath ? `feishu/${relPath}/${name}.md` : `feishu/${name}.md`;
-  const depth = mdRelPath.split('/').length - 1;
-  const up = '../'.repeat(depth + 1);
-  const refSub = relPath ? `feishu/${relPath}/${name}` : `feishu/${name}`;
-  const assetsRef = `${up}ref/${refSub}`;
-
-  // 分类:取飞书文件夹第一层目录名(顶层文档归到 feishu)
-  const category = relPath ? relPath.split('/')[0] : 'feishu';
+  // rel_path 相对 src/(带 dest_prefix)
+  const mdRelPath = relPath
+    ? `${destPrefix}/${relPath}/${name}.md`
+    : `${destPrefix}/${name}.md`;
 
   let content;
   if (ftype === 'docx') {
@@ -1501,30 +1511,104 @@ async function syncFile(client, fileInfo, kbRoot) {
   fs.writeFileSync(outputPath, content, 'utf8');
   log(`  转换完成: ${name} -> src/${mdRelPath}`);
 
-  return { rel_path: mdRelPath, title: name, category };
+  return { rel_path: mdRelPath, title: name };
+}
+
+// 单篇文档模式:自动识别 token 是 docx 还是 bitable,返回文件描述(与文件夹扫描同构)
+async function resolveSingleDoc(client, token) {
+  // 先按新版文档(docx)取标题
+  try {
+    const info = await client.getDocumentInfo(token);
+    const title = cleanName(
+      (info && info.document && info.document.title) || ''
+    );
+    if (title) {
+      return {
+        token,
+        name: title,
+        type: 'docx',
+        modified_time: (info && info.document && info.document.revision_id) || '',
+        relative_path: '',
+      };
+    }
+  } catch (e) {
+    log(`  按 docx 解析失败,尝试多维表格: ${e.message || e}`);
+  }
+  // 再按多维表格取应用名
+  try {
+    const resp = await client._jsonRequest('GET', `/bitable/v1/apps/${token}`);
+    const title = cleanName((resp.data && resp.data.app && resp.data.app.name) || '');
+    if (title) {
+      return {
+        token,
+        name: title,
+        type: 'bitable',
+        modified_time: (resp.data && resp.data.app && resp.data.app.revision) || '',
+        relative_path: '',
+      };
+    }
+  } catch (e) {
+    log(`  按 bitable 解析失败: ${e.message || e}`);
+  }
+  throw new Error('无法识别该文档(既不是新版文档 docx,也不是多维表格)');
+}
+
+// 递归列出目录下所有文件(相对 base 的正斜杠路径),跳过隐藏文件
+function walkFiles(base, rel = '') {
+  const out = [];
+  const dir = rel ? path.join(base, rel) : base;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    return out;
+  }
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const r = rel ? `${rel}/${e.name}` : e.name;
+    if (e.isDirectory()) {
+      out.push(...walkFiles(base, r));
+    } else {
+      out.push(r);
+    }
+  }
+  return out;
 }
 
 // 主流程
 async function run(req) {
-  const { app_id, app_secret, folder_token, kb_root, mode } = req;
+  const {
+    app_id,
+    app_secret,
+    target_type,
+    target_token,
+    kb_root,
+    dest_prefix,
+    mode,
+  } = req;
   if (!app_id || !app_secret) throw new Error('缺少 app_id / app_secret');
-  if (!folder_token) throw new Error('缺少 folder_token');
+  if (!target_token) throw new Error('缺少 target_token');
   if (!kb_root) throw new Error('缺少 kb_root');
+  if (!dest_prefix) throw new Error('缺少 dest_prefix');
+  if (target_type !== 'folder' && target_type !== 'doc') {
+    throw new Error(`target_type 必须是 folder 或 doc,收到「${target_type}」`);
+  }
 
-  // 知识库三目录结构:飞书文档落 src/feishu/,资源落 ref/feishu/,状态落 .ktree/
-  fs.mkdirSync(path.join(kb_root, 'src', 'feishu'), { recursive: true });
-  fs.mkdirSync(path.join(kb_root, 'ref', 'feishu'), { recursive: true });
+  const srcBase = path.join(kb_root, 'src', dest_prefix);
+  fs.mkdirSync(srcBase, { recursive: true });
   fs.mkdirSync(path.join(kb_root, '.ktree'), { recursive: true });
 
   const isSync = mode === 'sync';
   const client = new FeishuClient(app_id, app_secret);
 
-  log('正在扫描飞书文件夹...');
-  const files = await scanFeishuFolder(client, folder_token);
-
-  if (!files.length) {
-    log('文件夹为空或无支持的文档类型');
-    return { ok: true, documents: [], skipped: 0, errors: [], deleted: [] };
+  // 拿到要同步的文件列表(folder:递归扫描;doc:单篇)
+  let files;
+  if (target_type === 'folder') {
+    log('正在扫描飞书文件夹...');
+    files = await scanFeishuFolder(client, target_token);
+  } else {
+    log('正在解析单篇文档...');
+    files = [await resolveSingleDoc(client, target_token)];
   }
 
   const docsCount = files.filter((f) => f.type === 'docx').length;
@@ -1533,7 +1617,7 @@ async function run(req) {
     `找到 ${files.length} 个文件(文档 ${docsCount},多维表格 ${bitableCount}),开始同步...`
   );
 
-  const state = loadSyncState(kb_root);
+  const state = loadSyncState(kb_root, dest_prefix);
   const documents = [];
   const errors = [];
   let skipped = 0;
@@ -1542,18 +1626,20 @@ async function run(req) {
     const key = stateKey(f.relative_path, f.name);
     const existing = state[key];
 
-    // 增量模式:修改时间未变则跳过
+    // 增量模式:修改时间未变且文件还在盘上则跳过
     if (
       isSync &&
       existing &&
-      String(existing.modified_time || '') === String(f.modified_time || '')
+      String(existing.modified_time || '') === String(f.modified_time || '') &&
+      existing.rel_path &&
+      fs.existsSync(path.join(kb_root, 'src', existing.rel_path))
     ) {
       skipped += 1;
       continue;
     }
 
     try {
-      const doc = await syncFile(client, f, kb_root);
+      const doc = await syncFile(client, f, kb_root, dest_prefix);
       documents.push(doc);
       state[key] = {
         token: f.token,
@@ -1569,37 +1655,81 @@ async function run(req) {
     }
   }
 
-  // 飞书端已删除的文档:删除本地 md 与对应 assets,并收集 rel_path 上报 Rust 侧
+  // 飞书端已删除的文档:从增量状态里清掉
   const currentKeys = new Set(
     files.map((f) => stateKey(f.relative_path, f.name))
   );
-  const deleted = [];
   for (const key of Object.keys(state)) {
-    if (currentKeys.has(key)) continue;
-    const relPath = state[key].rel_path; // 相对 src,如 feishu/层级/名.md
-    if (relPath) {
-      deleted.push(relPath);
-      try {
-        fs.rmSync(path.join(kb_root, 'src', relPath), { force: true });
-        const refSub = relPath.replace(/\.md$/, '');
-        fs.rmSync(path.join(kb_root, 'ref', refSub), {
-          recursive: true,
-          force: true,
-        });
-      } catch (e) {
-        log(`  [警告] 清理已删除文档失败 ${relPath}: ${e}`);
-      }
-    }
-    delete state[key];
+    if (!currentKeys.has(key)) delete state[key];
   }
 
-  saveSyncState(kb_root, state);
+  saveSyncState(kb_root, dest_prefix, state);
+
+  // present:同步后应该存在的全部文档(本轮转换的 + 增量跳过但仍有效的)
+  const present = new Set();
+  for (const info of Object.values(state)) {
+    if (info.rel_path) present.add(info.rel_path);
+  }
+
+  // 严格镜像:src/<dest_prefix>/ 下不在 present 里的文件一律删除,
+  // 连同 docs/ 侧的 md 镜像与 .assets 伴生目录。
+  let purged = 0;
+  for (const rel of walkFiles(srcBase)) {
+    const relPath = `${dest_prefix}/${rel}`;
+    if (present.has(relPath)) continue;
+    try {
+      fs.rmSync(path.join(kb_root, 'src', relPath), { force: true });
+      fs.rmSync(path.join(kb_root, 'docs', relPath), { force: true });
+      const assetsRel = relPath.replace(/\.[^./]*$/, '') + '.assets';
+      fs.rmSync(path.join(kb_root, 'docs', assetsRel), {
+        recursive: true,
+        force: true,
+      });
+      purged += 1;
+    } catch (e) {
+      log(`  [警告] 严格镜像清理失败 ${relPath}: ${e}`);
+    }
+  }
+  // 清掉空目录(从深到浅)
+  const dirs = [];
+  (function collectDirs(base, rel = '') {
+    const dir = rel ? path.join(base, rel) : base;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      return;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        const r = rel ? `${rel}/${e.name}` : e.name;
+        dirs.push(r);
+        collectDirs(base, r);
+      }
+    }
+  })(srcBase);
+  dirs.sort((a, b) => b.length - a.length);
+  for (const d of dirs) {
+    try {
+      const abs = path.join(srcBase, d);
+      if (fs.readdirSync(abs).length === 0) fs.rmdirSync(abs);
+    } catch (e) {
+      // ignore
+    }
+  }
 
   log(
-    `\n完成! 同步 ${documents.length} 个, 跳过 ${skipped} 个未变更, 失败 ${errors.length} 个, 删除 ${deleted.length} 个`
+    `\n完成! 同步 ${documents.length} 个, 跳过 ${skipped} 个未变更, ` +
+      `失败 ${errors.length} 个, 严格镜像清理 ${purged} 个`
   );
 
-  return { ok: true, documents, skipped, errors, deleted };
+  return {
+    ok: true,
+    documents,
+    present: Array.from(present),
+    skipped,
+    errors,
+  };
 }
 
 // ==========================================================

@@ -5,7 +5,7 @@ use axum::{
     extract::{ConnectInfo, Multipart, Path as AxPath, Query, State as AxState},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -16,7 +16,7 @@ use tower_http::cors::CorsLayer;
 use md5::{Digest, Md5};
 
 use crate::config::KnowledgeBase;
-use crate::ingest::{self, safe_component, safe_rel_path};
+use crate::ingest::{self, in_upload_area, safe_component, safe_rel_path};
 use crate::mcp;
 use crate::state::AppState;
 
@@ -76,18 +76,62 @@ fn require_kb(state: &AppState, kb_id: &str) -> Result<KnowledgeBase, Response> 
         .ok_or_else(|| not_found("知识库不存在"))
 }
 
-/// 文件夹顶级名称排序权重:docs 最上,然后 src / ref / .ktree,其它按字母。
-fn folder_order(s: &str) -> u8 {
-    match s.split('/').next().unwrap_or("") {
+/// 单段目录名的排序权重(同级之间比较):
+/// 顶级:docs < src < .ktree;src/docs 下三区:vcs < cloud < upload;其余同权重按字母。
+fn segment_order(name: &str) -> u8 {
+    match name {
         "docs" => 0,
         "src" => 1,
-        "ref" => 2,
-        ".ktree" => 3,
-        _ => 9,
+        ".ktree" => 9,
+        // 三区顺序:仓库同步 / 云文档在前,用户上传区在后
+        "vcs" => 0,
+        "cloud" => 1,
+        "upload" => 2,
+        _ => 5,
     }
 }
 
-/// 递归收集目录下所有子目录的相对路径(正斜杠),跳过隐藏目录。
+/// 完整路径的层级排序键:每段映射成 (权重, 名字),Vec 的字典序即层级排序。
+fn folder_sort_key(path: &str) -> Vec<(u8, String)> {
+    path.split('/')
+        .map(|seg| (segment_order(seg), seg.to_string()))
+        .collect()
+}
+
+/// 路径是否落在镜像区(src|docs 下的 vcs / cloud)。镜像区的空目录是远端占位,
+/// 知识库里无意义,文件树不展示;upload 区的空目录是用户工作目录,保留。
+fn is_mirror_area_path(rel: &str) -> bool {
+    matches!(
+        rel.split('/').collect::<Vec<_>>().as_slice(),
+        ["src", "vcs", ..] | ["src", "cloud", ..] | ["docs", "vcs", ..] | ["docs", "cloud", ..]
+    )
+}
+
+/// 目录(递归)下是否有可见文件(跳过 .git/.svn/隐藏/.assets)。用于判断镜像区空目录。
+fn dir_has_visible_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name.ends_with(".assets") {
+            continue;
+        }
+        match e.file_type() {
+            Ok(t) if t.is_dir() => {
+                if dir_has_visible_file(&e.path()) {
+                    return true;
+                }
+            }
+            Ok(_) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// 递归收集目录下所有子目录的相对路径(正斜杠),跳过隐藏目录与 .assets 伴生资源目录;
+/// 镜像区(vcs/cloud)的空目录也跳过(远端占位,知识库无意义)。
 fn collect_folders(base: &Path, prefix: &str, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(base) else {
         return;
@@ -96,7 +140,7 @@ fn collect_folders(base: &Path, prefix: &str, out: &mut Vec<String>) {
         let path = e.path();
         if path.is_dir() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
+            if name.starts_with('.') || name.ends_with(".assets") {
                 continue;
             }
             let rel = if prefix.is_empty() {
@@ -104,6 +148,10 @@ fn collect_folders(base: &Path, prefix: &str, out: &mut Vec<String>) {
             } else {
                 format!("{prefix}/{name}")
             };
+            // 镜像区空目录不展示
+            if is_mirror_area_path(&rel) && !dir_has_visible_file(&path) {
+                continue;
+            }
             out.push(rel.clone());
             collect_folders(&path, &rel, out);
         }
@@ -156,20 +204,24 @@ pub async fn serve(state: AppState) {
         .route("/api/doc/:id", get(get_doc).delete(delete_doc))
         .route("/api/doc/:id/md", get(get_doc_md))
         .route("/api/doc/:id/raw", get(get_doc_raw))
-        .route("/api/sync/feishu/trigger", post(feishu_trigger))
         .route("/api/notes", get(list_notes).post(add_note))
         .route("/api/notes/:id", put(update_note).delete(delete_note))
         .route("/api/kb", post(add_kb))
-        .route("/api/kb/:kb_id/feishu", put(set_kb_feishu))
         .route("/api/kb/:kb_id/vcs", get(list_kb_vcs).post(add_kb_vcs))
         .route("/api/kb/:kb_id/vcs/sync", post(sync_kb_vcs_all))
         .route("/api/kb/:kb_id/vcs/:idx", put(update_kb_vcs).delete(remove_kb_vcs))
         .route("/api/kb/:kb_id/vcs/:idx/sync", post(sync_kb_vcs_one))
+        .route("/api/kb/:kb_id/cloud", get(list_kb_cloud).post(add_kb_cloud))
+        .route(
+            "/api/kb/:kb_id/cloud/:idx",
+            put(update_kb_cloud).delete(remove_kb_cloud),
+        )
+        .route("/api/kb/:kb_id/cloud/:idx/sync", post(sync_kb_cloud_one))
         .route("/lib/marked.min.js", get(lib_marked))
         .route("/lib/highlight.min.js", get(lib_hljs))
         .route("/lib/github.min.css", get(lib_css))
+        // MCP 只支持 JSON-RPC POST;不注册 GET,axum 会自动回 405 + Allow: POST
         .route("/mcp", post(mcp::handle))
-        .route("/mcp", get(mcp::handle_get))
         // 知识库文件直链:/<知识库名>/<相对知识库根的路径>。放最后,优先匹配上面的固定路由。
         .route("/:kb_id/*path", get(serve_kb_file))
         .layer(CorsLayer::permissive())
@@ -220,16 +272,18 @@ async fn api_info() -> Response {
             "GET  /api/tree?kb=<id>",
             "GET  /api/files?kb=<id>&path=<dir>",
             "GET  /<知识库名>/<file path>  (静态文件直链)",
-            "POST /api/folder?kb=<id>&path=src/<dir>",
-            "POST /api/upload?kb=<id>&path=src/<dir>&convert=md",
+            "POST /api/folder?kb=<id>&path=src/upload/<dir>",
+            "POST /api/upload?kb=<id>&path=src/upload/<dir>&convert=md",
             "GET  /api/search?kb=<id>&q=<kw>&limit=<n>",
             "GET  /api/doc/:id  /md  /raw",
-            "DELETE /api/doc/:id",
-            "POST /api/sync/feishu/trigger?kb=<id>",
+            "DELETE /api/doc/:id  (仅 upload 区)",
             "POST /api/kb  (新增知识库 {name, root?})",
-            "PUT  /api/kb/:kb_id/feishu  (配置飞书)",
-            "GET/POST /api/kb/:kb_id/vcs  (列出 / 新增 VCS 绑定)",
-            "PUT/DELETE /api/kb/:kb_id/vcs/:idx  (改 / 删 VCS 绑定)"
+            "GET/POST /api/kb/:kb_id/vcs  (列出 / 新增 VCS 绑定 → src/vcs/<名>)",
+            "PUT/DELETE /api/kb/:kb_id/vcs/:idx  (改 / 删 VCS 绑定)",
+            "POST /api/kb/:kb_id/vcs/:idx/sync  (同步一条 VCS 绑定)",
+            "GET/POST /api/kb/:kb_id/cloud  (列出 / 新增云文档绑定 → src/cloud/<提供方>/<名>)",
+            "PUT/DELETE /api/kb/:kb_id/cloud/:idx  (改 / 删云文档绑定)",
+            "POST /api/kb/:kb_id/cloud/:idx/sync  (同步一条云文档绑定)"
         ]
     }))
 }
@@ -313,20 +367,6 @@ async fn add_kb(
     })))
 }
 
-/// PUT /api/kb/:kb_id/feishu —— 覆盖某知识库的飞书配置。
-async fn set_kb_feishu(
-    AxState(state): AxState<AppState>,
-    AxPath(kb_id): AxPath<String>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(feishu): Json<crate::config::FeishuConfig>,
-) -> Result<Response, ApiError> {
-    if let Err(r) = require_local(&addr) {
-        return Ok(r);
-    }
-    state.config.set_feishu(&kb_id, feishu)?;
-    Ok(json_ok(json!({ "ok": true })))
-}
-
 /// POST /api/kb/:kb_id/vcs —— 追加一条 VCS 绑定。
 async fn add_kb_vcs(
     AxState(state): AxState<AppState>,
@@ -355,7 +395,8 @@ async fn update_kb_vcs(
     Ok(json_ok(json!({ "ok": true })))
 }
 
-/// DELETE /api/kb/:kb_id/vcs/:idx —— 删除第 idx 条 VCS 绑定。
+/// DELETE /api/kb/:kb_id/vcs/:idx —— 删除第 idx 条 VCS 绑定,
+/// 并清掉 src/vcs/<名>/ 目录、docs 产物与 store / 索引记录(镜像内容可重拉,放心删)。
 async fn remove_kb_vcs(
     AxState(state): AxState<AppState>,
     AxPath((kb_id, idx)): AxPath<(String, usize)>,
@@ -364,8 +405,137 @@ async fn remove_kb_vcs(
     if let Err(r) = require_local(&addr) {
         return Ok(r);
     }
-    state.config.remove_vcs_binding(&kb_id, idx)?;
+    let kb = match require_kb(&state, &kb_id) {
+        Ok(k) => k,
+        Err(r) => return Ok(r),
+    };
+    let removed_binding = state.config.remove_vcs_binding(&kb_id, idx)?;
+    // 清理该绑定的持久化同步状态(下标会随删除变动,后续状态由下次同步重建)
+    let _ = state.store.delete_sync_state("vcs", &kb_id, idx);
+    let st = state.clone();
+    let purged = tokio::task::spawn_blocking(move || {
+        crate::vcs::purge_binding_data(&st, &kb, &removed_binding)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("清理任务失败: {e}"))?
+    .unwrap_or(0);
+    Ok(json_ok(json!({ "ok": true, "purged_docs": purged })))
+}
+
+// ---- 云文档绑定(飞书等):列出 / 新增 / 修改 / 删除 / 同步 ----
+
+/// 列出某知识库下所有云文档绑定。**不会回显 app_secret**,保留其他字段。
+async fn list_kb_cloud(
+    AxState(state): AxState<AppState>,
+    AxPath(kb_id): AxPath<String>,
+) -> Result<Response, ApiError> {
+    let Some(kb) = state.config.get_kb(&kb_id) else {
+        return Ok(not_found("知识库不存在"));
+    };
+    let last_map = state.last_cloud_sync.lock().ok();
+    let syncing = state.syncing.lock().ok();
+    let arr: Vec<Value> = kb
+        .cloud_bindings
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let last = last_map
+                .as_ref()
+                .and_then(|m| m.get(&(kb_id.clone(), i)))
+                .cloned();
+            let in_progress = syncing
+                .as_ref()
+                .map(|s| s.contains(&("cloud".to_string(), kb_id.clone(), i)))
+                .unwrap_or(false);
+            json!({
+                "idx": i,
+                "name": b.name,
+                "provider": b.provider,
+                "app_id": b.app_id,
+                "target_type": b.target_type,
+                "target_token": b.target_token,
+                "has_credentials": !b.app_secret.is_empty(),
+                "sync_interval_minutes": b.sync_interval_minutes,
+                "last_sync": last,
+                "syncing": in_progress,
+            })
+        })
+        .collect();
+    Ok(json_ok(json!({ "ok": true, "bindings": arr })))
+}
+
+/// POST /api/kb/:kb_id/cloud —— 追加一条云文档绑定。
+async fn add_kb_cloud(
+    AxState(state): AxState<AppState>,
+    AxPath(kb_id): AxPath<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(binding): Json<crate::config::CloudBinding>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
+    let idx = state.config.add_cloud_binding(&kb_id, binding)?;
+    Ok(json_ok(json!({ "ok": true, "idx": idx })))
+}
+
+/// PUT /api/kb/:kb_id/cloud/:idx —— 覆盖第 idx 条云文档绑定(名字不可改)。
+async fn update_kb_cloud(
+    AxState(state): AxState<AppState>,
+    AxPath((kb_id, idx)): AxPath<(String, usize)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(binding): Json<crate::config::CloudBinding>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
+    state.config.update_cloud_binding(&kb_id, idx, binding)?;
     Ok(json_ok(json!({ "ok": true })))
+}
+
+/// DELETE /api/kb/:kb_id/cloud/:idx —— 删除第 idx 条云文档绑定,
+/// 并清掉 src/cloud/<提供方>/<名>/ 目录、docs 产物与 store / 索引记录。
+async fn remove_kb_cloud(
+    AxState(state): AxState<AppState>,
+    AxPath((kb_id, idx)): AxPath<(String, usize)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
+    let kb = match require_kb(&state, &kb_id) {
+        Ok(k) => k,
+        Err(r) => return Ok(r),
+    };
+    let removed_binding = state.config.remove_cloud_binding(&kb_id, idx)?;
+    let _ = state.store.delete_sync_state("cloud", &kb_id, idx);
+    let st = state.clone();
+    let purged = tokio::task::spawn_blocking(move || {
+        crate::feishu::purge_binding_data(&st, &kb, &removed_binding)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("清理任务失败: {e}"))?
+    .unwrap_or(0);
+    Ok(json_ok(json!({ "ok": true, "purged_docs": purged })))
+}
+
+/// POST /api/kb/:kb_id/cloud/:idx/sync —— 全量同步一条云文档绑定。
+async fn sync_kb_cloud_one(
+    AxState(state): AxState<AppState>,
+    AxPath((kb_id, idx)): AxPath<(String, usize)>,
+) -> Result<Response, ApiError> {
+    let Some(kb) = state.config.get_kb(&kb_id) else {
+        return Ok(not_found("知识库不存在"));
+    };
+    if idx >= kb.cloud_bindings.len() {
+        return Ok(bad_request("云文档绑定 idx 越界"));
+    }
+    let st = state.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        crate::feishu::sync_binding_with_record(&st, &kb, idx, "full", "manual")
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("云文档同步任务失败: {e}"))??;
+    Ok(json_ok(json!({ "ok": true, "report": report })))
 }
 
 // ---- 记事板:公共记事(所有人可看 / 可增删,不限本机)----
@@ -421,7 +591,8 @@ async fn list_kbs(AxState(state): AxState<AppState>) -> Result<Response, ApiErro
             "name": kb.name,
             "root": kb.root,
             "documents": docs,
-            "feishu_configured": kb.feishu.is_complete(),
+            "vcs_bindings": kb.vcs_bindings.len(),
+            "cloud_bindings": kb.cloud_bindings.len(),
         }));
     }
     Ok(json_ok(json!({ "ok": true, "knowledge_bases": kbs })))
@@ -432,7 +603,22 @@ struct KbQuery {
     kb: String,
 }
 
-/// 返回某知识库 src/docs/ref 三个区下的全部目录(相对知识库根,正斜杠)。
+/// 该路径是否属于「没有任何绑定时应隐藏」的空镜像区。
+/// vcs 区在没有 VCS 绑定、cloud 区在没有云文档绑定时不展示(目录可能还在盘上,但没有意义)。
+fn is_hidden_empty_area(kb: &KnowledgeBase, rel: &str) -> bool {
+    let area_of = |prefix: &str| {
+        rel == format!("src/{prefix}")
+            || rel.starts_with(&format!("src/{prefix}/"))
+            || rel == format!("docs/{prefix}")
+            || rel.starts_with(&format!("docs/{prefix}/"))
+    };
+    (kb.vcs_bindings.is_empty() && area_of("vcs"))
+        || (kb.cloud_bindings.is_empty() && area_of("cloud"))
+}
+
+/// 返回某知识库 docs/src 下的全部目录(相对知识库根,正斜杠)。
+/// 没有绑定的 vcs / cloud 镜像区不出现在树里;.ktree 元数据目录对用户隐藏
+/// (其内容仍可经直链 /<库>/.ktree/INDEX.md 访问,供 AI 自描述用)。
 async fn tree(
     AxState(state): AxState<AppState>,
     Query(q): Query<KbQuery>,
@@ -442,21 +628,15 @@ async fn tree(
         Err(r) => return Ok(r),
     };
     let mut folders = Vec::new();
-    for base in ["docs", "src", "ref", ".ktree"] {
+    for base in ["docs", "src"] {
         let base_abs = kb.root.join(base);
         if base_abs.is_dir() {
             folders.push(base.to_string());
             collect_folders(&base_abs, base, &mut folders);
         }
     }
-    folders.sort_by(|a, b| {
-        let (oa, ob) = (folder_order(a), folder_order(b));
-        if oa != ob {
-            oa.cmp(&ob)
-        } else {
-            a.cmp(b)
-        }
-    });
+    folders.retain(|f| !is_hidden_empty_area(&kb, f));
+    folders.sort_by_cached_key(|f| folder_sort_key(f));
     Ok(json_ok(json!({ "ok": true, "folders": folders })))
 }
 
@@ -468,7 +648,8 @@ struct FilesQuery {
 }
 
 /// 列某目录(相对知识库根)下的子目录与文件。src 下的文件附带 doc_id;
-/// 只有 src 区可写(可上传/建文件夹)。
+/// 只有 src/upload 区可写(可上传/建文件夹/删除),vcs/cloud 区只读。
+/// .assets 伴生资源目录默认隐藏。
 async fn list_files(
     AxState(state): AxState<AppState>,
     Query(q): Query<FilesQuery>,
@@ -491,16 +672,35 @@ async fn list_files(
     }
 
     let in_src = rel == "src" || rel.starts_with("src/");
+    // 可写性:仅 src/upload 区(含 src 根 —— 但上传/建目录的目标校验在各自接口里收口)
+    let writable = rel
+        .strip_prefix("src/")
+        .map(in_upload_area)
+        .unwrap_or(false);
     let mut folders: Vec<Value> = Vec::new();
     let mut files: Vec<Value> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir_abs) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            // .ktree 是知识库元数据目录,允许浏览;其它隐藏文件跳过
-            if name.starts_with('.') && name != ".ktree" {
+            // 隐藏文件(含 .ktree 元数据目录)与 .assets 伴生资源目录都不在列表展示;
+            // .ktree 内容仍可经直链访问,只是不出现在文件浏览里。
+            if name.starts_with('.') || name.ends_with(".assets") {
+                continue;
+            }
+            // 没有绑定的 vcs / cloud 镜像区不展示
+            let entry_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if is_hidden_empty_area(&kb, &entry_rel) {
                 continue;
             }
             let p = e.path();
+            // 镜像区(vcs/cloud)的空目录是远端占位,不展示(与文件树一致)
+            if p.is_dir() && is_mirror_area_path(&entry_rel) && !dir_has_visible_file(&p) {
+                continue;
+            }
             // 跟随软链取真实文件元数据(docs/ 下大量软链指向 src/ 原文件)。
             // 软链断裂时回落到软链自身的元数据,避免整目录崩。
             let meta = std::fs::metadata(&p).or_else(|_| e.metadata()).ok();
@@ -524,31 +724,18 @@ async fn list_files(
                     .and_then(|x| x.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                let (doc_id, md_path, ref_dir) = if in_src {
+                let (doc_id, md_path, assets_dir) = if in_src {
                     let src_rel = rel_file.strip_prefix("src/").unwrap_or(&rel_file);
                     match state.store.get_by_path(&kb.id, src_rel).ok().flatten() {
                         Some(d) => {
-                            // ref 资源目录:ref/<src 相对路径去扩展名>/,存在才返回
-                            let sp = Path::new(src_rel);
-                            let stem =
-                                sp.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                            let ref_rel = match sp
-                                .parent()
-                                .filter(|x| !x.as_os_str().is_empty())
-                            {
-                                Some(dir) => format!(
-                                    "{}/{}",
-                                    dir.to_string_lossy().replace('\\', "/"),
-                                    stem
-                                ),
-                                None => stem.to_string(),
-                            };
-                            let rd = if kb.root.join("ref").join(&ref_rel).is_dir() {
-                                Some(format!("ref/{ref_rel}"))
+                            // 伴生资源目录:docs/<父目录>/<stem>.assets/,存在才返回
+                            let assets_rel = ingest::assets_rel_of(src_rel);
+                            let ad = if kb.root.join("docs").join(&assets_rel).is_dir() {
+                                Some(format!("docs/{assets_rel}"))
                             } else {
                                 None
                             };
-                            (Some(d.id), d.md_path, rd)
+                            (Some(d.id), d.md_path, ad)
                         }
                         None => (None, None, None),
                     }
@@ -558,7 +745,7 @@ async fn list_files(
                 files.push(json!({
                     "name": name, "rel_path": rel_file, "size": size,
                     "modified": modified, "ext": ext,
-                    "doc_id": doc_id, "md_path": md_path, "ref_dir": ref_dir,
+                    "doc_id": doc_id, "md_path": md_path, "assets_dir": assets_dir,
                 }));
             }
         }
@@ -568,7 +755,7 @@ async fn list_files(
     };
     folders.sort_by(|a, b| {
         let (na, nb) = (name_of(a), name_of(b));
-        let (oa, ob) = (folder_order(&na), folder_order(&nb));
+        let (oa, ob) = (segment_order(&na), segment_order(&nb));
         if oa != ob {
             oa.cmp(&ob)
         } else {
@@ -578,7 +765,7 @@ async fn list_files(
     files.sort_by(|a, b| name_of(a).cmp(&name_of(b)));
 
     Ok(json_ok(json!({
-        "ok": true, "path": rel, "writable": in_src,
+        "ok": true, "path": rel, "writable": writable,
         "folders": folders, "files": files,
     })))
 }
@@ -629,7 +816,8 @@ struct FolderQuery {
     path: String,
 }
 
-/// 递归删除 src/ 下的一个文件夹(连同 docs/ ref/ 对应目录、SQLite + tantivy + manifest 联动)
+/// 递归删除上传区的一个文件夹(连同 docs/ 对应目录、SQLite + tantivy + manifest 联动)。
+/// 仅允许 src/upload/ 下的子目录;vcs/cloud 区是同步镜像,不允许手动删。
 async fn delete_folder_http(
     AxState(state): AxState<AppState>,
     Query(q): Query<FolderQuery>,
@@ -648,6 +836,11 @@ async fn delete_folder_http(
     if src_rel.is_empty() {
         return Ok(bad_request("不能删除 src 根目录"));
     }
+    if !in_upload_area(&src_rel) || src_rel == crate::config::AREA_UPLOAD {
+        return Ok(bad_request(
+            "只能删除上传区(src/upload/)下的文件夹;仓库同步与云文档目录由同步维护",
+        ));
+    }
     let st = state.clone();
     let kb2 = kb.clone();
     let sr = src_rel.clone();
@@ -661,7 +854,7 @@ async fn delete_folder_http(
     Ok(json_ok(json!({ "ok": true, "deleted_docs": removed })))
 }
 
-/// 在 src/ 下创建文件夹(仅 src 区可写)。path 相对知识库根,须以 src 开头。
+/// 在上传区创建文件夹。path 相对知识库根,须在 src/upload 下。
 async fn create_folder(
     AxState(state): AxState<AppState>,
     Query(q): Query<FolderQuery>,
@@ -673,8 +866,17 @@ async fn create_folder(
     let Some(rel) = safe_rel_path(&q.path) else {
         return Ok(bad_request("非法目录路径"));
     };
-    if rel != "src" && !rel.starts_with("src/") {
-        return Ok(bad_request("只能在 src 目录下创建文件夹"));
+    let in_upload = rel
+        .strip_prefix("src/")
+        .map(in_upload_area)
+        .unwrap_or(false);
+    if !in_upload {
+        return Ok(bad_request(
+            "只能在上传区(src/upload/)创建文件夹;仓库同步与云文档目录由同步维护",
+        ));
+    }
+    if rel.split('/').any(|seg| seg.ends_with(".assets")) {
+        return Ok(bad_request("目录名不能以 .assets 结尾(系统保留后缀)"));
     }
     tokio::fs::create_dir_all(kb.root.join(&rel)).await?;
     Ok(json_ok(json!({ "ok": true, "path": rel })))
@@ -683,13 +885,13 @@ async fn create_folder(
 #[derive(Deserialize)]
 struct UploadQuery {
     kb: String,
-    /// 上传目标目录,相对知识库根,须为 src 或 src/ 下
+    /// 上传目标目录,相对知识库根,须在 src/upload 下;空 = src/upload 根
     #[serde(default)]
     path: String,
     convert: Option<String>,
 }
 
-/// 上传文件到某知识库 src/<dir>/ 下。
+/// 上传文件到某知识库上传区(src/upload/<dir>/)。vcs/cloud 区只读,拒绝上传。
 async fn upload(
     AxState(state): AxState<AppState>,
     Query(q): Query<UploadQuery>,
@@ -701,16 +903,24 @@ async fn upload(
     };
     let convert_md = q.convert.as_deref() == Some("md");
 
-    // path 相对知识库根,解析出相对 src 的子目录
+    // path 相对知识库根,解析出相对 src 的目标目录(必须在 upload 区内)
     let src_dir = {
         let p = q.path.trim();
-        if p.is_empty() || p == "src" {
-            String::new()
+        if p.is_empty() {
+            crate::config::AREA_UPLOAD.to_string()
         } else {
             match safe_rel_path(p) {
-                Some(rp) if rp == "src" => String::new(),
-                Some(rp) if rp.starts_with("src/") => rp["src/".len()..].to_string(),
-                _ => return Ok(bad_request("只能上传到 src 目录下")),
+                Some(rp) if rp == "src" => crate::config::AREA_UPLOAD.to_string(),
+                Some(rp) if rp.starts_with("src/") => {
+                    let rest = rp["src/".len()..].to_string();
+                    if !in_upload_area(&rest) {
+                        return Ok(bad_request(
+                            "只能上传到上传区(src/upload/);仓库同步与云文档目录由同步维护",
+                        ));
+                    }
+                    rest
+                }
+                _ => return Ok(bad_request("只能上传到 src/upload 目录下")),
             }
         }
     };
@@ -725,13 +935,13 @@ async fn upload(
             errors.push(json!({ "file": raw_name, "error": "非法文件名" }));
             continue;
         };
+        if filename.ends_with(".assets") {
+            errors.push(json!({ "file": raw_name, "error": "文件名不能以 .assets 结尾(系统保留后缀)" }));
+            continue;
+        }
         let data = field.bytes().await?;
 
-        let rel_path = if src_dir.is_empty() {
-            filename.clone()
-        } else {
-            format!("{src_dir}/{filename}")
-        };
+        let rel_path = format!("{src_dir}/{filename}");
         let abs = kb.root.join("src").join(&rel_path);
         if let Some(parent) = abs.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -892,6 +1102,12 @@ async fn delete_doc(
     let Some(kb) = state.config.get_kb(&doc.kb_id) else {
         return Ok(not_found("文档所属知识库不存在"));
     };
+    // vcs/cloud 区是同步镜像:本地删了下次同步又会回来,且会造成镜像不一致 → 拒绝
+    if !in_upload_area(&doc.rel_path) {
+        return Ok(bad_request(
+            "该文档由仓库/云文档同步维护,不能单独删除;请在来源端删除后同步,或删除整个绑定",
+        ));
+    }
     let st = state.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         ingest::delete_doc(&st, &kb, &doc)?;
@@ -900,24 +1116,6 @@ async fn delete_doc(
     .await
     .map_err(|e| anyhow::anyhow!("删除任务失败: {e}"))??;
     Ok(json_ok(json!({ "ok": true, "deleted": id })))
-}
-
-async fn feishu_trigger(
-    AxState(state): AxState<AppState>,
-    Query(q): Query<KbQuery>,
-) -> Result<Response, ApiError> {
-    let kb = match require_kb(&state, &q.kb) {
-        Ok(k) => k,
-        Err(r) => return Ok(r),
-    };
-    if !kb.feishu.is_complete() {
-        return Ok(bad_request("该知识库未配置飞书凭证"));
-    }
-    let st = state.clone();
-    let report = tokio::task::spawn_blocking(move || crate::feishu::sync(&st, &kb, "full"))
-        .await
-        .map_err(|e| anyhow::anyhow!("飞书同步任务失败: {e}"))??;
-    Ok(json_ok(json!({ "ok": true, "report": report })))
 }
 
 /// 列出某知识库下所有 VCS 绑定。**不会回显 password**(避免泄露),保留其他字段。
@@ -929,6 +1127,7 @@ async fn list_kb_vcs(
         return Ok(not_found("知识库不存在"));
     };
     let last_map = state.last_vcs_sync.lock().ok();
+    let syncing = state.syncing.lock().ok();
     let arr: Vec<Value> = kb
         .vcs_bindings
         .iter()
@@ -938,16 +1137,21 @@ async fn list_kb_vcs(
                 .as_ref()
                 .and_then(|m| m.get(&(kb_id.clone(), i)))
                 .cloned();
+            let in_progress = syncing
+                .as_ref()
+                .map(|s| s.contains(&("vcs".to_string(), kb_id.clone(), i)))
+                .unwrap_or(false);
             json!({
                 "idx": i,
+                "name": b.name,
                 "vcs_type": b.vcs_type,
                 "url": b.url,
-                "sub_dir": b.sub_dir,
                 "repo_sub_path": b.repo_sub_path,
                 "branch": b.branch,
                 "has_credentials": !b.username.is_empty() || !b.password.is_empty(),
                 "sync_interval_minutes": b.sync_interval_minutes,
                 "last_sync": last,
+                "syncing": in_progress,
             })
         })
         .collect();

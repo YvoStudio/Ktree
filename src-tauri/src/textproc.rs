@@ -151,8 +151,38 @@ fn truncate(s: &str) -> String {
 
 /// 抽取式摘要:把正文切句、用 bge 编码,挑出最贴近全文中心的几句拼成摘要。
 /// 句子太少或 embed 不可用时,退化为「正文前若干字」。
+/// 去掉目录项 / 引导点 / 纯页码等噪音行(PDF/长文档常见),避免它们污染摘要。
+/// 只过滤很明确的目录/页码特征,不动正常正文。
+fn strip_toc_noise(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let t = line.trim();
+            if t.is_empty() {
+                return false;
+            }
+            // 目录项:行尾是 "…… 页码" 或 "....(多个点) 页码"
+            if t.ends_with(|c: char| c.is_ascii_digit())
+                && (t.contains("……") || t.matches('.').count() >= 4)
+            {
+                return false;
+            }
+            // 纯页码行:"- 1 -" / "1" / "—12—"
+            let core: String = t
+                .chars()
+                .filter(|c| !matches!(c, '-' | '–' | '—' | ' ' | '\t'))
+                .collect();
+            if !core.is_empty() && core.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn summarize(embedder: &Embedder, text: &str) -> String {
-    let text = text.trim();
+    let cleaned = strip_toc_noise(text);
+    let text = cleaned.trim();
     if text.is_empty() {
         return String::new();
     }

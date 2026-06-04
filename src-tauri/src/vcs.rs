@@ -1,5 +1,7 @@
-//! VCS(git / svn)同步:把仓库工作副本映射到 KB 的 src 子目录,
-//! 拉取后跟 store 里的 doc 列表 diff,新增/变更走 ingest,VCS 端删了的本地清掉。
+//! VCS(git / svn)同步:把仓库工作副本严格镜像到 KB 的 src/vcs/<绑定名>/ 目录。
+//! 该目录由绑定独占(不允许上传 / 手动修改),因此同步采用严格镜像:
+//! 仓库里没有的文件 —— 不管是 VCS 端删除的还是外部混进来的 —— 一律清掉
+//! (盘 + SQLite + tantivy + docs 产物)。
 
 use std::collections::HashSet;
 use std::fs;
@@ -9,8 +11,8 @@ use std::process::Command;
 use md5::{Digest, Md5};
 use serde::Serialize;
 
-use crate::config::{KnowledgeBase, VcsBinding};
-use crate::ingest::{self, safe_rel_path};
+use crate::config::{KnowledgeBase, VcsBinding, AREA_VCS};
+use crate::ingest::{self, safe_component};
 use crate::state::{AppState, LastVcsSync};
 
 /// 一次 VCS 同步的结果汇总。
@@ -20,7 +22,8 @@ pub struct VcsSyncReport {
     pub binding_idx: usize,
     pub vcs_type: String,
     pub url: String,
-    pub sub_dir: String,
+    /// 绑定名(= src/vcs/ 下的目录名)
+    pub name: String,
     /// 仅 git 子目录同步:同步的仓库内子目录;其它情况为空
     pub repo_sub_path: String,
     /// VCS 命令拉取后报告的修订(git: HEAD sha;svn: working copy 修订号)
@@ -29,27 +32,19 @@ pub struct VcsSyncReport {
     pub added: Vec<String>,
     /// 内容有变化、被重新 ingest 的文件
     pub updated: Vec<String>,
-    /// VCS 端删了、本地从 store 也清掉的文件
+    /// 仓库里没有、被严格镜像清掉的文件
     pub deleted: Vec<String>,
     pub failed: Vec<String>,
     pub messages: Vec<String>,
 }
 
-/// 校验一个 VCS 绑定的 sub_dir 合法且唯一指向 src 子目录。
+/// 校验绑定名并返回 (目标绝对路径, 相对 src 的前缀 "vcs/<name>")。
 fn binding_target_dir(kb: &KnowledgeBase, b: &VcsBinding) -> anyhow::Result<(PathBuf, String)> {
-    let sub = b.sub_dir.trim().trim_matches('/').to_string();
-    if !sub.is_empty() {
-        // 路径里不能有 .. 段
-        if safe_rel_path(&sub).is_none() {
-            anyhow::bail!("VCS 绑定 sub_dir「{sub}」不合法");
-        }
-    }
-    let target = if sub.is_empty() {
-        kb.root.join("src")
-    } else {
-        kb.root.join("src").join(&sub)
-    };
-    Ok((target, sub))
+    let name = safe_component(&b.name)
+        .ok_or_else(|| anyhow::anyhow!("VCS 绑定名「{}」不合法", b.name))?;
+    let prefix = format!("{AREA_VCS}/{name}");
+    let target = kb.root.join("src").join(&prefix);
+    Ok((target, prefix))
 }
 
 /// 把可选凭证注入到 https://… 形式的 URL 里(git 用)。
@@ -109,13 +104,14 @@ fn run_cmd(mut cmd: Command, ctx: &str) -> anyhow::Result<String> {
 }
 
 /// git 子目录同步用的隐藏工作副本目录 —— 放 `.ktree/vcs-cache/` 下,`.git` 不进 src。
-/// 按 url+branch+repo_sub_path 取哈希,改了任一项就换一个目录,互不干扰。
+/// 按 绑定名+url+branch+repo_sub_path 取哈希,改了任一项就换一个目录,互不干扰。
 fn git_cache_dir(kb: &KnowledgeBase, b: &VcsBinding) -> PathBuf {
     let key = format!(
         "{:x}",
         Md5::digest(
             format!(
-                "{}\u{0}{}\u{0}{}",
+                "{}\u{0}{}\u{0}{}\u{0}{}",
+                b.name.trim(),
                 b.url.trim(),
                 b.branch.trim(),
                 b.repo_sub_path.trim()
@@ -130,30 +126,23 @@ fn git_cache_dir(kb: &KnowledgeBase, b: &VcsBinding) -> PathBuf {
 }
 
 /// git 同步入口:`repo_sub_path` 为空走整仓克隆(工作副本就在 target);
-/// 非空走稀疏检出 —— 在隐藏目录里只拉那个子目录,再扁平镜像到 target。
+/// 非空走稀疏检出 —— 在隐藏目录里只拉那个子目录,再严格镜像到 target。
 fn git_sync(kb: &KnowledgeBase, target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
     let repo_sub = b.repo_sub_path.trim().trim_matches('/').to_string();
     if repo_sub.is_empty() {
         return git_whole_repo(target, b);
     }
-    if safe_rel_path(&repo_sub).is_none() {
+    if crate::ingest::safe_rel_path(&repo_sub).is_none() {
         anyhow::bail!("VCS 绑定 repo_sub_path「{repo_sub}」不合法");
     }
     let workdir = git_cache_dir(kb, b);
-    let from = workdir.join(&repo_sub);
-    // 拉取前先记下上一轮同步过的文件 —— 拉取后据此把 git 端已删除的文件从 target 精确清掉,
-    // 只动本绑定自己同步过的文件,不会误删 target 里其它来源(用户上传 / 飞书 / 别的绑定)的内容。
-    let prev_files = if from.is_dir() {
-        list_repo_files(&from).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
     let revision = git_sparse_checkout(&workdir, b, &repo_sub)?;
+    let from = workdir.join(&repo_sub);
     if !from.is_dir() {
         anyhow::bail!("git 仓库里找不到子目录「{repo_sub}」(分支 / 路径填对了吗?)");
     }
-    // 把仓库子目录扁平镜像到 src 目标目录:补齐 / 覆盖文件,并清掉 git 端已删除的。
-    mirror_tree(&from, target, &prev_files)?;
+    // 严格镜像:仓库子目录 → src/vcs/<name>/,多余文件清掉
+    mirror_tree_strict(&from, target)?;
     Ok(revision)
 }
 
@@ -215,17 +204,17 @@ fn git_sparse_clone(url: &str, workdir: &Path, branch: &str, partial: bool) -> a
     Ok(())
 }
 
-/// 把 `from` 目录树镜像进 `to`:复制 / 覆盖所有文件,并按 `prev_files`(上一轮同步过的
-/// 相对路径)清掉 git 端已删除的文件。只动本绑定同步过的文件,`to` 里其它来源的内容
-/// 不受影响 —— 因此 `to` 可以是 src 根目录。
-fn mirror_tree(from: &Path, to: &Path, prev_files: &[String]) -> anyhow::Result<()> {
+/// 把 `from` 目录树严格镜像进 `to`:复制 / 覆盖所有文件,并删除 `to` 里
+/// 不存在于 `from` 的文件(及因此空掉的目录)。`to` 由本绑定独占,可以放心清。
+fn mirror_tree_strict(from: &Path, to: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(to)?;
     copy_tree(from, to, Path::new(""))?;
-    for rel in prev_files {
-        if from.join(rel).is_file() {
-            continue; // git 里还有这个文件 → 保留
+    // 清掉 to 里 from 没有的文件
+    for rel in list_repo_files(to)? {
+        if from.join(&rel).is_file() {
+            continue;
         }
-        let p = to.join(rel);
+        let p = to.join(&rel);
         let _ = fs::remove_file(&p);
         // 顺手清掉因此空掉的目录(向上回溯到 `to` 为止)
         let mut dir = p.parent();
@@ -242,6 +231,11 @@ fn mirror_tree(from: &Path, to: &Path, prev_files: &[String]) -> anyhow::Result<
 /// 递归把 `from` 下的文件复制进 `to`(覆盖同名);遇到类型冲突先清掉旧的。
 fn copy_tree(from: &Path, to: &Path, rel: &Path) -> anyhow::Result<()> {
     for e in fs::read_dir(from.join(rel))?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // VCS 元数据不进 src
+        if name == ".git" || name == ".svn" {
+            continue;
+        }
         let r = rel.join(e.file_name());
         let dst = to.join(&r);
         match e.file_type() {
@@ -267,10 +261,11 @@ fn copy_tree(from: &Path, to: &Path, rel: &Path) -> anyhow::Result<()> {
 }
 
 /// 整仓克隆 / 更新:工作副本(含 `.git`)就落在 target。
+/// 更新后跑 `git clean -fd` 清掉一切 untracked 内容 —— 严格镜像。
 fn git_whole_repo(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
     let url = git_url_with_creds(&b.url, &b.username, &b.password);
     if target.join(".git").exists() {
-        // 已有工作副本 → fetch + reset 到上游
+        // 已有工作副本 → fetch + reset 到上游 + clean
         let branch = if b.branch.trim().is_empty() {
             None
         } else {
@@ -287,9 +282,18 @@ fn git_whole_repo(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
             reset.arg("@{u}");
         }
         let _ = run_cmd(reset, "git reset --hard");
+        // 严格镜像:untracked 文件 / 目录全部清掉
+        let mut clean = Command::new("git");
+        clean.current_dir(target).args(["clean", "-fd"]);
+        let _ = run_cmd(clean, "git clean -fd");
     } else {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
+        }
+        // clone 要求目标目录不存在或为空;残留旧目录(非 git)时先清掉
+        if target.exists() && fs::read_dir(target).map(|mut d| d.next().is_some()).unwrap_or(false)
+        {
+            fs::remove_dir_all(target)?;
         }
         let mut clone = Command::new("git");
         clone.arg("clone").arg(&url).arg(target);
@@ -306,33 +310,33 @@ fn git_whole_repo(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
 
 fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
     if target.join(".svn").exists() {
-        let mut up = Command::new("svn");
-        up.current_dir(target)
-            .arg("update")
+        // 上次 checkout / update 中断会留下锁(E155004),先 cleanup 再 update。
+        // cleanup 自身失败不管,让 update 报真实错误。
+        let mut cleanup = Command::new("svn");
+        cleanup
+            .current_dir(target)
+            .arg("cleanup")
             .arg("--non-interactive");
-        if !b.username.is_empty() {
-            up.arg("--username").arg(&b.username);
+        let _ = run_cmd(cleanup, "svn cleanup");
+
+        if let Err(e) = svn_update(target, b) {
+            // 只有"工作副本损坏"类错误(E155xxx,如锁损坏、wc.db 坏)才清掉重建;
+            // 远端错误(E170000 URL 不存在、E175xxx 网络不通、认证失败等)直接报错,
+            // 保留本地镜像 —— 删了也下载不回来,反而丢数据。
+            let msg = e.to_string();
+            if msg.contains("E155") {
+                eprintln!("[ktree] svn 工作副本损坏({e}),清掉重新 checkout");
+                fs::remove_dir_all(target)?;
+                svn_checkout(target, b)?;
+            } else {
+                return Err(e);
+            }
+        } else {
+            // 严格镜像:清掉 unversioned 文件(svn status 第一列 '?')
+            svn_clean_unversioned(target);
         }
-        if !b.password.is_empty() {
-            up.arg("--password").arg(&b.password);
-        }
-        run_cmd(up, "svn update")?;
     } else {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut co = Command::new("svn");
-        co.arg("checkout")
-            .arg(&b.url)
-            .arg(target)
-            .arg("--non-interactive");
-        if !b.username.is_empty() {
-            co.arg("--username").arg(&b.username);
-        }
-        if !b.password.is_empty() {
-            co.arg("--password").arg(&b.password);
-        }
-        run_cmd(co, "svn checkout")?;
+        svn_checkout(target, b)?;
     }
     let mut info = Command::new("svn");
     info.current_dir(target)
@@ -342,7 +346,64 @@ fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<Strin
     Ok(run_cmd(info, "svn info revision")?.trim().to_string())
 }
 
-/// 递归列出 `base/` 下所有文件,过滤掉 VCS 元数据目录。
+fn svn_update(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
+    let mut up = Command::new("svn");
+    up.current_dir(target)
+        .arg("update")
+        .arg("--non-interactive");
+    if !b.username.is_empty() {
+        up.arg("--username").arg(&b.username);
+    }
+    if !b.password.is_empty() {
+        up.arg("--password").arg(&b.password);
+    }
+    run_cmd(up, "svn update")?;
+    Ok(())
+}
+
+fn svn_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut co = Command::new("svn");
+    co.arg("checkout")
+        .arg(&b.url)
+        .arg(target)
+        .arg("--non-interactive");
+    if !b.username.is_empty() {
+        co.arg("--username").arg(&b.username);
+    }
+    if !b.password.is_empty() {
+        co.arg("--password").arg(&b.password);
+    }
+    run_cmd(co, "svn checkout")?;
+    Ok(())
+}
+
+/// 删除 svn 工作副本里所有 unversioned 的文件 / 目录(`svn status` 的 '?' 行)。
+fn svn_clean_unversioned(target: &Path) {
+    let mut status = Command::new("svn");
+    status.current_dir(target).arg("status");
+    let Ok(out) = run_cmd(status, "svn status") else {
+        return;
+    };
+    for line in out.lines() {
+        if let Some(rel) = line.strip_prefix('?') {
+            let rel = rel.trim();
+            if rel.is_empty() {
+                continue;
+            }
+            let p = target.join(rel);
+            if p.is_dir() {
+                let _ = fs::remove_dir_all(&p);
+            } else {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+}
+
+/// 递归列出 `base/` 下所有文件,过滤掉 VCS 元数据目录与隐藏文件。
 /// 返回的路径是相对 `base` 的正斜杠形式。
 fn list_repo_files(base: &Path) -> anyhow::Result<Vec<String>> {
     fn walk(base: &Path, rel: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
@@ -377,7 +438,7 @@ fn list_repo_files(base: &Path) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
-/// 对一个绑定执行一次同步:拉取/更新 → diff store → 入库 / 删除。
+/// 对一个绑定执行一次同步:拉取/更新(严格镜像)→ diff store → 入库 / 删除。
 /// 阻塞调用,放在 spawn_blocking 里跑。
 pub fn sync_binding(
     state: &AppState,
@@ -389,7 +450,7 @@ pub fn sync_binding(
         .get(binding_idx)
         .ok_or_else(|| anyhow::anyhow!("VCS 绑定 idx={binding_idx} 不存在"))?
         .clone();
-    let (target, sub_norm) = binding_target_dir(kb, &b)?;
+    let (target, prefix) = binding_target_dir(kb, &b)?;
 
     let repo_sub = b.repo_sub_path.trim().trim_matches('/').to_string();
 
@@ -398,7 +459,7 @@ pub fn sync_binding(
         binding_idx,
         vcs_type: b.vcs_type.clone(),
         url: b.url.clone(),
-        sub_dir: sub_norm.clone(),
+        name: b.name.trim().to_string(),
         repo_sub_path: repo_sub.clone(),
         revision: String::new(),
         added: Vec::new(),
@@ -408,15 +469,15 @@ pub fn sync_binding(
         messages: Vec::new(),
     };
 
-    // 拉取前 store 里这个 sub 下所有 rel_path,作为"删除"检测的基线
+    // 拉取前 store 里这个绑定目录下所有 rel_path,作为"删除"检测的基线
     let before: HashSet<String> = state
         .store
-        .list_documents(&kb.id, if sub_norm.is_empty() { None } else { Some(&sub_norm) })?
+        .list_documents(&kb.id, Some(&prefix))?
         .into_iter()
         .map(|d| d.rel_path)
         .collect();
 
-    // 拉取 / 更新
+    // 拉取 / 更新(内部已做严格镜像,盘上只剩仓库里的文件)
     report.revision = match b.vcs_type.as_str() {
         "git" => git_sync(kb, &target, &b)?,
         "svn" => svn_update_or_checkout(&target, &b)?,
@@ -425,16 +486,7 @@ pub fn sync_binding(
 
     // 列出工作副本里所有文件 → 拼成相对 src/ 的路径
     let files = list_repo_files(&target)?;
-    let after: HashSet<String> = files
-        .iter()
-        .map(|r| {
-            if sub_norm.is_empty() {
-                r.clone()
-            } else {
-                format!("{sub_norm}/{r}")
-            }
-        })
-        .collect();
+    let after: HashSet<String> = files.iter().map(|r| format!("{prefix}/{r}")).collect();
 
     // ingest 每个文件;ingest_file 内的 md5 短路会区分新增/无变化
     for rel_path in &after {
@@ -461,11 +513,11 @@ pub fn sync_binding(
         }
     }
 
-    // 算 deleted:before - after,这些是 VCS 端被删掉的,清 store + 软链/资源
+    // 算 deleted:before - after,这些文件已不在仓库里,清 store + docs 产物
     let deleted: Vec<String> = before.difference(&after).cloned().collect();
     for rel_path in &deleted {
         if let Ok(Some(doc)) = state.store.get_by_path(&kb.id, rel_path) {
-            // delete_doc 会清 src(已被 VCS 删过 → 文件不存在也没事)、docs/、ref/、manifest、SQLite、tantivy
+            // delete_doc 会清 src(严格镜像已删过 → 文件不存在也没事)、docs/、manifest、SQLite、tantivy
             if let Err(e) = ingest::delete_doc(state, kb, &doc) {
                 report.failed.push(rel_path.clone());
                 report.messages.push(format!("清理失败「{rel_path}」: {e}"));
@@ -475,10 +527,28 @@ pub fn sync_binding(
         }
     }
 
+    // 严格镜像收尾:清掉 docs 区里 store 已不认识的孤儿文件/空目录(历史失步自愈)
+    let _ = ingest::prune_docs_orphans(state, kb, &prefix);
+
     // 刷新 .ktree 元数据
     let _ = ingest::refresh_kb_meta(state, kb);
 
     Ok(report)
+}
+
+/// 删除一条 VCS 绑定的本地内容:src/vcs/<name>/ 目录、docs 产物、store / 索引记录、
+/// git 稀疏缓存。供「删除绑定」的 HTTP / MCP 接口在删配置后调用。
+pub fn purge_binding_data(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    b: &VcsBinding,
+) -> anyhow::Result<usize> {
+    let (_, prefix) = binding_target_dir(kb, b)?;
+    let removed = ingest::delete_folder(state, kb, &prefix)?;
+    // 清掉稀疏检出缓存
+    let _ = fs::remove_dir_all(git_cache_dir(kb, b));
+    let _ = ingest::refresh_kb_meta(state, kb);
+    Ok(removed)
 }
 
 /// 调 `sync_binding`,无论成败都把结果记到 `state.last_vcs_sync`,供 webui 展示。
@@ -492,7 +562,12 @@ pub fn sync_binding_with_record(
     binding_idx: usize,
     source: &str,
 ) -> anyhow::Result<VcsSyncReport> {
+    // 并发保护:同一绑定同时只允许一个同步在跑(并发 git/svn 进程会互相打架、留锁)
+    if !state.try_begin_sync("vcs", &kb.id, binding_idx) {
+        anyhow::bail!("该绑定正在同步中,请等当前同步结束");
+    }
     let result = sync_binding(state, kb, binding_idx);
+    state.end_sync("vcs", &kb.id, binding_idx);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -521,13 +596,12 @@ pub fn sync_binding_with_record(
             error: Some(e.to_string()),
         },
     };
-    if let Ok(mut m) = state.last_vcs_sync.lock() {
-        m.insert((kb.id.clone(), binding_idx), entry);
-    }
+    // 写内存 map + 持久化到 SQLite(重启后 webui 仍能显示最近同步时间)
+    state.record_sync("vcs", &kb.id, binding_idx, entry);
     result
 }
 
-/// 同 `sync_kb_all`,但每条绑定都走 `sync_binding_with_record`。
+/// 同步一个 KB 下所有 VCS 绑定,每条绑定都走 `sync_binding_with_record`。
 pub fn sync_kb_all_with_record(
     state: &AppState,
     kb: &KnowledgeBase,

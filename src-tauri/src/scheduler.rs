@@ -8,16 +8,16 @@ use crate::vcs;
 /// 后台定时同步循环。每分钟 tick 一次,从 config snapshot 重新读最新设置 ——
 /// 改 config 不用重启应用就能生效。
 ///
-/// 触发条件:
-/// - 飞书逐个:每个知识库 `feishu.sync_interval_minutes > 0` 且凭证完整,且距上次同步 ≥ 该间隔。
-/// - VCS 绑定逐个:每条绑定的 `sync_interval_minutes > 0`,且距上次同步 ≥ 该间隔。
+/// 触发条件(均为逐条绑定):
+/// - 云文档绑定:`sync_interval_minutes > 0` 且凭证完整,且距上次同步 ≥ 该间隔。
+/// - VCS 绑定:`sync_interval_minutes > 0`,且距上次同步 ≥ 该间隔。
 ///
 /// 上次同步时间只活在进程内存,重启进程会从零计时,首轮在 interval 到期后才跑。
 pub async fn run(state: AppState) {
     println!("[ktree] 后台调度器启动(60s 粒度)");
 
     let start = Instant::now();
-    let mut last_feishu: HashMap<String, Instant> = HashMap::new();
+    let mut last_cloud: HashMap<(String, usize), Instant> = HashMap::new();
     let mut last_vcs: HashMap<(String, usize), Instant> = HashMap::new();
 
     let mut ticker = tokio::time::interval(Duration::from_secs(60));
@@ -28,34 +28,52 @@ pub async fn run(state: AppState) {
         let cfg = state.config.snapshot();
         let now = Instant::now();
 
-        // ---- 飞书:每个知识库按自己的间隔同步 ----
-        let mut feishu_due: Vec<crate::config::KnowledgeBase> = Vec::new();
+        // ---- 云文档绑定:逐条按自己的间隔同步 ----
+        let mut cloud_due: Vec<(crate::config::KnowledgeBase, usize)> = Vec::new();
         for kb in &cfg.knowledge_bases {
-            let mins = kb.feishu.sync_interval_minutes;
-            if mins == 0 || !kb.feishu.is_complete() {
-                continue;
-            }
-            let elapsed = match last_feishu.get(&kb.id) {
-                Some(t) => now.duration_since(*t),
-                None => now.duration_since(start),
-            };
-            if elapsed >= Duration::from_secs(mins * 60) {
-                feishu_due.push(kb.clone());
+            for (idx, b) in kb.cloud_bindings.iter().enumerate() {
+                if b.sync_interval_minutes == 0 || !b.is_complete() {
+                    continue;
+                }
+                let key = (kb.id.clone(), idx);
+                let elapsed = match last_cloud.get(&key) {
+                    Some(t) => now.duration_since(*t),
+                    None => now.duration_since(start),
+                };
+                if elapsed >= Duration::from_secs(b.sync_interval_minutes * 60) {
+                    cloud_due.push((kb.clone(), idx));
+                }
             }
         }
-        for kb in feishu_due {
+        for (kb, idx) in cloud_due {
             let st = state.clone();
-            let name = kb.name.clone();
-            let id = kb.id.clone();
-            match tokio::task::spawn_blocking(move || feishu::sync(&st, &kb, "sync")).await {
+            let kb_name = kb.name.clone();
+            let kb_id = kb.id.clone();
+            let binding_name = kb
+                .cloud_bindings
+                .get(idx)
+                .map(|b| b.name.clone())
+                .unwrap_or_default();
+            let result = tokio::task::spawn_blocking(move || {
+                feishu::sync_binding_with_record(&st, &kb, idx, "sync", "auto")
+            })
+            .await;
+            match result {
                 Ok(Ok(r)) => println!(
-                    "[ktree] 飞书定时同步「{name}」: 入库 {} 跳过 {} 删除 {} 失败 {}",
-                    r.ingested, r.skipped, r.deleted, r.failed
+                    "[ktree] 云文档定时同步「{kb_name}/{binding_name}」: \
+                     新增 {} 更新 {} 删除 {} 跳过 {} 失败 {}",
+                    r.added.len(),
+                    r.updated.len(),
+                    r.deleted.len(),
+                    r.skipped,
+                    r.failed.len()
                 ),
-                Ok(Err(e)) => eprintln!("[ktree] 飞书定时同步「{name}」失败: {e}"),
-                Err(e) => eprintln!("[ktree] 飞书定时同步任务异常: {e}"),
+                Ok(Err(e)) => {
+                    eprintln!("[ktree] 云文档定时同步「{kb_name}/{binding_name}」失败: {e}")
+                }
+                Err(e) => eprintln!("[ktree] 云文档定时同步任务异常: {e}"),
             }
-            last_feishu.insert(id, Instant::now());
+            last_cloud.insert((kb_id, idx), Instant::now());
         }
 
         // ---- 每个 VCS 绑定按自己的间隔同步 ----
@@ -89,8 +107,9 @@ pub async fn run(state: AppState) {
             .await;
             match result {
                 Ok(Ok(r)) => println!(
-                    "[ktree] VCS 定时同步「{kb_name}#{idx}」({url}): \
+                    "[ktree] VCS 定时同步「{kb_name}/{}」({url}): \
                      新增 {} 更新 {} 删除 {} 失败 {} @ {}",
+                    r.name,
                     r.added.len(),
                     r.updated.len(),
                     r.deleted.len(),

@@ -1,14 +1,18 @@
 // Ktree — 跨平台知识库服务
 //
-// 模块规划(随阶段推进逐步启用):
-//   config     配置:知识库根目录、HTTP 端口、飞书凭证、同步间隔
-//   store      SQLite 元数据:documents / categories
+// 知识库目录结构:src/(upload 上传区 + vcs 仓库镜像区 + cloud 云文档镜像区)
+//              + docs/(Markdown 阅读视图 + .assets 伴生资源)+ .ktree/(元数据)
+//
+// 模块规划:
+//   config     配置:知识库根目录、HTTP 端口、VCS / 云文档绑定
+//   store      SQLite 元数据:documents / notes / 向量
 //   convert    调 Node sidecar 把文档转 Markdown
 //   index      tantivy 全文索引:建索引 / BM25 搜索
 //   http       axum REST API,绑 0.0.0.0
-//   mcp        MCP server:stdio + HTTP/SSE transport
-//   feishu     飞书 OpenAPI 同步
-//   scheduler  tokio-cron 定时飞书同步
+//   mcp        MCP server:HTTP transport
+//   vcs        git / svn 仓库严格镜像同步(src/vcs/<绑定名>/)
+//   feishu     飞书云文档严格镜像同步(src/cloud/feishu/<绑定名>/)
+//   scheduler  定时同步循环(VCS + 云文档绑定)
 //   commands   Tauri invoke 命令(GUI 用)
 
 mod commands;
@@ -74,8 +78,13 @@ pub fn run() {
                 embedder: Arc::new(embed::Embedder::new()),
                 http_port: Arc::new(Mutex::new(None)),
                 last_vcs_sync: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                last_cloud_sync: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                syncing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             };
             app.manage(app_state.clone());
+
+            // 恢复历次同步状态(SQLite → 内存 map),webui 重启后仍能看到最近同步时间
+            app_state.restore_sync_states();
 
             // 启动时:清理孤儿 → 按 manifest 重建缓存 → 给存量文档补算语义向量
             let rebuild_state = app_state.clone();
@@ -202,7 +211,7 @@ pub fn run() {
             config::get_config,
             config::set_config,
             commands::get_service_info,
-            commands::trigger_feishu_sync,
+            commands::delete_binding,
             commands::get_local_ip,
         ])
         .run(tauri::generate_context!())

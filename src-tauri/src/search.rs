@@ -42,7 +42,17 @@ pub fn hybrid(
         *fused.entry(*doc_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
     }
 
+    // 内容惩罚:图片/视频等无正文的媒体文件只能靠文件名命中,融合分打 3 折 ——
+    // 避免一张恰好同名的 PNG 排在真正讨论该主题的文本文档前面(检索噪音)。
+    // 它们仍会出现在结果里(用户确实可能在找图),只是排序靠后。
     let mut ranked: Vec<(i64, f32)> = fused.into_iter().collect();
+    for (doc_id, score) in ranked.iter_mut() {
+        if let Ok(Some(doc)) = state.store.get_document(*doc_id) {
+            if doc.summary.trim().is_empty() && is_media_ext(&doc.ext) {
+                *score *= 0.3;
+            }
+        }
+    }
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     ranked.truncate(limit);
 
@@ -97,6 +107,17 @@ fn vector_search(
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// 图片 / 音视频 / 压缩包等不可能有可检索正文的扩展名。
+fn is_media_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico"
+            | "mp4" | "mov" | "webm" | "mkv" | "avi"
+            | "mp3" | "wav" | "flac" | "ogg" | "aac"
+            | "zip" | "rar" | "gz" | "tar" | "7z" | "bz2"
+    )
 }
 
 /// 仅被语义命中的文档,从 SQLite 补出标题 / 摘要 / 分类。

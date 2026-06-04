@@ -37,22 +37,43 @@ pub fn normalize_custom_domain(raw: &str) -> String {
     }
 }
 
-/// 设置界面触发某知识库的飞书全量同步。
+/// 删除一条绑定(VCS / 云文档)并清理本地镜像数据,返回清理的文档数。
+/// 设置窗口(Tauri WebView)走这个 invoke 通道,不绕 HTTP —— 避免本机 127.0.0.1
+/// 被其它进程占用(如安卓模拟器)时删除失败。`kind`:"vcs" | "cloud"。
 #[tauri::command]
-pub async fn trigger_feishu_sync(
+pub async fn delete_binding(
     state: State<'_, AppState>,
+    kind: String,
     kb_id: String,
-) -> Result<serde_json::Value, String> {
+    idx: usize,
+) -> Result<u64, String> {
     let st = state.inner().clone();
     let kb = st
         .config
         .get_kb(&kb_id)
         .ok_or_else(|| "知识库不存在".to_string())?;
-    let report = tokio::task::spawn_blocking(move || crate::feishu::sync(&st, &kb, "full"))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    serde_json::to_value(report).map_err(|e| e.to_string())
+    let purged = if kind == "cloud" {
+        let removed = st
+            .config
+            .remove_cloud_binding(&kb_id, idx)
+            .map_err(|e| e.to_string())?;
+        let _ = st.store.delete_sync_state("cloud", &kb_id, idx);
+        tokio::task::spawn_blocking(move || crate::feishu::purge_binding_data(&st, &kb, &removed))
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0)
+    } else {
+        let removed = st
+            .config
+            .remove_vcs_binding(&kb_id, idx)
+            .map_err(|e| e.to_string())?;
+        let _ = st.store.delete_sync_state("vcs", &kb_id, idx);
+        tokio::task::spawn_blocking(move || crate::vcs::purge_binding_data(&st, &kb, &removed))
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0)
+    };
+    Ok(purged as u64)
 }
 
 /// 取本机局域网 IPv4(供设置界面拼接 web 访问地址)。

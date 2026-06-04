@@ -19,7 +19,20 @@ const path = require('path');
 const SUMMARY_LEN = 200;
 
 function summarize(md) {
-  const text = md
+  // 逐行清洗:跳过目录引导点行、页码行、表格分隔行,取真正的正文做摘要。
+  const body = md
+    .split('\n')
+    .filter((line) => {
+      const t = line.trim();
+      if (!t) return false;
+      if (/\.{3,}/.test(t) || /……\s*\d+\s*$/.test(t)) return false; // 目录引导点 / 目录项
+      if (/^[-–—\s|]*\d{0,4}[-–—\s|:]*$/.test(t)) return false; // 页码 / 表格分隔
+      if (/^#{1,6}\s/.test(t)) return false; // 标题行不进摘要
+      if (t === '目录' || t === '前言') return false; // 目录/前言标题词
+      return true;
+    })
+    .join(' ');
+  const text = body
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
     .replace(/[#>*_`|\-]/g, ' ')
@@ -82,11 +95,59 @@ function convertXlsx(input) {
   return parts.join('\n');
 }
 
+// 清洗 pdf-parse 的朴素文本流:去目录引导点、页眉页脚页码、合并被排版硬断的中文行。
+// pdf-parse 不做版面分析,表格会被打散成单列 —— 那个无法在纯文本层还原,这里只做可读性清洗。
+function cleanPdfText(raw) {
+  const lines = raw.split('\n');
+  const out = [];
+  for (let line of lines) {
+    let s = line.replace(/ /g, ' ').replace(/[ \t]+$/g, '');
+    const t = s.trim();
+
+    // 纯页码行:"- 1 -" / "1" / "第 1 页" 之类,删掉
+    if (/^[-–—\s]*\d{1,4}[-–—\s]*$/.test(t)) continue;
+    if (/^第?\s*\d{1,4}\s*页?(\s*\/\s*共?\s*\d{1,4}\s*页?)?$/.test(t)) continue;
+
+    // 目录引导点:"标题 ......... - 6 -" → "标题 …… 6"(把一长串点 + 尾部页码压扁)
+    if (/\.{3,}/.test(s)) {
+      s = s.replace(/\s*\.{3,}\s*-?\s*(\d+)?\s*-?\s*$/, (m, p) => (p ? `  …… ${p}` : ''));
+      s = s.replace(/\.{3,}/g, ' ');
+    }
+
+    out.push(s);
+  }
+
+  // 合并被 PDF 排版硬断的中文段落:上一行以中文/逗号结尾(非句末标点)、
+  // 当前行以中文开头 → 接到上一行(中文不加空格)。空行作为段落边界保留。
+  const merged = [];
+  for (let i = 0; i < out.length; i++) {
+    const cur = out[i];
+    const prev = merged.length ? merged[merged.length - 1] : '';
+    const prevTrim = prev.trim();
+    const curTrim = cur.trim();
+    // 只合并"接近满行"被硬断的长行(≥14 字),避免把"目录""前言"这类独立短标题误接;
+    // 目录项行(…… 页码)也不参与合并。
+    const endsMidSentence =
+      prevTrim.length >= 14 &&
+      /[一-龥，、]$/.test(prevTrim) &&
+      !/[。！？.!?:：；…]$/.test(prevTrim) &&
+      !/……\s*\d+$/.test(prevTrim);
+    const startsCjk = /^[一-龥]/.test(curTrim) && !/……\s*\d+$/.test(curTrim);
+    if (merged.length && curTrim && endsMidSentence && startsCjk) {
+      merged[merged.length - 1] = prevTrim + curTrim;
+    } else {
+      merged.push(cur);
+    }
+  }
+
+  return merged.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 async function convertPdf(input) {
   const pdfParse = require('pdf-parse');
   const buf = fs.readFileSync(input);
   const data = await pdfParse(buf);
-  return (data.text || '').replace(/\n{3,}/g, '\n\n').trim();
+  return cleanPdfText(data.text || '');
 }
 
 function convertHtml(input) {
@@ -135,6 +196,13 @@ function readStdin() {
 }
 
 (async () => {
+  // 第三方库(pdf-parse 内置的 pdf.js 等)会用 console.log 往 stdout 打警告
+  // (如 "Warning: TT: undefined function"),混进 JSON 输出会导致 Rust 端解析失败。
+  // 把 stdout 写入劫持到 stderr,只有最后的结果 JSON 用原始 write 输出。
+  const rawStdoutWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (...args) => process.stderr.write(...args);
+  console.log = (...args) => console.error(...args);
+
   let out;
   try {
     const raw = await readStdin();
@@ -156,5 +224,6 @@ function readStdin() {
   } catch (err) {
     out = { ok: false, error: String((err && err.message) || err) };
   }
-  process.stdout.write(JSON.stringify(out));
+  // 结果 JSON 换行后输出(用未被劫持的原始 write),Rust 端取最后一行非空内容解析
+  rawStdoutWrite('\n' + JSON.stringify(out));
 })();

@@ -9,40 +9,47 @@ use std::net::SocketAddr;
 
 use axum::{
     extract::{ConnectInfo, State as AxState},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::{json, Value};
 
-use crate::config::{FeishuConfig, VcsBinding};
+use crate::config::{CloudBinding, VcsBinding};
 use crate::ingest;
 use crate::state::AppState;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// GET /mcp —— 不提供 server→client 主动推送的 SSE 通道。
-pub async fn handle_get() -> Response {
-    (
-        StatusCode::METHOD_NOT_ALLOWED,
-        "Ktree MCP over HTTP:请用 POST 发送 JSON-RPC",
-    )
-        .into_response()
-}
-
 /// POST /mcp —— 接收单条或批量 JSON-RPC 消息。
+/// (不提供 GET/SSE 通道;GET 请求由 axum 自动返回 405 + Allow: POST)
 pub async fn handle(
     AxState(state): AxState<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     // 改配置类写工具仅限本机调用 —— is_local 一路传到 call_tool。
     let is_local = addr.ip().is_loopback();
+    // 知识库资源(图片等)的访问基地址:优先自定义域名,否则用请求的 Host 头。
+    // kb_get_doc 用它把 md 里的相对图片路径改写成完整 URL。
+    let base_url = {
+        let cd = crate::commands::normalize_custom_domain(&state.config.snapshot().custom_domain);
+        if !cd.is_empty() {
+            cd
+        } else {
+            headers
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .map(|h| format!("http://{h}"))
+                .unwrap_or_default()
+        }
+    };
     match body {
         Value::Array(items) => {
             let mut responses = Vec::new();
             for item in items {
-                if let Some(resp) = handle_one(&state, item, is_local).await {
+                if let Some(resp) = handle_one(&state, item, is_local, &base_url).await {
                     responses.push(resp);
                 }
             }
@@ -52,7 +59,7 @@ pub async fn handle(
                 Json(Value::Array(responses)).into_response()
             }
         }
-        obj => match handle_one(&state, obj, is_local).await {
+        obj => match handle_one(&state, obj, is_local, &base_url).await {
             Some(resp) => Json(resp).into_response(),
             None => StatusCode::ACCEPTED.into_response(),
         },
@@ -60,7 +67,7 @@ pub async fn handle(
 }
 
 /// 处理单条 JSON-RPC 消息。notification(无 id)返回 None。
-async fn handle_one(state: &AppState, msg: Value, is_local: bool) -> Option<Value> {
+async fn handle_one(state: &AppState, msg: Value, is_local: bool, base_url: &str) -> Option<Value> {
     let id = msg.get("id").cloned()?;
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -73,7 +80,7 @@ async fn handle_one(state: &AppState, msg: Value, is_local: bool) -> Option<Valu
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-        "tools/call" => call_tool(state, &params, is_local).await,
+        "tools/call" => call_tool(state, &params, is_local, base_url).await,
         other => Err((-32601, format!("未知方法: {other}"))),
     };
 
@@ -90,7 +97,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "kb_list",
-            "description": "列出所有知识库及其 id、名称、文档数。其它工具的 kb 参数用这里的 id。",
+            "description": "列出所有知识库及其 id、名称、文档数。其它工具的 kb 参数用这里的 id。\n知识库源文件按来源分区,文档的 rel_path 都带区前缀:\n- upload/…       用户上传区,可通过 kb_upload 写入\n- vcs/<绑定名>/…  git/svn 仓库的只读镜像,内容由同步维护,要修改请提交到仓库",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -117,26 +124,26 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "kb_list_docs",
-            "description": "列出某个知识库的文档,可选按目录前缀过滤。",
+            "description": "列出某个知识库的文档,可选按目录前缀过滤。\n注意:path 是文档 rel_path 的前缀(相对 src/,带区前缀),不要加 \"src/\" 或 \"docs/\"。\n示例:path=\"upload\" 列上传区全部;path=\"vcs/svn/版号申请版本\" 列仓库镜像区该目录下全部。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kb": { "type": "string", "description": "知识库 id" },
-                    "path": { "type": "string", "description": "可选,限定 src 下的目录前缀" }
+                    "path": { "type": "string", "description": "可选,目录前缀。如 \"upload\" 或 \"vcs/svn/版号申请版本\";不要带 src/ 或 docs/ 前缀" }
                 },
                 "required": ["kb"]
             }
         },
         {
             "name": "kb_upload",
-            "description": "把一段文本写入某知识库的 src/<path>/<filename>,并建立索引。",
+            "description": "把一段文本写入某知识库上传区 src/upload/<path>/<filename>,并建立索引。\n只有上传区(upload/)可写;仓库镜像区(vcs/<绑定名>/)只读 —— 那些内容由 git/svn 同步维护,要修改请到仓库里提交,下次同步自动更新。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kb": { "type": "string", "description": "知识库 id" },
                     "filename": { "type": "string", "description": "文件名,如 笔记.md" },
                     "content": { "type": "string", "description": "文本内容" },
-                    "path": { "type": "string", "description": "可选,src 下的目标目录" },
+                    "path": { "type": "string", "description": "可选,上传区内的目标子目录。如 \"会议纪要\" → 写入 upload/会议纪要/<filename>" },
                     "convert": { "type": "boolean", "description": "是否转 Markdown 并写入 docs/,默认 true" }
                 },
                 "required": ["kb", "filename", "content"]
@@ -144,7 +151,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "kb_get_config",
-            "description": "查看知识库配置:根目录、飞书同步设置、VCS 绑定列表(密钥已脱敏)。改配置前先用它查 VCS 绑定下标 idx。",
+            "description": "查看知识库配置:根目录、VCS(git/svn)绑定列表(密钥已脱敏)。改配置前先用它查绑定下标 idx。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -164,62 +171,47 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "kb_set_feishu",
-            "description": "配置某知识库的飞书同步(整体覆盖)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "kb": { "type": "string", "description": "知识库 id" },
-                    "app_id": { "type": "string", "description": "飞书应用 App ID" },
-                    "app_secret": { "type": "string", "description": "飞书应用 App Secret" },
-                    "folder_token": { "type": "string", "description": "飞书共享文件夹 token" },
-                    "sync_interval_minutes": { "type": "integer", "description": "自动同步间隔(分钟),0=不自动" }
-                },
-                "required": ["kb"]
-            }
-        },
-        {
             "name": "kb_add_vcs",
-            "description": "给某知识库新增一条 VCS(git / svn)同步绑定,返回绑定下标 idx。",
+            "description": "给某知识库新增一条 VCS(git / svn)同步绑定:仓库内容严格镜像到 src/vcs/<name>/(只读目录)。返回绑定下标 idx。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kb": { "type": "string", "description": "知识库 id" },
+                    "name": { "type": "string", "description": "绑定名 = src/vcs/ 下的目录名,库内唯一,创建后不可改" },
                     "vcs_type": { "type": "string", "description": "git 或 svn" },
                     "url": { "type": "string", "description": "仓库 URL" },
-                    "sub_dir": { "type": "string", "description": "可选,同步到 src 下的子目录;空=src 根" },
                     "repo_sub_path": { "type": "string", "description": "可选,仅 git:只稀疏检出仓库内的这个子目录" },
                     "branch": { "type": "string", "description": "可选,仅 git:分支" },
                     "username": { "type": "string", "description": "可选,凭证用户名;留空走系统凭证" },
                     "password": { "type": "string", "description": "可选,凭证密码 / token" },
                     "sync_interval_minutes": { "type": "integer", "description": "自动同步间隔(分钟),0=不自动" }
                 },
-                "required": ["kb", "vcs_type", "url"]
+                "required": ["kb", "name", "vcs_type", "url"]
             }
         },
         {
             "name": "kb_update_vcs",
-            "description": "覆盖某知识库第 idx 条 VCS 绑定(整体替换,字段同 kb_add_vcs)。idx 用 kb_get_config 查。",
+            "description": "覆盖某知识库第 idx 条 VCS 绑定(整体替换,字段同 kb_add_vcs;name 不可改)。idx 用 kb_get_config 查。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kb": { "type": "string", "description": "知识库 id" },
                     "idx": { "type": "integer", "description": "VCS 绑定下标" },
+                    "name": { "type": "string", "description": "绑定名(必须与原值一致,不可改)" },
                     "vcs_type": { "type": "string", "description": "git 或 svn" },
                     "url": { "type": "string", "description": "仓库 URL" },
-                    "sub_dir": { "type": "string" },
                     "repo_sub_path": { "type": "string" },
                     "branch": { "type": "string" },
                     "username": { "type": "string" },
                     "password": { "type": "string" },
                     "sync_interval_minutes": { "type": "integer" }
                 },
-                "required": ["kb", "idx", "vcs_type", "url"]
+                "required": ["kb", "idx", "name", "vcs_type", "url"]
             }
         },
         {
             "name": "kb_remove_vcs",
-            "description": "删除某知识库第 idx 条 VCS 绑定(只是不再同步,不影响已入库内容)。",
+            "description": "删除某知识库第 idx 条 VCS 绑定,并清掉 src/vcs/<name>/ 目录与已入库内容(镜像可重拉)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -229,6 +221,9 @@ fn tool_definitions() -> Value {
                 "required": ["kb", "idx"]
             }
         },
+        // 云文档(飞书)绑定的 kb_add_cloud / kb_update_cloud / kb_remove_cloud 工具已封存:
+        // 后端 API 与同步链路保留,但不再对 MCP 客户端公开 —— 内网部署暂无云文档需求,
+        // 以后需要时把工具定义加回来即可(分发逻辑 call_tool 里仍保留)。
         {
             "name": "kb_list_notes",
             "description": "列出公共记事板的全部记事(标题、类型、内容 / 链接)。记事板是知识库的共享便签区,所有人可见。",
@@ -252,12 +247,14 @@ fn tool_definitions() -> Value {
 }
 
 /// 改配置类写工具 —— 仅允许本机调用。
-const WRITE_TOOLS: [&str; 5] = [
+const WRITE_TOOLS: [&str; 7] = [
     "kb_create",
-    "kb_set_feishu",
     "kb_add_vcs",
     "kb_update_vcs",
     "kb_remove_vcs",
+    "kb_add_cloud",
+    "kb_update_cloud",
+    "kb_remove_cloud",
 ];
 
 /// 分发 tools/call。工具执行错误按 MCP 约定返回 result{isError:true}。
@@ -265,6 +262,7 @@ async fn call_tool(
     state: &AppState,
     params: &Value,
     is_local: bool,
+    base_url: &str,
 ) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
@@ -283,15 +281,17 @@ async fn call_tool(
     let outcome = match name {
         "kb_list" => tool_list(state).await,
         "kb_search" => tool_search(state, &args).await,
-        "kb_get_doc" => tool_get_doc(state, &args).await,
+        "kb_get_doc" => tool_get_doc(state, &args, base_url).await,
         "kb_list_docs" => tool_list_docs(state, &args).await,
         "kb_upload" => tool_upload(state, &args).await,
         "kb_get_config" => tool_get_config(state, &args).await,
         "kb_create" => tool_create_kb(state, &args).await,
-        "kb_set_feishu" => tool_set_feishu(state, &args).await,
         "kb_add_vcs" => tool_add_vcs(state, &args).await,
         "kb_update_vcs" => tool_update_vcs(state, &args).await,
         "kb_remove_vcs" => tool_remove_vcs(state, &args).await,
+        "kb_add_cloud" => tool_add_cloud(state, &args).await,
+        "kb_update_cloud" => tool_update_cloud(state, &args).await,
+        "kb_remove_cloud" => tool_remove_cloud(state, &args).await,
         "kb_list_notes" => tool_list_notes(state).await,
         "kb_add_note" => tool_add_note(state, &args).await,
         other => return Err((-32602, format!("未知工具: {other}"))),
@@ -367,7 +367,7 @@ async fn tool_search(state: &AppState, args: &Value) -> anyhow::Result<String> {
     Ok(out)
 }
 
-async fn tool_get_doc(state: &AppState, args: &Value) -> anyhow::Result<String> {
+async fn tool_get_doc(state: &AppState, args: &Value, base_url: &str) -> anyhow::Result<String> {
     let id = args
         .get("id")
         .and_then(|v| v.as_i64())
@@ -381,7 +381,7 @@ async fn tool_get_doc(state: &AppState, args: &Value) -> anyhow::Result<String> 
         .get_kb(&doc.kb_id)
         .ok_or_else(|| anyhow::anyhow!("文档所属知识库不存在"))?;
 
-    let content = if let Some(md) = &doc.md_path {
+    let mut content = if let Some(md) = &doc.md_path {
         tokio::fs::read_to_string(kb.root.join(md))
             .await
             .unwrap_or_default()
@@ -390,6 +390,43 @@ async fn tool_get_doc(state: &AppState, args: &Value) -> anyhow::Result<String> 
             .await
             .unwrap_or_else(|_| "(该文档无可读文本,请用 REST GET /api/doc/{id}/raw 下载原件)".to_string())
     };
+
+    // 把 md 里的相对 .assets 资源引用改写成完整 URL,MCP 客户端才能直接显示图片。
+    // 转换产物的引用形如 "<文件名去后缀>.assets/img_001.png"(与 md 同目录),
+    // 对应直链 <base>/<kb>/docs/<父目录>/<同名>.assets/img_001.png。
+    if !base_url.is_empty() {
+        let stem = std::path::Path::new(&doc.rel_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if !stem.is_empty() {
+            let parent = std::path::Path::new(&doc.rel_path)
+                .parent()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let url_dir = if parent.is_empty() {
+                format!("{base_url}/{}/docs", kb.id)
+            } else {
+                format!("{base_url}/{}/docs/{parent}", kb.id)
+            };
+            let assets_name = format!("{stem}.assets/");
+            // markdown 引用 ![](xxx.assets/…) / [附件](xxx.assets/…)
+            content = content.replace(
+                &format!("]({assets_name}"),
+                &format!("]({url_dir}/{assets_name}"),
+            );
+            // HTML 引用 <img src="xxx.assets/…"> / <video src=…> / <a href=…>
+            content = content
+                .replace(
+                    &format!("src=\"{assets_name}"),
+                    &format!("src=\"{url_dir}/{assets_name}"),
+                )
+                .replace(
+                    &format!("href=\"{assets_name}"),
+                    &format!("href=\"{url_dir}/{assets_name}"),
+                );
+        }
+    }
 
     Ok(format!(
         "# {}\n\n> 知识库: {} | 路径: {} | 类型: .{}\n\n{}",
@@ -434,20 +471,30 @@ async fn tool_upload(state: &AppState, args: &Value) -> anyhow::Result<String> {
         .get("content")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("缺少 content"))?;
+    // path 是上传区内的子目录(相对 src/upload/);兼容直接传 "upload/xxx" 的写法
     let dir = match args.get("path").and_then(|v| v.as_str()) {
-        None | Some("") => String::new(),
-        Some(p) => ingest::safe_rel_path(p).ok_or_else(|| anyhow::anyhow!("非法 path"))?,
+        None | Some("") => crate::config::AREA_UPLOAD.to_string(),
+        Some(p) => {
+            let rp = ingest::safe_rel_path(p).ok_or_else(|| anyhow::anyhow!("非法 path"))?;
+            let full = if rp == crate::config::AREA_UPLOAD
+                || rp.starts_with(&format!("{}/", crate::config::AREA_UPLOAD))
+            {
+                rp
+            } else {
+                format!("{}/{rp}", crate::config::AREA_UPLOAD)
+            };
+            full
+        }
     };
+    if filename.ends_with(".assets") {
+        anyhow::bail!("文件名不能以 .assets 结尾(系统保留后缀)");
+    }
     let convert_md = args
         .get("convert")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let rel_path = if dir.is_empty() {
-        filename.clone()
-    } else {
-        format!("{dir}/{filename}")
-    };
+    let rel_path = format!("{dir}/{filename}");
     let abs = kb.root.join("src").join(&rel_path);
     if let Some(parent) = abs.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -500,18 +547,6 @@ async fn tool_get_config(state: &AppState, args: &Value) -> anyhow::Result<Strin
         }
         out.push_str(&format!("知识库「{}」(id={})\n", kb.name, kb.id));
         out.push_str(&format!("  根目录: {}\n", kb.root.display()));
-        let fs = &kb.feishu;
-        if fs.app_id.is_empty() && fs.app_secret.is_empty() && fs.folder_token.is_empty() {
-            out.push_str("  飞书: 未配置\n");
-        } else {
-            out.push_str(&format!(
-                "  飞书: app_id={} / app_secret={} / folder_token={} / 间隔 {} 分钟\n",
-                if fs.app_id.is_empty() { "(空)" } else { &fs.app_id },
-                if fs.app_secret.is_empty() { "(空)" } else { "已设置" },
-                if fs.folder_token.is_empty() { "(空)" } else { &fs.folder_token },
-                fs.sync_interval_minutes
-            ));
-        }
         if kb.vcs_bindings.is_empty() {
             out.push_str("  VCS 绑定: 无\n");
         } else {
@@ -521,14 +556,7 @@ async fn tool_get_config(state: &AppState, args: &Value) -> anyhow::Result<Strin
                 if !b.repo_sub_path.is_empty() {
                     line.push_str(&format!(" 仓库子目录={}", b.repo_sub_path));
                 }
-                line.push_str(&format!(
-                    " → src{}",
-                    if b.sub_dir.is_empty() {
-                        String::new()
-                    } else {
-                        format!("/{}", b.sub_dir)
-                    }
-                ));
+                line.push_str(&format!(" → src/vcs/{}", b.name));
                 if !b.branch.is_empty() {
                     line.push_str(&format!(" 分支={}", b.branch));
                 }
@@ -543,6 +571,23 @@ async fn tool_get_config(state: &AppState, args: &Value) -> anyhow::Result<Strin
                 ));
                 out.push_str(&line);
                 out.push('\n');
+            }
+        }
+        // 云文档功能已封存:有历史绑定才显示,没有就不提
+        if !kb.cloud_bindings.is_empty() {
+            out.push_str("  云文档绑定:\n");
+            for (i, b) in kb.cloud_bindings.iter().enumerate() {
+                out.push_str(&format!(
+                    "    [{}] {} {}({}) → src/cloud/{}/{} app_id={} 间隔={}分钟\n",
+                    i,
+                    b.provider,
+                    if b.target_type == "doc" { "单篇文档" } else { "文件夹" },
+                    b.target_token,
+                    b.provider,
+                    b.name,
+                    if b.app_id.is_empty() { "(空)" } else { &b.app_id },
+                    b.sync_interval_minutes
+                ));
             }
         }
         out.push('\n');
@@ -570,18 +615,14 @@ async fn tool_create_kb(state: &AppState, args: &Value) -> anyhow::Result<String
     ))
 }
 
-async fn tool_set_feishu(state: &AppState, args: &Value) -> anyhow::Result<String> {
-    let kb_id = arg_kb_id(args)?;
-    let feishu: FeishuConfig = serde_json::from_value(args.clone())?;
-    state.config.set_feishu(&kb_id, feishu)?;
-    Ok(format!("已更新知识库「{kb_id}」的飞书配置"))
-}
-
 async fn tool_add_vcs(state: &AppState, args: &Value) -> anyhow::Result<String> {
     let kb_id = arg_kb_id(args)?;
     let binding: VcsBinding = serde_json::from_value(args.clone())?;
+    let name = binding.name.clone();
     let idx = state.config.add_vcs_binding(&kb_id, binding)?;
-    Ok(format!("已为知识库「{kb_id}」新增 VCS 绑定,下标 idx={idx}"))
+    Ok(format!(
+        "已为知识库「{kb_id}」新增 VCS 绑定「{name}」(idx={idx}),内容将镜像到 src/vcs/{name}/"
+    ))
 }
 
 async fn tool_update_vcs(state: &AppState, args: &Value) -> anyhow::Result<String> {
@@ -595,8 +636,59 @@ async fn tool_update_vcs(state: &AppState, args: &Value) -> anyhow::Result<Strin
 async fn tool_remove_vcs(state: &AppState, args: &Value) -> anyhow::Result<String> {
     let kb_id = arg_kb_id(args)?;
     let idx = arg_idx(args)?;
-    state.config.remove_vcs_binding(&kb_id, idx)?;
-    Ok(format!("已删除知识库「{kb_id}」第 {idx} 条 VCS 绑定"))
+    let kb = state
+        .config
+        .get_kb(&kb_id)
+        .ok_or_else(|| anyhow::anyhow!("知识库「{kb_id}」不存在"))?;
+    let removed = state.config.remove_vcs_binding(&kb_id, idx)?;
+    // 清掉本地镜像目录与已入库内容
+    let st = state.clone();
+    let purged = tokio::task::spawn_blocking(move || {
+        crate::vcs::purge_binding_data(&st, &kb, &removed)
+    })
+    .await?
+    .unwrap_or(0);
+    Ok(format!(
+        "已删除知识库「{kb_id}」第 {idx} 条 VCS 绑定,并清理本地镜像内容 {purged} 篇"
+    ))
+}
+
+async fn tool_add_cloud(state: &AppState, args: &Value) -> anyhow::Result<String> {
+    let kb_id = arg_kb_id(args)?;
+    let binding: CloudBinding = serde_json::from_value(args.clone())?;
+    let name = binding.name.clone();
+    let provider = binding.provider.clone();
+    let idx = state.config.add_cloud_binding(&kb_id, binding)?;
+    Ok(format!(
+        "已为知识库「{kb_id}」新增云文档绑定「{name}」(idx={idx}),内容将镜像到 src/cloud/{provider}/{name}/"
+    ))
+}
+
+async fn tool_update_cloud(state: &AppState, args: &Value) -> anyhow::Result<String> {
+    let kb_id = arg_kb_id(args)?;
+    let idx = arg_idx(args)?;
+    let binding: CloudBinding = serde_json::from_value(args.clone())?;
+    state.config.update_cloud_binding(&kb_id, idx, binding)?;
+    Ok(format!("已更新知识库「{kb_id}」第 {idx} 条云文档绑定"))
+}
+
+async fn tool_remove_cloud(state: &AppState, args: &Value) -> anyhow::Result<String> {
+    let kb_id = arg_kb_id(args)?;
+    let idx = arg_idx(args)?;
+    let kb = state
+        .config
+        .get_kb(&kb_id)
+        .ok_or_else(|| anyhow::anyhow!("知识库「{kb_id}」不存在"))?;
+    let removed = state.config.remove_cloud_binding(&kb_id, idx)?;
+    let st = state.clone();
+    let purged = tokio::task::spawn_blocking(move || {
+        crate::feishu::purge_binding_data(&st, &kb, &removed)
+    })
+    .await?
+    .unwrap_or(0);
+    Ok(format!(
+        "已删除知识库「{kb_id}」第 {idx} 条云文档绑定,并清理本地镜像内容 {purged} 篇"
+    ))
 }
 
 // ---- 记事板:公共记事 ----
