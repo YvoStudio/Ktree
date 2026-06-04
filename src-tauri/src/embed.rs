@@ -5,7 +5,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::Mutex;
 
 use serde::Deserialize;
@@ -76,7 +76,8 @@ impl Embedder {
 
     fn spawn() -> anyhow::Result<EmbedProc> {
         let (program, args) = Self::sidecar_command();
-        let mut child = Command::new(&program)
+        let mut cmd = crate::convert::sidecar_process(&program);
+        let mut child = cmd
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

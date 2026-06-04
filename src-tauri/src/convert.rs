@@ -4,6 +4,12 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 #[derive(Serialize)]
 struct ConvertRequest<'a> {
     input: &'a str,
@@ -55,6 +61,19 @@ fn sidecar_command() -> (String, Vec<String>) {
     }
 }
 
+pub(crate) fn sidecar_process(program: &str) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new(program);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new(program)
+    }
+}
+
 /// 把任意支持的文档转成 Markdown。失败(spawn 失败、非零退出)返回 Err;
 /// 文档本身无法转换(格式不支持等)返回 Ok(ConvertResult{ ok:false }).
 /// `ref_dir` 是图片等资源的输出目录,`ref_prefix` 是 md 中引用资源的相对路径前缀。
@@ -78,7 +97,8 @@ pub fn convert_file(
     })?;
 
     let (program, args) = sidecar_command();
-    let mut child = Command::new(&program)
+    let mut cmd = sidecar_process(&program);
+    let mut child = cmd
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

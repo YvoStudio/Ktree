@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 
@@ -140,7 +140,8 @@ pub fn sync_binding(
     })?;
 
     let (program, args) = sidecar_command();
-    let mut child = Command::new(&program)
+    let mut cmd = crate::convert::sidecar_process(&program);
+    let mut child = cmd
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -1,6 +1,6 @@
 [package]
 name = "ktree"
-version = "0.1.10"
+version = "0.1.11"
 description = "Ktree knowledge base server"
 authors = ["YvoStudio"]
 edition = "2021"
