@@ -347,7 +347,11 @@ fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<Strin
             svn_clean_unversioned(target);
         }
     } else if svn_export_marker(target).exists() {
-        svn_export_without_workcopy(target, b)?;
+        let remote_revision = svn_remote_revision(b)?;
+        if svn_export_marker_revision(target).as_deref() != Some(remote_revision.as_str()) {
+            svn_export_without_workcopy(target, b)?;
+        }
+        return Ok(remote_revision);
     } else {
         svn_checkout_or_export(target, b)?;
     }
@@ -395,7 +399,7 @@ fn svn_checkout_or_export(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
                 return Err(e);
             }
             eprintln!("[ktree] svn checkout 遇到 Windows 非法路径({e}),改用无工作副本导出");
-            svn_export_without_workcopy(target, b)
+            svn_export_without_workcopy(target, b).map(|_| ())
         }
     }
 }
@@ -415,6 +419,16 @@ fn svn_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
 
 fn svn_export_marker(target: &Path) -> PathBuf {
     target.join(".ktree-svn-export-fallback")
+}
+
+fn svn_export_marker_revision(target: &Path) -> Option<String> {
+    let marker = fs::read_to_string(svn_export_marker(target)).ok()?;
+    marker
+        .lines()
+        .find_map(|line| line.strip_prefix("Revision:"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
 }
 
 fn svn_remote_revision(b: &VcsBinding) -> anyhow::Result<String> {
@@ -555,7 +569,8 @@ fn svn_export_rel_path(rel: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-fn svn_export_without_workcopy(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
+fn svn_export_without_workcopy(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
+    let revision = svn_remote_revision(b)?;
     let _ = fs::remove_dir_all(target);
     fs::create_dir_all(target)?;
     let mut skipped = Vec::new();
@@ -579,14 +594,14 @@ fn svn_export_without_workcopy(target: &Path, b: &VcsBinding) -> anyhow::Result<
         fs::write(dst, svn_cat(b, &rel)?)?;
     }
     let marker = format!(
-        "SVN working copy fallback export. Skipped Windows-invalid paths:\n{}\n",
+        "SVN working copy fallback export.\nRevision: {revision}\nSkipped Windows-invalid paths:\n{}\n",
         skipped.join("\n")
     );
     fs::write(svn_export_marker(target), marker)?;
     if !skipped.is_empty() {
         eprintln!("[ktree] svn 跳过 Windows 非法路径: {}", skipped.join(", "));
     }
-    Ok(())
+    Ok(revision)
 }
 
 /// 删除 svn 工作副本里所有 unversioned 的文件 / 目录(`svn status` 的 '?' 行)。
