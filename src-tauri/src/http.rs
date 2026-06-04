@@ -107,6 +107,26 @@ fn is_mirror_area_path(rel: &str) -> bool {
     )
 }
 
+fn docs_mirror_source_abs(kb: &KnowledgeBase, rel: &str) -> Option<PathBuf> {
+    let src_rel = rel.strip_prefix("docs/")?;
+    let src_abs = kb.root.join("src").join(src_rel);
+    src_abs.is_file().then_some(src_abs)
+}
+
+fn file_metadata_with_docs_fallback(
+    kb: &KnowledgeBase,
+    rel: &str,
+    path: &Path,
+) -> Option<std::fs::Metadata> {
+    let meta = std::fs::metadata(path).ok();
+    let src_meta = docs_mirror_source_abs(kb, rel).and_then(|p| std::fs::metadata(p).ok());
+    match (meta, src_meta) {
+        (None, Some(sm)) => Some(sm),
+        (Some(m), Some(sm)) if m.len() == 0 && sm.len() > 0 => Some(sm),
+        (m, _) => m,
+    }
+}
+
 /// 目录(递归)下是否有可见文件(跳过 .git/.svn/隐藏/.assets)。用于判断镜像区空目录。
 fn dir_has_visible_file(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -701,9 +721,9 @@ async fn list_files(
             if p.is_dir() && is_mirror_area_path(&entry_rel) && !dir_has_visible_file(&p) {
                 continue;
             }
-            // 跟随软链取真实文件元数据(docs/ 下大量软链指向 src/ 原文件)。
-            // 软链断裂时回落到软链自身的元数据,避免整目录崩。
-            let meta = std::fs::metadata(&p).or_else(|_| e.metadata()).ok();
+            // 跟随软链取真实文件元数据;docs 镜像断链时回落到 src 同名源文件。
+            let meta = file_metadata_with_docs_fallback(&kb, &entry_rel, &p)
+                .or_else(|| e.metadata().ok());
             let modified = meta
                 .as_ref()
                 .and_then(|m| m.modified().ok())
@@ -799,12 +819,20 @@ async fn serve_kb_file(
         return Ok(bad_request("非法路径"));
     };
     let abs = kb.root.join(&rel);
-    let bytes = match tokio::fs::read(&abs).await {
-        Ok(b) => b,
-        Err(_) => return Ok(not_found("文件不存在")),
+    let (served_abs, bytes) = match tokio::fs::read(&abs).await {
+        Ok(b) => (abs.clone(), b),
+        Err(_) => {
+            let Some(src_abs) = docs_mirror_source_abs(&kb, &rel) else {
+                return Ok(not_found("文件不存在"));
+            };
+            match tokio::fs::read(&src_abs).await {
+                Ok(b) => (src_abs, b),
+                Err(_) => return Ok(not_found("文件不存在")),
+            }
+        }
     };
     Ok((
-        [(header::CONTENT_TYPE, file_content_type(&abs))],
+        [(header::CONTENT_TYPE, file_content_type(&served_abs))],
         bytes,
     )
         .into_response())
