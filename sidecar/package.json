@@ -1,6 +1,6 @@
 {
   "name": "ktree-sidecar",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Ktree 文档转换 sidecar:docx/xlsx/pdf/html → Markdown",
   "type": "commonjs",

@@ -709,6 +709,16 @@ function rawUrl(path,kb){
   const segs=String(path).split('/').filter(Boolean).map(encodeURIComponent).join('/');
   return `/${encodeURIComponent(kb||CUR_KB)}/${segs}`;
 }
+// 复制给人看的直链:保留中文,只转义会破坏 URL 结构的 ASCII 字符。
+function readablePathPart(s){
+  return String(s).replace(/[%\u0000-\u001F\u007F "#<>?`{}|\\^[\]]/g, c =>
+    [...new TextEncoder().encode(c)].map(b => '%' + b.toString(16).toUpperCase().padStart(2,'0')).join('')
+  );
+}
+function readableRawUrl(path,kb){
+  const segs=String(path).split('/').filter(Boolean).map(readablePathPart).join('/');
+  return `/${readablePathPart(kb||CUR_KB)}/${segs}`;
+}
 async function api(path,opts){
   const r=await fetch(path,opts);
   const ct=r.headers.get('content-type')||'';
@@ -2142,7 +2152,7 @@ function toggleFav(kb,rp,isFolder){
   if(VIEW==='list') loadDir();
 }
 async function doCopyAddr(btn,kb,rp){
-  const url=(CUSTOM_DOMAIN||location.origin)+rawUrl(rp,kb);
+  const url=(CUSTOM_DOMAIN||location.origin)+readableRawUrl(rp,kb);
   const ok=await copyText(url);
   if(ok){
     btn.classList.add('copied');
