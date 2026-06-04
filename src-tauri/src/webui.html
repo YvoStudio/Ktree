@@ -1017,6 +1017,7 @@ async function renderOpsList(host){
       </div>
       <div class="ops-actions">
         <button class="btn ghost" data-act="vcs-all">同步全部仓库</button>
+        <button class="btn ghost" data-act="vcs-check-all">全库检查</button>
         <span class="hint" style="align-self:center">绑定的添加 / 删除请在桌面端「Ktree → 设置」中配置</span>
       </div>
       <div class="vcs-list" data-vcs-host="1"><div class="ops-empty">加载仓库绑定…</div></div>
@@ -1044,14 +1045,26 @@ async function renderOpsList(host){
                 ${b.branch?` <span style="color:#aaa">[${esc(b.branch)}]</span>`:''}
                 ${b.has_credentials?' <span style="color:#888;font-size:11px">(自定义凭证)</span>':''}
               </div>
-              <button class="btn ghost sm" ${b.syncing?'disabled':''}>${b.syncing?'同步中…':'同步'}</button>
+              <div style="display:flex;gap:8px;flex-shrink:0">
+                <button class="btn ghost sm" data-act="vcs-one" ${b.syncing?'disabled':''}>${b.syncing?'同步中…':'同步'}</button>
+                <button class="btn ghost sm" data-act="vcs-check-one" ${b.syncing?'disabled':''}>全库检查</button>
+              </div>
             </div>
             <div class="vcs-last">${renderVcsLast(b.last_sync, b.sync_interval_minutes, b.syncing)}</div>`;
-          row.querySelector('button').addEventListener('click',()=>{
-            show(`同步 ${b.vcs_type}: ${b.url} …(大仓库首次同步可能较久,可关闭此窗口,后台会继续)`);
+          row.querySelector('[data-act="vcs-one"]').addEventListener('click',()=>{
+            show(`同步 ${b.vcs_type}: ${b.url} …(增量更新,可关闭此窗口,后台会继续)`);
             // 不 await 到底 —— 大仓库同步可能要几十分钟,连接断了服务端也会继续跑;
             // 完成与否靠下方轮询刷新状态。
             api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/${b.idx}/sync`,{method:'POST'})
+              .then(rr=>{ if(rr&&rr.report){ show(formatVcsReport(rr.report)); } reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm(rr&&rr.report?[rr.report]:[]); })
+              .catch(()=>{});
+            reloadVcs(); startSyncPolling();
+          });
+          row.querySelector('[data-act="vcs-check-one"]').addEventListener('click',async ()=>{
+            const ok=await confirmDialog('全库检查会遍历整个仓库并补齐缺失 docs,大仓库会比较久。继续吗?',{okText:'开始检查'});
+            if(!ok) return;
+            show(`全库检查 ${b.vcs_type}: ${b.url} …(可关闭此窗口,后台会继续)`);
+            api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/${b.idx}/check`,{method:'POST'})
               .then(rr=>{ if(rr&&rr.report){ show(formatVcsReport(rr.report)); } reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm(rr&&rr.report?[rr.report]:[]); })
               .catch(()=>{});
             reloadVcs(); startSyncPolling();
@@ -1079,8 +1092,17 @@ async function renderOpsList(host){
     }
 
     block.querySelector('[data-act="vcs-all"]').addEventListener('click',()=>{
-      show('同步所有仓库绑定…(可关闭此窗口,后台会继续)');
+      show('同步所有仓库绑定…(增量更新,可关闭此窗口,后台会继续)');
       api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/sync`,{method:'POST'})
+        .then(r=>{ if(r) show(formatVcsReports(r.reports||[], r.errors||[])); reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm((r&&r.reports)||[]); })
+        .catch(()=>{});
+      reloadVcs(); startSyncPolling();
+    });
+    block.querySelector('[data-act="vcs-check-all"]').addEventListener('click',async ()=>{
+      const ok=await confirmDialog('全库检查会遍历此知识库的所有仓库绑定并补齐缺失 docs,大仓库会比较久。继续吗?',{okText:'开始检查'});
+      if(!ok) return;
+      show('全库检查所有仓库绑定…(可关闭此窗口,后台会继续)');
+      api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/check`,{method:'POST'})
         .then(r=>{ if(r) show(formatVcsReports(r.reports||[], r.errors||[])); reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm((r&&r.reports)||[]); })
         .catch(()=>{});
       reloadVcs(); startSyncPolling();
@@ -1127,7 +1149,7 @@ async function afterSyncConfirm(reports){
 // last 可能为 null(后端从未同步过) → 看 interval 决定提示"待自动同步"还是"未同步"。
 function renderVcsLast(last, intervalMinutes, syncing){
   if(syncing){
-    return `<span class="empty">⏳ 同步进行中…(首次同步大仓库较久:拉取完成后才开始逐个转换入库,docs 会随之逐步出现)</span>`;
+    return `<span class="empty">⏳ 同步进行中…</span>`;
   }
   if(!last){
     if(intervalMinutes>0) return `<span class="empty">暂无同步记录 · 自动每 ${intervalMinutes} 分钟</span>`;

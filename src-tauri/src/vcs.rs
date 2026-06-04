@@ -11,9 +11,15 @@ use std::process::Command;
 use md5::{Digest, Md5};
 use serde::Serialize;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use crate::config::{KnowledgeBase, VcsBinding, AREA_VCS};
 use crate::ingest::{self, safe_component};
 use crate::state::{AppState, LastVcsSync};
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// 一次 VCS 同步的结果汇总。
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +44,49 @@ pub struct VcsSyncReport {
     pub messages: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+enum ReconcileMode {
+    Full,
+    Incremental {
+        changed: HashSet<String>,
+        deleted: HashSet<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct VcsPullResult {
+    revision: String,
+    reconcile: ReconcileMode,
+}
+
+impl VcsPullResult {
+    fn full(revision: String) -> Self {
+        Self {
+            revision,
+            reconcile: ReconcileMode::Full,
+        }
+    }
+
+    fn incremental(revision: String, changed: HashSet<String>, deleted: HashSet<String>) -> Self {
+        Self {
+            revision,
+            reconcile: ReconcileMode::Incremental { changed, deleted },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SvnEntryKind {
+    File,
+    Dir,
+}
+
+#[derive(Debug, Clone)]
+struct SvnListEntry {
+    rel: String,
+    kind: SvnEntryKind,
+}
+
 /// 校验绑定名并返回 (目标绝对路径, 相对 src 的前缀 "vcs/<name>")。
 fn binding_target_dir(kb: &KnowledgeBase, b: &VcsBinding) -> anyhow::Result<(PathBuf, String)> {
     let name = safe_component(&b.name)
@@ -48,7 +97,16 @@ fn binding_target_dir(kb: &KnowledgeBase, b: &VcsBinding) -> anyhow::Result<(Pat
 }
 
 fn vcs_command(program: &str) -> Command {
-    Command::new(resolve_vcs_program(program))
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new(resolve_vcs_program(program));
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new(resolve_vcs_program(program))
+    }
 }
 
 fn resolve_vcs_program(program: &str) -> PathBuf {
@@ -174,17 +232,6 @@ fn run_cmd(mut cmd: Command, ctx: &str) -> anyhow::Result<String> {
         anyhow::bail!("{ctx} 失败: {stderr}");
     }
     Ok(stdout)
-}
-
-fn run_cmd_bytes(mut cmd: Command, ctx: &str) -> anyhow::Result<Vec<u8>> {
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow::anyhow!("{ctx}:启动失败: {e}"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("{ctx} 失败: {stderr}");
-    }
-    Ok(out.stdout)
 }
 
 /// git 子目录同步用的隐藏工作副本目录 —— 放 `.ktree/vcs-cache/` 下,`.git` 不进 src。
@@ -392,7 +439,7 @@ fn git_whole_repo(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
     Ok(run_cmd(head, "git rev-parse HEAD")?.trim().to_string())
 }
 
-fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
+fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<VcsPullResult> {
     if target.join(".svn").exists() {
         // 上次 checkout / update 中断会留下锁(E155004),先 cleanup 再 update。
         // cleanup 自身失败不管,让 update 报真实错误。
@@ -403,34 +450,39 @@ fn svn_update_or_checkout(target: &Path, b: &VcsBinding) -> anyhow::Result<Strin
             .arg("--non-interactive");
         let _ = run_cmd(cleanup, "svn cleanup");
 
-        if let Err(e) = svn_update(target, b) {
-            // 只有"工作副本损坏"类错误(E155xxx,如锁损坏、wc.db 坏)才清掉重建;
-            // 远端错误(E170000 URL 不存在、E175xxx 网络不通、认证失败等)直接报错,
-            // 保留本地镜像 —— 删了也下载不回来,反而丢数据。
-            let msg = e.to_string();
-            if msg.contains("E155") {
-                eprintln!("[ktree] svn 工作副本损坏({e}),清掉重新 checkout");
-                fs::remove_dir_all(target)?;
-                svn_checkout_or_export(target, b)?;
-            } else {
-                return Err(e);
+        let update_output = match svn_update(target, b) {
+            Ok(out) => out,
+            Err(e) => {
+                // 只有"工作副本损坏"类错误(E155xxx,如锁损坏、wc.db 坏)才清掉重建;
+                // 远端错误(E170000 URL 不存在、E175xxx 网络不通、认证失败等)直接报错,
+                // 保留本地镜像 —— 删了也下载不回来,反而丢数据。
+                let msg = e.to_string();
+                if msg.contains("E155") {
+                    eprintln!("[ktree] svn 工作副本损坏({e}),清掉重新 checkout");
+                    fs::remove_dir_all(target)?;
+                    return svn_checkout_or_export(target, b);
+                } else {
+                    return Err(e);
+                }
             }
-        } else {
-            // 严格镜像:清掉 unversioned 文件(svn status 第一列 '?')
-            svn_clean_unversioned(target);
+        };
+        // 严格镜像:清掉 unversioned 文件(svn status 第一列 '?')
+        svn_clean_unversioned(target);
+        let revision = svn_working_copy_revision(target)?;
+        let (changed, deleted) = parse_svn_update_changes(&update_output);
+        if svn_export_marker(target).exists() {
+            let (changed, deleted) = svn_refresh_sparse_workcopy(target, b, &revision, changed, deleted)?;
+            return Ok(VcsPullResult::incremental(revision, changed, deleted));
         }
+        return Ok(VcsPullResult::incremental(revision, changed, deleted));
     } else if svn_export_marker(target).exists() {
-        let remote_revision = svn_remote_revision(b)?;
-        if svn_export_marker_revision(target).as_deref() != Some(remote_revision.as_str()) {
-            svn_export_without_workcopy(target, b)?;
-        }
-        return Ok(remote_revision);
+        return svn_checkout_or_export(target, b);
     } else {
-        svn_checkout_or_export(target, b)?;
+        return svn_checkout_or_export(target, b);
     }
-    if !target.join(".svn").exists() {
-        return svn_remote_revision(b);
-    }
+}
+
+fn svn_working_copy_revision(target: &Path) -> anyhow::Result<String> {
     let mut info = vcs_command("svn");
     info.current_dir(target)
         .arg("info")
@@ -449,30 +501,29 @@ fn svn_add_auth(cmd: &mut Command, b: &VcsBinding) {
     }
 }
 
-fn svn_update(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
+fn svn_update(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
     let mut up = vcs_command("svn");
     up.current_dir(target).arg("update");
     svn_add_auth(&mut up, b);
-    run_cmd(up, "svn update")?;
-    Ok(())
+    run_cmd(up, "svn update")
 }
 
-fn svn_checkout_or_export(target: &Path, b: &VcsBinding) -> anyhow::Result<()> {
+fn svn_checkout_or_export(target: &Path, b: &VcsBinding) -> anyhow::Result<VcsPullResult> {
     if target.exists() && !target.join(".svn").exists() {
         fs::remove_dir_all(target)?;
     }
     match svn_checkout(target, b) {
         Ok(()) => {
             let _ = fs::remove_file(svn_export_marker(target));
-            Ok(())
+            svn_working_copy_revision(target).map(VcsPullResult::full)
         }
         Err(e) => {
             let msg = e.to_string();
             if !msg.contains("E155") {
                 return Err(e);
             }
-            eprintln!("[ktree] svn checkout 遇到 Windows 非法路径({e}),改用无工作副本导出");
-            svn_export_without_workcopy(target, b).map(|_| ())
+            eprintln!("[ktree] svn checkout 遇到 Windows 非法路径({e}),改用稀疏工作副本");
+            svn_sparse_checkout_valid_paths(target, b).map(VcsPullResult::full)
         }
     }
 }
@@ -494,16 +545,6 @@ fn svn_export_marker(target: &Path) -> PathBuf {
     target.join(".ktree-svn-export-fallback")
 }
 
-fn svn_export_marker_revision(target: &Path) -> Option<String> {
-    let marker = fs::read_to_string(svn_export_marker(target)).ok()?;
-    marker
-        .lines()
-        .find_map(|line| line.strip_prefix("Revision:"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-}
-
 fn svn_remote_revision(b: &VcsBinding) -> anyhow::Result<String> {
     let mut info = vcs_command("svn");
     info.arg("info")
@@ -514,15 +555,55 @@ fn svn_remote_revision(b: &VcsBinding) -> anyhow::Result<String> {
     Ok(run_cmd(info, "svn info revision")?.trim().to_string())
 }
 
-fn svn_list_recursive_files(b: &VcsBinding) -> anyhow::Result<Vec<String>> {
+fn svn_list_recursive_entries(b: &VcsBinding) -> anyhow::Result<Vec<SvnListEntry>> {
     let mut ls = vcs_command("svn");
     ls.arg("list").arg("--xml").arg("-R").arg(&b.url);
     svn_add_auth(&mut ls, b);
-    parse_svn_list_xml_files(&run_cmd(ls, "svn list --xml")?)
+    parse_svn_list_xml_entries(&run_cmd(ls, "svn list --xml")?)
 }
 
-fn parse_svn_list_xml_files(xml: &str) -> anyhow::Result<Vec<String>> {
-    let mut files = Vec::new();
+fn parse_svn_update_changes(output: &str) -> (HashSet<String>, HashSet<String>) {
+    let mut changed = HashSet::new();
+    let mut deleted = HashSet::new();
+    for line in output.lines() {
+        let prefix: String = line.chars().take(4).collect();
+        if prefix.is_empty()
+            || !prefix
+                .chars()
+                .all(|c| matches!(c, ' ' | 'A' | 'B' | 'C' | 'D' | 'E' | 'G' | 'R' | 'U'))
+        {
+            continue;
+        }
+        let Some(status) = prefix.chars().find(|c| *c != ' ') else {
+            continue;
+        };
+        let raw_path: String = line.chars().skip(4).collect();
+        let Some(path) = normalize_svn_update_path(&raw_path) else {
+            continue;
+        };
+        if status == 'D' {
+            deleted.insert(path);
+        } else {
+            changed.insert(path);
+        }
+    }
+    (changed, deleted)
+}
+
+fn normalize_svn_update_path(raw: &str) -> Option<String> {
+    let mut s = raw.trim().trim_matches('"').trim_matches('\'').replace('\\', "/");
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    let s = s.trim_matches('/').to_string();
+    if s.is_empty() || s == "." {
+        return None;
+    }
+    Some(s)
+}
+
+fn parse_svn_list_xml_entries(xml: &str) -> anyhow::Result<Vec<SvnListEntry>> {
+    let mut entries = Vec::new();
     let mut rest = xml;
     while let Some(entry_start) = rest.find("<entry") {
         rest = &rest[entry_start..];
@@ -530,7 +611,14 @@ fn parse_svn_list_xml_files(xml: &str) -> anyhow::Result<Vec<String>> {
             anyhow::bail!("svn list --xml 输出不完整:缺少 </entry>");
         };
         let entry = &rest[..entry_end + "</entry>".len()];
-        if entry.contains("kind=\"file\"") {
+        let kind = if entry.contains("kind=\"file\"") {
+            Some(SvnEntryKind::File)
+        } else if entry.contains("kind=\"dir\"") {
+            Some(SvnEntryKind::Dir)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
             let name_start = entry
                 .find("<name>")
                 .ok_or_else(|| anyhow::anyhow!("svn list --xml 输出不完整:缺少 <name>"))?
@@ -539,11 +627,14 @@ fn parse_svn_list_xml_files(xml: &str) -> anyhow::Result<Vec<String>> {
                 .find("</name>")
                 .ok_or_else(|| anyhow::anyhow!("svn list --xml 输出不完整:缺少 </name>"))?
                 + name_start;
-            files.push(xml_unescape(&entry[name_start..name_end])?);
+            let rel = xml_unescape(&entry[name_start..name_end])?;
+            if !rel.is_empty() {
+                entries.push(SvnListEntry { rel, kind });
+            }
         }
         rest = &rest[entry_end + "</entry>".len()..];
     }
-    Ok(files)
+    Ok(entries)
 }
 
 fn xml_unescape(s: &str) -> anyhow::Result<String> {
@@ -587,30 +678,6 @@ fn xml_unescape(s: &str) -> anyhow::Result<String> {
     Ok(out)
 }
 
-fn svn_cat(b: &VcsBinding, rel: &str) -> anyhow::Result<Vec<u8>> {
-    let mut cat = vcs_command("svn");
-    cat.arg("cat").arg(svn_url_with_rel(&b.url, rel));
-    svn_add_auth(&mut cat, b);
-    run_cmd_bytes(cat, "svn cat")
-}
-
-fn svn_url_with_rel(base: &str, rel: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), percent_encode_svn_path(rel))
-}
-
-fn percent_encode_svn_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for &b in path.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 fn windows_reserved_component(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." {
         return true;
@@ -642,39 +709,211 @@ fn svn_export_rel_path(rel: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-fn svn_export_without_workcopy(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
-    let revision = svn_remote_revision(b)?;
-    let _ = fs::remove_dir_all(target);
-    fs::create_dir_all(target)?;
+fn split_svn_entries_for_windows(
+    entries: Vec<SvnListEntry>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
     let mut skipped = Vec::new();
-    for rel in svn_list_recursive_files(b)? {
-        if rel.is_empty() || rel.ends_with('/') {
+    for entry in entries {
+        if svn_export_rel_path(&entry.rel).is_none() {
+            skipped.push(entry.rel);
             continue;
         }
-        let Some(dst_rel) = svn_export_rel_path(&rel) else {
-            skipped.push(rel);
-            continue;
-        };
-        let dst = target.join(dst_rel);
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)?;
+        match entry.kind {
+            SvnEntryKind::Dir => dirs.push(entry.rel),
+            SvnEntryKind::File => files.push(entry.rel),
         }
-        if dst.is_dir() {
-            let _ = fs::remove_dir_all(&dst);
-        } else {
-            let _ = fs::remove_file(&dst);
-        }
-        fs::write(dst, svn_cat(b, &rel)?)?;
     }
+    dirs.sort();
+    files.sort();
+    skipped.sort();
+    (dirs, files, skipped)
+}
+
+fn path_depth(path: &str) -> usize {
+    path.split('/').filter(|part| !part.is_empty()).count()
+}
+
+fn svn_update_targets(
+    target: &Path,
+    b: &VcsBinding,
+    targets: &[String],
+    set_depth_empty: bool,
+    ctx: &str,
+) -> anyhow::Result<String> {
+    if targets.is_empty() {
+        return Ok(String::new());
+    }
+    let mut combined = String::new();
+    let mut batch = Vec::new();
+    let mut batch_len = 0usize;
+    for t in targets {
+        let next_len = batch_len + t.len() + 8;
+        if !batch.is_empty() && (batch.len() >= 200 || next_len > 12_000) {
+            combined.push_str(&svn_update_target_batch(
+                target,
+                b,
+                &batch,
+                set_depth_empty,
+                ctx,
+            )?);
+            batch.clear();
+            batch_len = 0;
+        }
+        batch.push(t.clone());
+        batch_len += t.len() + 8;
+    }
+    if !batch.is_empty() {
+        combined.push_str(&svn_update_target_batch(
+            target,
+            b,
+            &batch,
+            set_depth_empty,
+            ctx,
+        )?);
+    }
+    Ok(combined)
+}
+
+fn svn_update_target_batch(
+    target: &Path,
+    b: &VcsBinding,
+    targets: &[String],
+    set_depth_empty: bool,
+    ctx: &str,
+) -> anyhow::Result<String> {
+    let mut up = vcs_command("svn");
+    up.current_dir(target).arg("update");
+    svn_add_auth(&mut up, b);
+    if set_depth_empty {
+        up.arg("--set-depth").arg("empty");
+    }
+    for t in targets {
+        up.arg(t);
+    }
+    run_cmd(up, ctx)
+}
+
+fn svn_update_dirs_by_depth(
+    target: &Path,
+    b: &VcsBinding,
+    dirs: &[String],
+) -> anyhow::Result<String> {
+    let mut dirs = dirs.to_vec();
+    dirs.sort_by(|a, b| path_depth(a).cmp(&path_depth(b)).then_with(|| a.cmp(b)));
+    let mut combined = String::new();
+    let mut start = 0usize;
+    while start < dirs.len() {
+        let depth = path_depth(&dirs[start]);
+        let mut end = start + 1;
+        while end < dirs.len() && path_depth(&dirs[end]) == depth {
+            end += 1;
+        }
+        combined.push_str(&svn_update_targets(
+            target,
+            b,
+            &dirs[start..end],
+            true,
+            "svn update sparse dirs",
+        )?);
+        start = end;
+    }
+    Ok(combined)
+}
+
+fn ancestor_dirs_for_files(files: &HashSet<String>, valid_dirs: &HashSet<String>) -> Vec<String> {
+    let mut dirs = HashSet::new();
+    for file in files {
+        let mut parts: Vec<&str> = file.split('/').collect();
+        parts.pop();
+        while !parts.is_empty() {
+            let dir = parts.join("/");
+            if valid_dirs.contains(&dir) {
+                dirs.insert(dir);
+            }
+            parts.pop();
+        }
+    }
+    let mut dirs: Vec<String> = dirs.into_iter().collect();
+    dirs.sort_by(|a, b| path_depth(a).cmp(&path_depth(b)).then_with(|| a.cmp(b)));
+    dirs
+}
+
+fn write_svn_sparse_marker(target: &Path, revision: &str, skipped: &[String]) -> anyhow::Result<()> {
     let marker = format!(
-        "SVN working copy fallback export.\nRevision: {revision}\nSkipped Windows-invalid paths:\n{}\n",
+        "SVN sparse working copy fallback.\nRevision: {revision}\nSkipped Windows-invalid paths:\n{}\n",
         skipped.join("\n")
     );
     fs::write(svn_export_marker(target), marker)?;
     if !skipped.is_empty() {
         eprintln!("[ktree] svn 跳过 Windows 非法路径: {}", skipped.join(", "));
     }
+    Ok(())
+}
+
+fn svn_sparse_checkout_valid_paths(target: &Path, b: &VcsBinding) -> anyhow::Result<String> {
+    let revision = svn_remote_revision(b)?;
+    let _ = fs::remove_dir_all(target);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut checkout = vcs_command("svn");
+    checkout
+        .arg("checkout")
+        .arg("--depth")
+        .arg("empty")
+        .arg(&b.url)
+        .arg(target);
+    svn_add_auth(&mut checkout, b);
+    run_cmd(checkout, "svn checkout --depth empty")?;
+
+    let (dirs, files, skipped) = split_svn_entries_for_windows(svn_list_recursive_entries(b)?);
+    svn_update_dirs_by_depth(target, b, &dirs)?;
+    svn_update_targets(target, b, &files, false, "svn update sparse files")?;
+    write_svn_sparse_marker(target, &revision, &skipped)?;
     Ok(revision)
+}
+
+fn svn_refresh_sparse_workcopy(
+    target: &Path,
+    b: &VcsBinding,
+    revision: &str,
+    mut changed: HashSet<String>,
+    mut deleted: HashSet<String>,
+) -> anyhow::Result<(HashSet<String>, HashSet<String>)> {
+    let (dirs, files, skipped) = split_svn_entries_for_windows(svn_list_recursive_entries(b)?);
+    let remote_files: HashSet<String> = files.into_iter().collect();
+    let valid_dirs: HashSet<String> = dirs.into_iter().collect();
+    let local_files: HashSet<String> = list_repo_files(target)?.into_iter().collect();
+
+    let stale: Vec<String> = local_files.difference(&remote_files).cloned().collect();
+    for rel in &stale {
+        if let Some(path) = safe_vcs_rel_path(rel) {
+            let p = target.join(path);
+            let _ = fs::remove_file(&p);
+            deleted.insert(rel.clone());
+        }
+    }
+
+    let missing: HashSet<String> = remote_files.difference(&local_files).cloned().collect();
+    let dirs_to_update = ancestor_dirs_for_files(&missing, &valid_dirs);
+    svn_update_dirs_by_depth(target, b, &dirs_to_update)?;
+    let mut missing_files: Vec<String> = missing.iter().cloned().collect();
+    missing_files.sort();
+    let out = svn_update_targets(
+        target,
+        b,
+        &missing_files,
+        false,
+        "svn update sparse missing files",
+    )?;
+    let (more_changed, more_deleted) = parse_svn_update_changes(&out);
+    changed.extend(missing);
+    changed.extend(more_changed);
+    deleted.extend(more_deleted);
+    write_svn_sparse_marker(target, revision, &skipped)?;
+    Ok((changed, deleted))
 }
 
 /// 删除 svn 工作副本里所有 unversioned 的文件 / 目录(`svn status` 的 '?' 行)。
@@ -688,6 +927,9 @@ fn svn_clean_unversioned(target: &Path) {
         if let Some(rel) = line.strip_prefix('?') {
             let rel = rel.trim();
             if rel.is_empty() {
+                continue;
+            }
+            if rel == ".ktree-svn-export-fallback" {
                 continue;
             }
             let p = target.join(rel);
@@ -735,12 +977,161 @@ fn list_repo_files(base: &Path) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+fn safe_vcs_rel_path(rel: &str) -> Option<PathBuf> {
+    let rel = normalize_svn_update_path(rel)?;
+    let path = Path::new(&rel);
+    if path.is_absolute() {
+        return None;
+    }
+    if path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(PathBuf::from(rel))
+}
+
+fn expand_changed_repo_files(
+    target: &Path,
+    changed: &HashSet<String>,
+) -> anyhow::Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    for rel in changed {
+        let Some(rel_path) = safe_vcs_rel_path(rel) else {
+            continue;
+        };
+        let p = target.join(&rel_path);
+        if p.is_dir() {
+            let base = rel.trim_end_matches('/');
+            for child in list_repo_files(&p)? {
+                out.insert(format!("{base}/{child}"));
+            }
+        } else if p.is_file() {
+            out.insert(rel.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn collect_deleted_rel_paths(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    prefix: &str,
+    deleted: &HashSet<String>,
+) -> anyhow::Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    for rel in deleted {
+        let Some(_) = safe_vcs_rel_path(rel) else {
+            continue;
+        };
+        let rel_path = format!("{}/{}", prefix.trim_end_matches('/'), rel.trim_matches('/'));
+        if state.store.get_by_path(&kb.id, &rel_path)?.is_some() {
+            out.insert(rel_path.clone());
+        }
+        for doc in state.store.list_documents(&kb.id, Some(&rel_path))? {
+            out.insert(doc.rel_path);
+        }
+    }
+    Ok(out)
+}
+
+fn ingest_vcs_rel_path(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    rel_path: &str,
+    report: &mut VcsSyncReport,
+) {
+    let old_doc = state.store.get_by_path(&kb.id, rel_path).ok().flatten();
+    let old_md5 = old_doc.as_ref().map(|d| d.md5.as_str());
+    match ingest::ingest_file(state, kb, rel_path, "vcs", true, false) {
+        Ok(doc) => {
+            if old_doc.is_none() {
+                report.added.push(rel_path.to_string());
+            } else if old_md5 != Some(doc.md5.as_str()) {
+                report.updated.push(rel_path.to_string());
+            }
+        }
+        Err(e) => {
+            report.failed.push(rel_path.to_string());
+            report.messages.push(format!("入库失败「{rel_path}」: {e}"));
+        }
+    }
+}
+
+fn delete_vcs_rel_path(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    rel_path: &str,
+    report: &mut VcsSyncReport,
+) {
+    if let Ok(Some(doc)) = state.store.get_by_path(&kb.id, rel_path) {
+        if let Err(e) = ingest::delete_doc(state, kb, &doc) {
+            report.failed.push(rel_path.to_string());
+            report.messages.push(format!("清理失败「{rel_path}」: {e}"));
+        } else {
+            report.deleted.push(rel_path.to_string());
+        }
+    }
+}
+
+fn reconcile_full(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    target: &Path,
+    prefix: &str,
+    report: &mut VcsSyncReport,
+) -> anyhow::Result<()> {
+    let before: HashSet<String> = state
+        .store
+        .list_documents(&kb.id, Some(prefix))?
+        .into_iter()
+        .map(|d| d.rel_path)
+        .collect();
+    let files = list_repo_files(target)?;
+    let after: HashSet<String> = files.iter().map(|r| format!("{prefix}/{r}")).collect();
+
+    for rel_path in &after {
+        ingest_vcs_rel_path(state, kb, rel_path, report);
+    }
+
+    for rel_path in before.difference(&after) {
+        delete_vcs_rel_path(state, kb, rel_path, report);
+    }
+
+    let _ = ingest::prune_docs_orphans(state, kb, prefix);
+    Ok(())
+}
+
+fn reconcile_incremental(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    target: &Path,
+    prefix: &str,
+    changed: &HashSet<String>,
+    deleted: &HashSet<String>,
+    report: &mut VcsSyncReport,
+) -> anyhow::Result<()> {
+    for rel in expand_changed_repo_files(target, changed)? {
+        ingest_vcs_rel_path(state, kb, &format!("{prefix}/{rel}"), report);
+    }
+    for rel_path in collect_deleted_rel_paths(state, kb, prefix, deleted)? {
+        delete_vcs_rel_path(state, kb, &rel_path, report);
+    }
+    Ok(())
+}
+
 /// 对一个绑定执行一次同步:拉取/更新(严格镜像)→ diff store → 入库 / 删除。
 /// 阻塞调用,放在 spawn_blocking 里跑。
-pub fn sync_binding(
+fn sync_binding_inner(
     state: &AppState,
     kb: &KnowledgeBase,
     binding_idx: usize,
+    force_full_check: bool,
 ) -> anyhow::Result<VcsSyncReport> {
     let b = kb
         .vcs_bindings
@@ -766,66 +1157,46 @@ pub fn sync_binding(
         messages: Vec::new(),
     };
 
-    // 拉取前 store 里这个绑定目录下所有 rel_path,作为"删除"检测的基线
-    let before: HashSet<String> = state
-        .store
-        .list_documents(&kb.id, Some(&prefix))?
-        .into_iter()
-        .map(|d| d.rel_path)
-        .collect();
-
     // 拉取 / 更新(内部已做严格镜像,盘上只剩仓库里的文件)
-    report.revision = match b.vcs_type.as_str() {
-        "git" => git_sync(kb, &target, &b)?,
+    let pull = match b.vcs_type.as_str() {
+        "git" => VcsPullResult::full(git_sync(kb, &target, &b)?),
         "svn" => svn_update_or_checkout(&target, &b)?,
         other => anyhow::bail!("不支持的 VCS 类型「{other}」(只支持 git / svn)"),
     };
+    report.revision = pull.revision.clone();
 
-    // 列出工作副本里所有文件 → 拼成相对 src/ 的路径
-    let files = list_repo_files(&target)?;
-    let after: HashSet<String> = files.iter().map(|r| format!("{prefix}/{r}")).collect();
-
-    // ingest 每个文件;ingest_file 内的 md5 短路会区分新增/无变化
-    for rel_path in &after {
-        // 在 ingest 之前看 store 里有没有这条记录 → 决定 added vs updated
-        let was_present = before.contains(rel_path);
-        let old_md5 = state
-            .store
-            .get_by_path(&kb.id, rel_path)
-            .ok()
-            .flatten()
-            .map(|d| d.md5);
-        match ingest::ingest_file(state, kb, rel_path, "vcs", true, false) {
-            Ok(doc) => {
-                if !was_present {
-                    report.added.push(rel_path.clone());
-                } else if old_md5.as_deref() != Some(&doc.md5) {
-                    report.updated.push(rel_path.clone());
-                }
-            }
-            Err(e) => {
-                report.failed.push(rel_path.clone());
-                report.messages.push(format!("入库失败「{rel_path}」: {e}"));
-            }
+    match pull.reconcile {
+        ReconcileMode::Full => {
+            reconcile_full(state, kb, &target, &prefix, &mut report)?;
         }
-    }
-
-    // 算 deleted:before - after,这些文件已不在仓库里,清 store + docs 产物
-    let deleted: Vec<String> = before.difference(&after).cloned().collect();
-    for rel_path in &deleted {
-        if let Ok(Some(doc)) = state.store.get_by_path(&kb.id, rel_path) {
-            // delete_doc 会清 src(严格镜像已删过 → 文件不存在也没事)、docs/、manifest、SQLite、tantivy
-            if let Err(e) = ingest::delete_doc(state, kb, &doc) {
-                report.failed.push(rel_path.clone());
-                report.messages.push(format!("清理失败「{rel_path}」: {e}"));
+        ReconcileMode::Incremental { changed, deleted } => {
+            if force_full_check {
+                report
+                    .messages
+                    .push("手动全库检查:比对 src 与 docs/store".to_string());
+                reconcile_full(state, kb, &target, &prefix, &mut report)?;
+            } else if changed.is_empty() && deleted.is_empty() {
+                report
+                    .messages
+                    .push("SVN 未返回文件变更,跳过入库检查".to_string());
             } else {
-                report.deleted.push(rel_path.clone());
+                report.messages.push(format!(
+                    "SVN 增量对账:变更 {} 项,删除 {} 项",
+                    changed.len(),
+                    deleted.len()
+                ));
+                reconcile_incremental(
+                    state,
+                    kb,
+                    &target,
+                    &prefix,
+                    &changed,
+                    &deleted,
+                    &mut report,
+                )?;
             }
         }
     }
-
-    // 严格镜像收尾:清掉 docs 区里 store 已不认识的孤儿文件/空目录(历史失步自愈)
-    let _ = ingest::prune_docs_orphans(state, kb, &prefix);
 
     // 刷新 .ktree 元数据
     let _ = ingest::refresh_kb_meta(state, kb);
@@ -859,11 +1230,30 @@ pub fn sync_binding_with_record(
     binding_idx: usize,
     source: &str,
 ) -> anyhow::Result<VcsSyncReport> {
+    run_binding_with_record(state, kb, binding_idx, source, false)
+}
+
+pub fn check_binding_full_with_record(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    binding_idx: usize,
+    source: &str,
+) -> anyhow::Result<VcsSyncReport> {
+    run_binding_with_record(state, kb, binding_idx, source, true)
+}
+
+fn run_binding_with_record(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    binding_idx: usize,
+    source: &str,
+    force_full_check: bool,
+) -> anyhow::Result<VcsSyncReport> {
     // 并发保护:同一绑定同时只允许一个同步在跑(并发 git/svn 进程会互相打架、留锁)
     if !state.try_begin_sync("vcs", &kb.id, binding_idx) {
         anyhow::bail!("该绑定正在同步中,请等当前同步结束");
     }
-    let result = sync_binding(state, kb, binding_idx);
+    let result = sync_binding_inner(state, kb, binding_idx, force_full_check);
     state.end_sync("vcs", &kb.id, binding_idx);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -906,5 +1296,15 @@ pub fn sync_kb_all_with_record(
 ) -> Vec<anyhow::Result<VcsSyncReport>> {
     (0..kb.vcs_bindings.len())
         .map(|i| sync_binding_with_record(state, kb, i, source))
+        .collect()
+}
+
+pub fn check_kb_all_full_with_record(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    source: &str,
+) -> Vec<anyhow::Result<VcsSyncReport>> {
+    (0..kb.vcs_bindings.len())
+        .map(|i| check_binding_full_with_record(state, kb, i, source))
         .collect()
 }
