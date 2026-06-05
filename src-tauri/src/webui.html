@@ -2281,6 +2281,34 @@ function previewFile(url,name){
   if(CODE_EXT.has(ext)||TEXT_EXT.has(ext)||ext==='json') return showCodePreview(url,name);
   return showBinaryPreview(url,name);
 }
+function isRelativeResourceUrl(value){
+  const s=String(value||'').trim();
+  return !!s && !s.startsWith('#') && !/^([a-z][a-z0-9+.-]*:|\/\/)/i.test(s);
+}
+function resolvePreviewResourceUrl(value,baseUrl){
+  const rel=String(value||'').replace(/\\/g,'/');
+  try { return new URL(rel, new URL(baseUrl, location.href)).href; }
+  catch(e){ return value; }
+}
+function rewriteSrcset(value,baseUrl){
+  return String(value||'').split(',').map(item=>{
+    const parts=item.trim().split(/\s+/);
+    if(parts[0] && isRelativeResourceUrl(parts[0])) parts[0]=resolvePreviewResourceUrl(parts[0],baseUrl);
+    return parts.join(' ');
+  }).join(', ');
+}
+function rewriteMarkdownResourceUrls(root,baseUrl){
+  [['img','src'],['source','src'],['video','src'],['audio','src'],['track','src'],['iframe','src'],['embed','src'],['a','href']]
+    .forEach(([tag,attr])=>{
+      root.querySelectorAll(`${tag}[${attr}]`).forEach(el=>{
+        const value=el.getAttribute(attr);
+        if(isRelativeResourceUrl(value)) el.setAttribute(attr, resolvePreviewResourceUrl(value, baseUrl));
+      });
+    });
+  root.querySelectorAll('img[srcset],source[srcset]').forEach(el=>{
+    el.setAttribute('srcset', rewriteSrcset(el.getAttribute('srcset'), baseUrl));
+  });
+}
 async function showMarkdownPreview(url,name){
   const body=createModal(name,url);
   body.innerHTML='<div class="md-body"><p style="color:#ccc">加载中…</p></div>';
@@ -2294,7 +2322,12 @@ async function showMarkdownPreview(url,name){
           catch(e){ return code; }
         }});
       }
-      body.innerHTML='<div class="md-body">'+marked.parse(text)+'</div>';
+      const md=document.createElement('div');
+      md.className='md-body';
+      md.innerHTML=marked.parse(text);
+      rewriteMarkdownResourceUrls(md,url);
+      body.innerHTML='';
+      body.appendChild(md);
     } else { body.innerHTML='<pre class="pv-code">'+esc(text)+'</pre>'; }
   } catch(e){ body.innerHTML='<div class="md-body"><p style="color:#c00">加载失败:'+esc(e)+'</p></div>'; }
 }
