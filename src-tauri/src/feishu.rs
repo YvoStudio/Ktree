@@ -189,8 +189,25 @@ pub fn sync_binding(
         messages: Vec::new(),
     };
 
+    // 显式忽略规则:路径任一层级以 ##! / ##！ 开头时,只保留来源文件,不进索引。
+    for rel_path in result
+        .present
+        .iter()
+        .filter(|p| ingest::path_has_ignored_component(p))
+    {
+        if let Ok(true) = ingest::forget_path_artifacts(state, kb, rel_path) {
+            report.deleted.push(rel_path.clone());
+            report
+                .messages
+                .push(format!("按忽略规则移出索引「{rel_path}」"));
+        }
+    }
+
     // ingest 本轮有变化的文档(md 是文本 → 软链镜像进 docs/)
     for doc in &result.documents {
+        if ingest::path_has_ignored_component(&doc.rel_path) {
+            continue;
+        }
         let was_present = before.contains(&doc.rel_path);
         match ingest::ingest_file(state, kb, &doc.rel_path, "feishu", true, false) {
             Ok(_) => {
@@ -211,7 +228,12 @@ pub fn sync_binding(
 
     // 删除检测:store 里有、但同步后已不存在的 → 清 store / 索引 / docs 产物。
     // sidecar 已做盘上的严格镜像,这里收口缓存层。
-    let present: HashSet<String> = result.present.iter().cloned().collect();
+    let present: HashSet<String> = result
+        .present
+        .iter()
+        .filter(|p| !ingest::path_has_ignored_component(p))
+        .cloned()
+        .collect();
     for rel_path in before.difference(&present) {
         if let Ok(Some(doc)) = state.store.get_by_path(&kb.id, rel_path) {
             if let Err(e) = ingest::delete_doc(state, kb, &doc) {

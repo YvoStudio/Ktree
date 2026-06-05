@@ -134,7 +134,10 @@ fn dir_has_visible_file(dir: &Path) -> bool {
     };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || name.ends_with(".assets") {
+        if name.starts_with('.')
+            || name.ends_with(".assets")
+            || ingest::is_ignored_component(&name)
+        {
             continue;
         }
         match e.file_type() {
@@ -160,7 +163,10 @@ fn collect_folders(base: &Path, prefix: &str, out: &mut Vec<String>) {
         let path = e.path();
         if path.is_dir() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name.ends_with(".assets") {
+            if name.starts_with('.')
+                || name.ends_with(".assets")
+                || ingest::is_ignored_component(&name)
+            {
                 continue;
             }
             let rel = if prefix.is_empty() {
@@ -331,8 +337,16 @@ async fn lib_css() -> Response {
 }
 
 async fn health(AxState(state): AxState<AppState>) -> Result<Response, ApiError> {
-    let total = state.store.count_documents(None)?;
     let cfg = state.config.snapshot();
+    let mut total = 0i64;
+    for kb in &cfg.knowledge_bases {
+        total += state
+            .store
+            .list_documents(&kb.id, None)?
+            .into_iter()
+            .filter(|d| !ingest::path_has_ignored_component(&d.rel_path))
+            .count() as i64;
+    }
     Ok(json_ok(json!({
         "ok": true,
         "documents": total,
@@ -605,7 +619,12 @@ async fn list_kbs(AxState(state): AxState<AppState>) -> Result<Response, ApiErro
     let cfg = state.config.snapshot();
     let mut kbs = Vec::new();
     for kb in &cfg.knowledge_bases {
-        let docs = state.store.count_documents(Some(&kb.id))?;
+        let docs = state
+            .store
+            .list_documents(&kb.id, None)?
+            .into_iter()
+            .filter(|d| !ingest::path_has_ignored_component(&d.rel_path))
+            .count();
         kbs.push(json!({
             "id": kb.id,
             "name": kb.name,
@@ -686,6 +705,9 @@ async fn list_files(
             None => return Ok(bad_request("非法路径")),
         }
     };
+    if ingest::path_has_ignored_component(&rel) {
+        return Ok(not_found("目录不存在"));
+    }
     let dir_abs = kb.root.join(&rel);
     if !dir_abs.is_dir() {
         return Ok(not_found("目录不存在"));
@@ -704,7 +726,10 @@ async fn list_files(
             let name = e.file_name().to_string_lossy().into_owned();
             // 隐藏文件(含 .ktree 元数据目录)与 .assets 伴生资源目录都不在列表展示;
             // .ktree 内容仍可经直链访问,只是不出现在文件浏览里。
-            if name.starts_with('.') || name.ends_with(".assets") {
+            if name.starts_with('.')
+                || name.ends_with(".assets")
+                || ingest::is_ignored_component(&name)
+            {
                 continue;
             }
             // 没有绑定的 vcs / cloud 镜像区不展示
@@ -906,6 +931,9 @@ async fn create_folder(
     if rel.split('/').any(|seg| seg.ends_with(".assets")) {
         return Ok(bad_request("目录名不能以 .assets 结尾(系统保留后缀)"));
     }
+    if ingest::path_has_ignored_component(&rel) {
+        return Ok(bad_request(ingest::ignore_rule_description()));
+    }
     tokio::fs::create_dir_all(kb.root.join(&rel)).await?;
     Ok(json_ok(json!({ "ok": true, "path": rel })))
 }
@@ -970,6 +998,10 @@ async fn upload(
         let data = field.bytes().await?;
 
         let rel_path = format!("{src_dir}/{filename}");
+        if ingest::path_has_ignored_component(&rel_path) {
+            errors.push(json!({ "file": raw_name, "error": ingest::ignore_rule_description() }));
+            continue;
+        }
         let abs = kb.root.join("src").join(&rel_path);
         if let Some(parent) = abs.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -1050,19 +1082,22 @@ async fn search(
     let store = state.store.clone();
     let enriched: Vec<Value> = hits
         .into_iter()
-        .map(|h| {
-            let doc = store.get_document(h.doc_id).ok().flatten();
-            json!({
+        .filter_map(|h| {
+            let doc = store.get_document(h.doc_id).ok().flatten()?;
+            if ingest::path_has_ignored_component(&doc.rel_path) {
+                return None;
+            }
+            Some(json!({
                 "doc_id": h.doc_id,
                 "title": h.title,
                 "category": h.category,
                 "summary": h.summary,
                 "score": h.score,
-                "kb_id": doc.as_ref().map(|d| d.kb_id.clone()),
-                "rel_path": doc.as_ref().map(|d| d.rel_path.clone()),
-                "md_path": doc.as_ref().and_then(|d| d.md_path.clone()),
-                "ext": doc.as_ref().map(|d| d.ext.clone()),
-            })
+                "kb_id": doc.kb_id,
+                "rel_path": doc.rel_path,
+                "md_path": doc.md_path,
+                "ext": doc.ext,
+            }))
         })
         .collect();
     Ok(json_ok(json!({ "ok": true, "query": q.q, "hits": enriched })))
@@ -1073,7 +1108,10 @@ async fn get_doc(
     AxPath(id): AxPath<i64>,
 ) -> Result<Response, ApiError> {
     match state.store.get_document(id)? {
-        Some(doc) => Ok(json_ok(json!({ "ok": true, "document": doc }))),
+        Some(doc) if !ingest::path_has_ignored_component(&doc.rel_path) => {
+            Ok(json_ok(json!({ "ok": true, "document": doc })))
+        }
+        Some(_) => Ok(not_found("文档不存在")),
         None => Ok(not_found("文档不存在")),
     }
 }
@@ -1085,6 +1123,9 @@ async fn get_doc_md(
     let Some(doc) = state.store.get_document(id)? else {
         return Ok(not_found("文档不存在"));
     };
+    if ingest::path_has_ignored_component(&doc.rel_path) {
+        return Ok(not_found("文档不存在"));
+    }
     let Some(kb) = state.config.get_kb(&doc.kb_id) else {
         return Ok(not_found("文档所属知识库不存在"));
     };
@@ -1106,6 +1147,9 @@ async fn get_doc_raw(
     let Some(doc) = state.store.get_document(id)? else {
         return Ok(not_found("文档不存在"));
     };
+    if ingest::path_has_ignored_component(&doc.rel_path) {
+        return Ok(not_found("文档不存在"));
+    }
     let Some(kb) = state.config.get_kb(&doc.kb_id) else {
         return Ok(not_found("文档所属知识库不存在"));
     };
@@ -1125,6 +1169,9 @@ async fn delete_doc(
     let Some(doc) = state.store.get_document(id)? else {
         return Ok(not_found("文档不存在"));
     };
+    if ingest::path_has_ignored_component(&doc.rel_path) {
+        return Ok(not_found("文档不存在"));
+    }
     let Some(kb) = state.config.get_kb(&doc.kb_id) else {
         return Ok(not_found("文档所属知识库不存在"));
     };

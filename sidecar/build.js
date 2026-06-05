@@ -52,8 +52,15 @@ const SIDECAR_DIR = __dirname;
 const BIN_DIR = path.join(SIDECAR_DIR, '..', 'src-tauri', 'binaries');
 const ENTRIES = ['convert', 'feishu-sync'];
 
+function pkgBin() {
+  const bin = process.platform === 'win32' ? 'pkg.cmd' : 'pkg';
+  const local = path.join(SIDECAR_DIR, 'node_modules', '.bin', bin);
+  return fs.existsSync(local) ? local : 'npx';
+}
+
 function main() {
   const { pkg, triple, ext } = resolveTarget();
+  const pkgCmd = pkgBin();
   fs.mkdirSync(BIN_DIR, { recursive: true });
   console.log(`目标平台: ${pkg}  (triple: ${triple})`);
 
@@ -61,10 +68,11 @@ function main() {
     const entry = path.join(SIDECAR_DIR, `${name}.js`);
     const out = path.join(BIN_DIR, `${name}-${triple}${ext}`);
     console.log(`\n打包 ${name}.js → ${out}`);
-    execSync(
-      `npx @yao-pkg/pkg "${entry}" --target ${pkg} --output "${out}"`,
-      { stdio: 'inherit', cwd: SIDECAR_DIR }
-    );
+    const cmd =
+      pkgCmd === 'npx'
+        ? `npx @yao-pkg/pkg "${entry}" --target ${pkg} --output "${out}"`
+        : `"${pkgCmd}" "${entry}" --target ${pkg} --output "${out}"`;
+    execSync(cmd, { stdio: 'inherit', cwd: SIDECAR_DIR });
   }
   console.log('\n完成。二进制已就绪,tauri build 会通过 externalBin 打包进应用。');
   console.log('交叉打包其他平台:在对应平台重跑本脚本,或用 pkg 的 --target 多值能力。');

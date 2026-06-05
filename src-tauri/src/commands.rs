@@ -28,10 +28,25 @@ pub struct ServiceInfo {
 #[tauri::command]
 pub fn get_service_info(state: State<'_, AppState>) -> ServiceInfo {
     let cfg = state.config.snapshot();
+    let documents = cfg
+        .knowledge_bases
+        .iter()
+        .map(|kb| {
+            state
+                .store
+                .list_documents(&kb.id, None)
+                .map(|docs| {
+                    docs.into_iter()
+                        .filter(|d| !crate::ingest::path_has_ignored_component(&d.rel_path))
+                        .count() as i64
+                })
+                .unwrap_or(0)
+        })
+        .sum();
     ServiceInfo {
         http_port: *state.http_port.lock().unwrap(),
         knowledge_bases: cfg.knowledge_bases.len(),
-        documents: state.store.count_documents(None).unwrap_or(0),
+        documents,
         custom_domain: normalize_custom_domain(&cfg.custom_domain),
     }
 }

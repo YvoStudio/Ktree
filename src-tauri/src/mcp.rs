@@ -97,12 +97,12 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "kb_list",
-            "description": "列出所有知识库及其 id、名称、文档数。其它工具的 kb 参数用这里的 id。\n知识库源文件按来源分区,文档的 rel_path 都带区前缀:\n- upload/…       用户上传区,可通过 kb_upload 写入\n- vcs/<绑定名>/…  git/svn 仓库的只读镜像,内容由同步维护,要修改请提交到仓库",
+            "description": "列出所有知识库及其 id、名称、文档数。其它工具的 kb 参数用这里的 id。\n知识库源文件按来源分区,文档的 rel_path 都带区前缀:\n- upload/…       用户上传区,可通过 kb_upload 写入\n- vcs/<绑定名>/…  git/svn 仓库的只读镜像,内容由同步维护,要修改请提交到仓库\n显式忽略:任一路径层级的目录名或文件名以 ##! 或 ##！ 开头时,不转换、不索引,AI 工具也不会返回。",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "kb_search",
-            "description": "在知识库中做中文混合检索:BM25 字面匹配 + 语义向量,RRF 融合排序。能命中近义 / 概念相关的文档。返回标题、摘要、所属知识库。",
+            "description": "在知识库中做中文混合检索:BM25 字面匹配 + 语义向量,RRF 融合排序。能命中近义 / 概念相关的文档。返回标题、摘要、所属知识库。路径层级以 ##! 或 ##！ 开头的内容会被视为显式忽略,不会返回。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -124,7 +124,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "kb_list_docs",
-            "description": "列出某个知识库的文档,可选按目录前缀过滤。\n注意:path 是文档 rel_path 的前缀(相对 src/,带区前缀),不要加 \"src/\" 或 \"docs/\";静态直链才使用 /<kb>/src/... 或 /<kb>/docs/...。\n示例:path=\"upload\" 列上传区全部;path=\"vcs/svn/版号申请版本\" 列仓库镜像区该目录下全部。",
+            "description": "列出某个知识库的文档,可选按目录前缀过滤。\n注意:path 是文档 rel_path 的前缀(相对 src/,带区前缀),不要加 \"src/\" 或 \"docs/\";静态直链才使用 /<kb>/src/... 或 /<kb>/docs/...。\n示例:path=\"upload\" 列上传区全部;path=\"vcs/svn/版号申请版本\" 列仓库镜像区该目录下全部。\n显式忽略:任一路径层级的目录名或文件名以 ##! 或 ##！ 开头时,不转换、不索引,本工具不会列出。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -316,7 +316,15 @@ async fn tool_list(state: &AppState) -> anyhow::Result<String> {
     }
     let mut out = String::from("知识库列表:\n");
     for kb in &cfg.knowledge_bases {
-        let n = state.store.count_documents(Some(&kb.id)).unwrap_or(0);
+        let n = state
+            .store
+            .list_documents(&kb.id, None)
+            .map(|docs| {
+                docs.into_iter()
+                    .filter(|d| !ingest::path_has_ignored_component(&d.rel_path))
+                    .count()
+            })
+            .unwrap_or(0);
         out.push_str(&format!("- id={} 名称「{}」 {} 篇文档\n", kb.id, kb.name, n));
     }
     Ok(out)
@@ -376,6 +384,9 @@ async fn tool_get_doc(state: &AppState, args: &Value, base_url: &str) -> anyhow:
         .store
         .get_document(id)?
         .ok_or_else(|| anyhow::anyhow!("文档 #{id} 不存在"))?;
+    if ingest::path_has_ignored_component(&doc.rel_path) {
+        anyhow::bail!("文档 #{id} 不存在");
+    }
     let kb = state
         .config
         .get_kb(&doc.kb_id)
@@ -437,7 +448,12 @@ async fn tool_list_docs(state: &AppState, args: &Value) -> anyhow::Result<String
         .get_kb(kb_id)
         .ok_or_else(|| anyhow::anyhow!("知识库 {kb_id} 不存在"))?;
     let path = args.get("path").and_then(|v| v.as_str());
-    let docs = state.store.list_documents(&kb.id, path)?;
+    let docs: Vec<_> = state
+        .store
+        .list_documents(&kb.id, path)?
+        .into_iter()
+        .filter(|d| !ingest::path_has_ignored_component(&d.rel_path))
+        .collect();
     let mut out = format!("知识库「{}」共 {} 篇文档:\n", kb.name, docs.len());
     for d in &docs {
         out.push_str(&format!("- #{} {} ({})\n", d.id, d.title, d.rel_path));
@@ -488,6 +504,9 @@ async fn tool_upload(state: &AppState, args: &Value) -> anyhow::Result<String> {
         .unwrap_or(true);
 
     let rel_path = format!("{dir}/{filename}");
+    if ingest::path_has_ignored_component(&rel_path) {
+        anyhow::bail!("{}", ingest::ignore_rule_description());
+    }
     let abs = kb.root.join("src").join(&rel_path);
     if let Some(parent) = abs.parent() {
         tokio::fs::create_dir_all(parent).await?;

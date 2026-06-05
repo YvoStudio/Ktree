@@ -200,6 +200,9 @@ pub fn rebuild_cache_if_needed(state: &AppState, kb: &KnowledgeBase) -> anyhow::
     state.index.delete_by_kb(&kb.id)?;
     let mut rebuilt = 0usize;
     for (rel_path, entry) in &manifest {
+        if crate::ingest::path_has_ignored_component(rel_path) {
+            continue;
+        }
         let src_abs = kb.root.join("src").join(rel_path);
         let size = fs::metadata(&src_abs).map(|m| m.len() as i64).unwrap_or(0);
         let ext = Path::new(rel_path)

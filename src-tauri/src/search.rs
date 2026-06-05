@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::embed::QUERY_INSTRUCTION;
+use crate::ingest;
 use crate::index::SearchHit;
 use crate::kbmeta;
 use crate::state::AppState;
@@ -29,9 +30,18 @@ pub fn hybrid(
     // 各路多取一些候选,给融合留出空间。
     let candidates = (limit * 3).max(20);
 
-    let bm25 = state.index.search(kb, query, candidates)?;
+    let bm25: Vec<SearchHit> = state
+        .index
+        .search(kb, query, candidates)?
+        .into_iter()
+        .filter(|h| !is_ignored_doc_id(state, h.doc_id))
+        .collect();
     // 向量路失败不致命:退化成纯 BM25。
-    let vector = vector_search(state, kb, query, candidates).unwrap_or_default();
+    let vector: Vec<(i64, f32)> = vector_search(state, kb, query, candidates)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(doc_id, _)| !is_ignored_doc_id(state, *doc_id))
+        .collect();
 
     // RRF:每条结果在某一路里名次为 r(从 0 起),贡献 1/(K + r + 1)。
     let mut fused: HashMap<i64, f32> = HashMap::new();
@@ -48,11 +58,16 @@ pub fn hybrid(
     let mut ranked: Vec<(i64, f32)> = fused.into_iter().collect();
     for (doc_id, score) in ranked.iter_mut() {
         if let Ok(Some(doc)) = state.store.get_document(*doc_id) {
+            if ingest::path_has_ignored_component(&doc.rel_path) {
+                *score = 0.0;
+                continue;
+            }
             if doc.summary.trim().is_empty() && is_media_ext(&doc.ext) {
                 *score *= 0.3;
             }
         }
     }
+    ranked.retain(|(doc_id, _)| !is_ignored_doc_id(state, *doc_id));
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     ranked.truncate(limit);
 
@@ -120,9 +135,22 @@ fn is_media_ext(ext: &str) -> bool {
     )
 }
 
+fn is_ignored_doc_id(state: &AppState, doc_id: i64) -> bool {
+    state
+        .store
+        .get_document(doc_id)
+        .ok()
+        .flatten()
+        .map(|doc| ingest::path_has_ignored_component(&doc.rel_path))
+        .unwrap_or(false)
+}
+
 /// 仅被语义命中的文档,从 SQLite 补出标题 / 摘要 / 分类。
 fn hit_from_store(state: &AppState, doc_id: i64, score: f32) -> Option<SearchHit> {
     let doc = state.store.get_document(doc_id).ok().flatten()?;
+    if ingest::path_has_ignored_component(&doc.rel_path) {
+        return None;
+    }
     Some(SearchHit {
         category: kbmeta::category_of(&doc.rel_path),
         doc_id: doc.id,

@@ -18,6 +18,27 @@ const EMBED_TEXT_LIMIT: usize = 1500;
 /// 一篇文档取多少个关键词。
 const KEYWORD_COUNT: usize = 8;
 
+/// 使用者显式排除知识库索引的前缀。
+/// 任一路径层级的目录名或文件名以这些前缀开头时,不转换、不索引。
+const IGNORE_PREFIX_ASCII: &str = "##!";
+const IGNORE_PREFIX_FULLWIDTH: &str = "##！";
+
+pub(crate) fn is_ignored_component(name: &str) -> bool {
+    name.starts_with(IGNORE_PREFIX_ASCII) || name.starts_with(IGNORE_PREFIX_FULLWIDTH)
+}
+
+/// 判断相对路径任一层级是否带有显式忽略前缀。
+/// 接受相对 src/ 的路径,也接受相对知识库根的 src/... / docs/... 路径。
+pub(crate) fn path_has_ignored_component(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .filter(|p| !p.is_empty())
+        .any(is_ignored_component)
+}
+
+pub(crate) fn ignore_rule_description() -> &'static str {
+    "路径任一目录或文件名以 ##! 或 ##！ 开头,按显式忽略规则不转换、不索引"
+}
+
 /// 由正文派生标签:正文非空走 jieba 关键词,为空(图片等)退化为文件名拆词。
 fn derive_tags(body: &str, stem: &str) -> Vec<String> {
     if body.trim().is_empty() {
@@ -139,6 +160,11 @@ pub fn ingest_file(
     convert_md: bool,
     force: bool,
 ) -> anyhow::Result<Document> {
+    if path_has_ignored_component(rel_path) {
+        let _ = forget_path_artifacts(state, kb, rel_path);
+        anyhow::bail!("{}", ignore_rule_description());
+    }
+
     let src_abs = kb.root.join("src").join(rel_path);
     let bytes = fs::read(&src_abs)?;
     let size = bytes.len() as i64;
@@ -361,7 +387,12 @@ pub fn prune_docs_orphans(
 
 /// 从 SQLite 全量重算某知识库的 .ktree/INDEX.md。
 pub fn refresh_kb_meta(state: &AppState, kb: &KnowledgeBase) -> anyhow::Result<()> {
-    let docs = state.store.list_documents(&kb.id, None)?;
+    let docs: Vec<_> = state
+        .store
+        .list_documents(&kb.id, None)?
+        .into_iter()
+        .filter(|d| !path_has_ignored_component(&d.rel_path))
+        .collect();
     kbmeta::regenerate_meta(kb, &docs)
 }
 
@@ -403,6 +434,16 @@ pub fn delete_folder(
 /// manifest 条目、SQLite + tantivy 缓存。
 pub fn delete_doc(state: &AppState, kb: &KnowledgeBase, doc: &Document) -> anyhow::Result<()> {
     let _ = fs::remove_file(kb.root.join("src").join(&doc.rel_path));
+    forget_doc_artifacts(state, kb, doc)
+}
+
+/// 只清理某文档的 docs 产物 / manifest / SQLite / tantivy,保留 src 原件。
+/// 用于显式忽略规则:文件仍可留在 VCS 工作副本里,但不再属于知识库索引。
+pub(crate) fn forget_doc_artifacts(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    doc: &Document,
+) -> anyhow::Result<()> {
     if let Some(md) = &doc.md_path {
         let _ = fs::remove_file(kb.root.join(md));
     }
@@ -419,6 +460,18 @@ pub fn delete_doc(state: &AppState, kb: &KnowledgeBase, doc: &Document) -> anyho
     state.index.delete(doc.id)?;
     state.index.commit()?;
     Ok(())
+}
+
+pub(crate) fn forget_path_artifacts(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    rel_path: &str,
+) -> anyhow::Result<bool> {
+    let Some(doc) = state.store.get_by_path(&kb.id, rel_path)? else {
+        return Ok(false);
+    };
+    forget_doc_artifacts(state, kb, &doc)?;
+    Ok(true)
 }
 
 /// 去掉文件开头的 YAML frontmatter(`---` 包起来的块)。
@@ -508,6 +561,9 @@ pub fn backfill_meta(state: &AppState) -> usize {
             Err(_) => continue,
         };
         for doc in docs {
+            if path_has_ignored_component(&doc.rel_path) {
+                continue;
+            }
             if !doc.summary.trim().is_empty() {
                 continue; // 已有摘要,跳过
             }
@@ -557,6 +613,9 @@ pub fn backfill_vectors(state: &AppState) -> (usize, usize) {
     };
     let (mut done, mut failed) = (0usize, 0usize);
     for doc in docs {
+        if path_has_ignored_component(&doc.rel_path) {
+            continue;
+        }
         let Some(kb) = state.config.get_kb(&doc.kb_id) else {
             continue; // KB 已不存在(孤儿应已清,稳妥起见仍跳过)
         };
@@ -570,4 +629,18 @@ pub fn backfill_vectors(state: &AppState) -> (usize, usize) {
         }
     }
     (done, failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_has_ignored_component;
+
+    #[test]
+    fn explicit_ignore_prefix_only() {
+        assert!(path_has_ignored_component("vcs/svn/##!草稿/方案.md"));
+        assert!(path_has_ignored_component("vcs/svn/##！草稿/方案.md"));
+        assert!(path_has_ignored_component("vcs/svn/策划/##!方案.md"));
+        assert!(!path_has_ignored_component("vcs/svn/归档（AI不看）/方案.md"));
+        assert!(!path_has_ignored_component("vcs/svn/策划/方案##!.md"));
+    }
 }

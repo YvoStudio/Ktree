@@ -989,6 +989,8 @@ function renderAiBlock(){
         MCP 只接受 JSON-RPC POST,浏览器 GET 返回 405 属于正常现象。
         常用流程:<code>kb_search</code> → <code>kb_get_doc</code> → <code>kb_list_docs</code>。
         工具路径用 <code>vcs/...</code>,静态直链才带 <code>src/</code> 或 <code>docs/</code>。
+        显式忽略规则:任一路径层级的目录名或文件名以 <code>##!</code> 或 <code>##！</code> 开头时,
+        不自动转换、不加入索引,AI 工具也不会返回。
         其它工具:<code>kb_upload</code> / <code>kb_list_notes</code>。
         旧客户端不支持 HTTP MCP 时,可用 <code>npx -y mcp-remote ${esc(mcpUrl)}</code> 桥接。
         ${isLocal?'<br>当前访问的是 <code>'+esc(location.hostname)+'</code>,给其它机器用时请把 hostname 换成本机 LAN IP。':''}

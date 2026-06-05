@@ -1046,6 +1046,23 @@ fn ingest_vcs_rel_path(
     rel_path: &str,
     report: &mut VcsSyncReport,
 ) {
+    if ingest::path_has_ignored_component(rel_path) {
+        match ingest::forget_path_artifacts(state, kb, rel_path) {
+            Ok(true) => {
+                report.deleted.push(rel_path.to_string());
+                report
+                    .messages
+                    .push(format!("按忽略规则移出索引「{rel_path}」"));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                report.failed.push(rel_path.to_string());
+                report.messages.push(format!("清理忽略文档失败「{rel_path}」: {e}"));
+            }
+        }
+        return;
+    }
+
     let old_doc = state.store.get_by_path(&kb.id, rel_path).ok().flatten();
     let old_md5 = old_doc.as_ref().map(|d| d.md5.as_str());
     match ingest::ingest_file(state, kb, rel_path, "vcs", true, false) {
