@@ -212,6 +212,7 @@ pub fn run() {
             config::set_config,
             commands::get_service_info,
             commands::delete_binding,
+            commands::check_vcs_all,
             commands::get_local_ip,
         ])
         .run(tauri::generate_context!())

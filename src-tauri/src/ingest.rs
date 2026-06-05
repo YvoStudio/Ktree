@@ -74,7 +74,7 @@ pub(crate) fn assets_rel_of(rel_path: &str) -> String {
 }
 
 /// 文本类扩展名:不转换时直接把原文当作可索引正文。
-fn is_textual(ext: &str) -> bool {
+pub(crate) fn is_textual(ext: &str) -> bool {
     matches!(
         ext,
         "md" | "markdown" | "txt" | "html" | "htm" | "json" | "csv" | "log"
@@ -433,15 +433,57 @@ fn strip_frontmatter(s: &str) -> &str {
     s
 }
 
+fn push_unique_path(paths: &mut Vec<String>, rel: &str) {
+    if let Some(rel) = safe_rel_path(rel) {
+        if !paths.iter().any(|p| p == &rel) {
+            paths.push(rel);
+        }
+    }
+}
+
+/// 读取一篇文档的 Markdown/文本全文。优先读 store 里的 md_path;
+/// 若 docs 产物失效、断链、空文件或 Windows 路径异常,回落到同路径 docs 与 src 原文。
+pub(crate) fn read_doc_markdown(kb: &KnowledgeBase, doc: &Document) -> anyhow::Result<String> {
+    let mut paths = Vec::new();
+    if let Some(md) = doc.md_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        push_unique_path(&mut paths, md);
+    }
+    push_unique_path(&mut paths, &format!("docs/{}", doc.rel_path));
+    push_unique_path(&mut paths, &format!("src/{}", doc.rel_path));
+
+    let mut first_error: Option<std::io::Error> = None;
+    for rel in paths {
+        if rel.starts_with("src/") && !is_textual(&doc.ext) {
+            continue;
+        }
+        match fs::read(kb.root.join(&rel)) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                if !text.trim().is_empty() || rel.starts_with("src/") {
+                    return Ok(text);
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+
+    if !is_textual(&doc.ext) {
+        anyhow::bail!("该文档没有可读取的 Markdown 转换结果,请先同步或全库检查补齐 docs");
+    }
+    match first_error {
+        Some(e) => Err(e.into()),
+        None => anyhow::bail!("该文档没有可读文本"),
+    }
+}
+
 /// 读一篇文档的「可索引正文」:优先 docs/ 下的产物,回落到 src 原文,
 /// 去掉 frontmatter,HTML 抽纯文本。读不到(图片等二进制)返回空串。
-fn read_doc_body(kb: &KnowledgeBase, doc: &Document) -> String {
-    let raw = doc
-        .md_path
-        .as_ref()
-        .and_then(|md| fs::read_to_string(kb.root.join(md)).ok())
-        .or_else(|| fs::read_to_string(kb.root.join("src").join(&doc.rel_path)).ok())
-        .unwrap_or_default();
+pub(crate) fn read_doc_body(kb: &KnowledgeBase, doc: &Document) -> String {
+    let raw = read_doc_markdown(kb, doc).unwrap_or_default();
     textproc::clean_body(strip_frontmatter(&raw), &doc.ext)
 }
 

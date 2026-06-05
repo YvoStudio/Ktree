@@ -229,10 +229,8 @@ pub async fn serve(state: AppState) {
         .route("/api/kb", post(add_kb))
         .route("/api/kb/:kb_id/vcs", get(list_kb_vcs).post(add_kb_vcs))
         .route("/api/kb/:kb_id/vcs/sync", post(sync_kb_vcs_all))
-        .route("/api/kb/:kb_id/vcs/check", post(check_kb_vcs_all))
         .route("/api/kb/:kb_id/vcs/:idx", put(update_kb_vcs).delete(remove_kb_vcs))
         .route("/api/kb/:kb_id/vcs/:idx/sync", post(sync_kb_vcs_one))
-        .route("/api/kb/:kb_id/vcs/:idx/check", post(check_kb_vcs_one))
         .route("/api/kb/:kb_id/cloud", get(list_kb_cloud).post(add_kb_cloud))
         .route(
             "/api/kb/:kb_id/cloud/:idx",
@@ -303,7 +301,6 @@ async fn api_info() -> Response {
             "GET/POST /api/kb/:kb_id/vcs  (列出 / 新增 VCS 绑定 → src/vcs/<名>)",
             "PUT/DELETE /api/kb/:kb_id/vcs/:idx  (改 / 删 VCS 绑定)",
             "POST /api/kb/:kb_id/vcs/:idx/sync  (同步一条 VCS 绑定)",
-            "POST /api/kb/:kb_id/vcs/:idx/check (全库检查一条 VCS 绑定)",
             "GET/POST /api/kb/:kb_id/cloud  (列出 / 新增云文档绑定 → src/cloud/<提供方>/<名>)",
             "PUT/DELETE /api/kb/:kb_id/cloud/:idx  (改 / 删云文档绑定)",
             "POST /api/kb/:kb_id/cloud/:idx/sync  (同步一条云文档绑定)"
@@ -1088,15 +1085,13 @@ async fn get_doc_md(
     let Some(doc) = state.store.get_document(id)? else {
         return Ok(not_found("文档不存在"));
     };
-    let Some(md_rel) = doc.md_path else {
-        return Ok(not_found("该文档没有 Markdown 转换结果"));
-    };
     let Some(kb) = state.config.get_kb(&doc.kb_id) else {
         return Ok(not_found("文档所属知识库不存在"));
     };
-    // 用字节读 + lossy,避免非 UTF-8(GBK 等)源文件直接报 5xx。
-    let bytes = tokio::fs::read(kb.root.join(md_rel)).await?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let text = match ingest::read_doc_markdown(&kb, &doc) {
+        Ok(text) => text,
+        Err(e) => return Ok(not_found(&format!("Markdown 读取失败: {e}"))),
+    };
     Ok((
         [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
         text,
@@ -1209,26 +1204,6 @@ async fn sync_kb_vcs_one(
     Ok(json_ok(json!({ "ok": true, "report": report })))
 }
 
-/// 全库检查一个 KB 下指定 idx 的 VCS 绑定。会执行 update/拉取,然后完整比对 src 与 docs/store。
-async fn check_kb_vcs_one(
-    AxState(state): AxState<AppState>,
-    AxPath((kb_id, idx)): AxPath<(String, usize)>,
-) -> Result<Response, ApiError> {
-    let Some(kb) = state.config.get_kb(&kb_id) else {
-        return Ok(not_found("知识库不存在"));
-    };
-    if idx >= kb.vcs_bindings.len() {
-        return Ok(bad_request("VCS 绑定 idx 越界"));
-    }
-    let st = state.clone();
-    let report = tokio::task::spawn_blocking(move || {
-        crate::vcs::check_binding_full_with_record(&st, &kb, idx, "check")
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("VCS 全库检查任务失败: {e}"))??;
-    Ok(json_ok(json!({ "ok": true, "report": report })))
-}
-
 /// 同步一个 KB 下所有 VCS 绑定。逐个执行,失败的塞 errors,不阻塞其它。
 async fn sync_kb_vcs_all(
     AxState(state): AxState<AppState>,
@@ -1246,34 +1221,6 @@ async fn sync_kb_vcs_all(
     })
     .await
     .map_err(|e| anyhow::anyhow!("VCS 同步任务失败: {e}"))?;
-    let mut reports = Vec::new();
-    let mut errors = Vec::new();
-    for (i, r) in outcomes.into_iter().enumerate() {
-        match r {
-            Ok(rep) => reports.push(rep),
-            Err(e) => errors.push(json!({ "idx": i, "error": e.to_string() })),
-        }
-    }
-    Ok(json_ok(json!({ "ok": true, "reports": reports, "errors": errors })))
-}
-
-/// 全库检查一个 KB 下所有 VCS 绑定。逐个执行,失败的塞 errors,不阻塞其它。
-async fn check_kb_vcs_all(
-    AxState(state): AxState<AppState>,
-    AxPath(kb_id): AxPath<String>,
-) -> Result<Response, ApiError> {
-    let Some(kb) = state.config.get_kb(&kb_id) else {
-        return Ok(not_found("知识库不存在"));
-    };
-    if kb.vcs_bindings.is_empty() {
-        return Ok(json_ok(json!({ "ok": true, "reports": [], "errors": [] })));
-    }
-    let st = state.clone();
-    let outcomes = tokio::task::spawn_blocking(move || {
-        crate::vcs::check_kb_all_full_with_record(&st, &kb, "check")
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("VCS 全库检查任务失败: {e}"))?;
     let mut reports = Vec::new();
     let mut errors = Vec::new();
     for (i, r) in outcomes.into_iter().enumerate() {

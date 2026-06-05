@@ -115,7 +115,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "kb_get_doc",
-            "description": "按文档 id 读取全文(优先返回 Markdown 转换结果)。",
+            "description": "按文档 id 读取全文。先用 kb_search 拿 id,再调用本工具;优先返回 Markdown,docs 失效时会回源到 src 文本文件。",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "integer", "description": "文档 id" } },
@@ -124,7 +124,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "kb_list_docs",
-            "description": "列出某个知识库的文档,可选按目录前缀过滤。\n注意:path 是文档 rel_path 的前缀(相对 src/,带区前缀),不要加 \"src/\" 或 \"docs/\"。\n示例:path=\"upload\" 列上传区全部;path=\"vcs/svn/版号申请版本\" 列仓库镜像区该目录下全部。",
+            "description": "列出某个知识库的文档,可选按目录前缀过滤。\n注意:path 是文档 rel_path 的前缀(相对 src/,带区前缀),不要加 \"src/\" 或 \"docs/\";静态直链才使用 /<kb>/src/... 或 /<kb>/docs/...。\n示例:path=\"upload\" 列上传区全部;path=\"vcs/svn/版号申请版本\" 列仓库镜像区该目录下全部。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -381,15 +381,8 @@ async fn tool_get_doc(state: &AppState, args: &Value, base_url: &str) -> anyhow:
         .get_kb(&doc.kb_id)
         .ok_or_else(|| anyhow::anyhow!("文档所属知识库不存在"))?;
 
-    let mut content = if let Some(md) = &doc.md_path {
-        tokio::fs::read_to_string(kb.root.join(md))
-            .await
-            .unwrap_or_default()
-    } else {
-        tokio::fs::read_to_string(kb.root.join("src").join(&doc.rel_path))
-            .await
-            .unwrap_or_else(|_| "(该文档无可读文本,请用 REST GET /api/doc/{id}/raw 下载原件)".to_string())
-    };
+    let mut content = ingest::read_doc_markdown(&kb, &doc)
+        .unwrap_or_else(|_| format!("(该文档暂无可读 Markdown,请用 REST GET /api/doc/{id}/raw 下载原件)"));
 
     // 把 md 里的相对 .assets 资源引用改写成完整 URL,MCP 客户端才能直接显示图片。
     // 转换产物的引用形如 "<文件名去后缀>.assets/img_001.png"(与 md 同目录),

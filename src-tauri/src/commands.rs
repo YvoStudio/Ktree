@@ -3,6 +3,18 @@ use tauri::State;
 
 use crate::state::AppState;
 
+#[derive(Serialize)]
+pub struct VcsCheckError {
+    pub idx: usize,
+    pub error: String,
+}
+
+#[derive(Serialize)]
+pub struct VcsCheckResult {
+    pub reports: Vec<crate::vcs::VcsSyncReport>,
+    pub errors: Vec<VcsCheckError>,
+}
+
 /// 前端 GUI 启动时拉取的服务概况:用 http_port 拼接本机 API 地址(桌面壳跳转用)。
 #[derive(Serialize)]
 pub struct ServiceInfo {
@@ -74,6 +86,37 @@ pub async fn delete_binding(
             .unwrap_or(0)
     };
     Ok(purged as u64)
+}
+
+/// 设置窗口里的手动全库检查:仅通过 Tauri invoke 暴露给本机桌面端。
+#[tauri::command]
+pub async fn check_vcs_all(
+    state: State<'_, AppState>,
+    kb_id: String,
+) -> Result<VcsCheckResult, String> {
+    let st = state.inner().clone();
+    let kb = st
+        .config
+        .get_kb(&kb_id)
+        .ok_or_else(|| "知识库不存在".to_string())?;
+    let outcomes = tokio::task::spawn_blocking(move || {
+        crate::vcs::check_kb_all_full_with_record(&st, &kb, "check")
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut reports = Vec::new();
+    let mut errors = Vec::new();
+    for (idx, outcome) in outcomes.into_iter().enumerate() {
+        match outcome {
+            Ok(report) => reports.push(report),
+            Err(e) => errors.push(VcsCheckError {
+                idx,
+                error: e.to_string(),
+            }),
+        }
+    }
+    Ok(VcsCheckResult { reports, errors })
 }
 
 /// 取本机局域网 IPv4(供设置界面拼接 web 访问地址)。

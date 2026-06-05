@@ -74,12 +74,16 @@
   .vcs-section { margin-top:12px; padding-top:12px; border-top:1px dashed var(--card-line); }
   .vcs-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
   .vcs-title { font-size:13px; color:#555; font-weight:500; }
-  .vcs-head .btn { margin-left:auto; }
+  .vcs-head-actions { margin-left:auto; display:flex; align-items:center; gap:8px; }
   .vcs-row { background:#faf9fc; border:1px solid var(--card-line); border-radius:10px;
     padding:42px 14px 14px; margin-bottom:10px; position:relative; }
   .vcs-del-btn { position:absolute; top:10px; right:12px; }
   .vcs-row .row { margin-bottom:8px; }
   .vcs-row.is-svn .vcs-git-only { display:none; }
+  .vcs-check-report { margin:8px 0 10px; padding:9px 11px; background:#f7f7f8;
+    border:1px solid var(--line); border-radius:8px; color:#555; font-size:12px;
+    line-height:1.55; white-space:pre-wrap; word-break:break-all;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; max-height:260px; overflow:auto; }
 </style>
 </head>
 <body>
@@ -208,8 +212,12 @@ function renderKbs(){
       <div class="vcs-section">
         <div class="vcs-head">
           <span class="vcs-title">仓库绑定(git / svn)→ src/vcs/&lt;名字&gt;/(只读镜像,严格同步)</span>
-          <button class="btn ghost sm" data-act="vcs-add" data-i="${i}">＋ 添加绑定</button>
+          <div class="vcs-head-actions">
+            <button class="btn ghost sm" data-act="vcs-check-kb" data-i="${i}" ${(SAVED_COUNTS[i]?.vcs||0)?'':'disabled'}>全库检查</button>
+            <button class="btn ghost sm" data-act="vcs-add" data-i="${i}">＋ 添加绑定</button>
+          </div>
         </div>
+        <div class="vcs-check-report" data-check-report="${i}" style="display:none"></div>
         <div class="vcs-list">${renderVcsList(kb.vcs_bindings||[], i)}</div>
       </div>
     </div>`).join('') || '<p class="hint" style="margin-bottom:14px">还没有知识库,点下方「添加知识库」。</p>';
@@ -297,6 +305,30 @@ async function apiDeleteBinding(kind, kbId, idx){
   }catch(e){ toast('删除失败:'+e); return false; }
 }
 
+function formatVcsReport(r){
+  if(!r) return '(无报告)';
+  const lines=[
+    `[${r.vcs_type}] ${r.url}${r.repo_sub_path?(' :: '+r.repo_sub_path):''} → src/vcs/${r.name}`,
+    `  修订: ${r.revision||'(空)'}`,
+    `  新增 ${r.added.length}  更新 ${r.updated.length}  删除 ${r.deleted.length}  失败 ${r.failed.length}`,
+  ];
+  ['added','updated','deleted','failed'].forEach(k=>{
+    if(r[k] && r[k].length){
+      lines.push(`  ${k}:`);
+      r[k].slice(0,20).forEach(f=>lines.push('    '+f));
+      if(r[k].length>20) lines.push(`    ... (+${r[k].length-20})`);
+    }
+  });
+  (r.messages||[]).slice(0,10).forEach(m=>lines.push('  '+m));
+  return lines.join('\n');
+}
+function formatVcsReports(reports, errors){
+  if(!reports.length && !errors.length) return '(没有配置 VCS 绑定)';
+  const parts=reports.map(formatVcsReport);
+  errors.forEach(e=>parts.push(`[#${e.idx}] 失败: ${e.error}`));
+  return parts.join('\n\n');
+}
+
 document.getElementById('kbSections').addEventListener('click', async e=>{
   const el = e.target.closest('[data-act]');
   if(!el) return;
@@ -311,6 +343,28 @@ document.getElementById('kbSections').addEventListener('click', async e=>{
     kb.vcs_bindings = kb.vcs_bindings || [];
     kb.vcs_bindings.push({ name:'', vcs_type:'git', url:'', repo_sub_path:'', branch:'', username:'', password:'', sync_interval_minutes:0 });
     renderKbs();
+  } else if(act==='vcs-check-kb'){
+    const ki=+el.dataset.i;
+    collect();
+    const kb=CFG.knowledge_bases[ki];
+    if(!kb || !kb.id){ toast('请先保存知识库配置'); return; }
+    const ok=await confirmDialog('全库检查会先更新仓库,再逐个检查 docs 是否缺失。大仓库可能较久,继续吗?',{okText:'开始检查'});
+    if(!ok) return;
+    const reportBox=document.querySelector(`[data-check-report="${ki}"]`);
+    if(reportBox){ reportBox.style.display='block'; reportBox.textContent='全库检查进行中...'; }
+    const oldText=el.textContent;
+    el.disabled=true; el.textContent='检查中...';
+    try{
+      const r=await invoke('check_vcs_all', { kbId: kb.id });
+      if(reportBox) reportBox.textContent=formatVcsReports(r.reports||[], r.errors||[]);
+      toast('全库检查完成');
+      await loadStatus();
+    }catch(err){
+      if(reportBox) reportBox.textContent='全库检查失败: '+err;
+      toast('全库检查失败:'+err);
+    }finally{
+      el.disabled=false; el.textContent=oldText;
+    }
   } else if(act==='vcs-del'){
     const [ki,bi] = el.dataset.vi.split('-').map(Number);
     collect();

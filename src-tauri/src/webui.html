@@ -933,7 +933,7 @@ function renderAiBlock(){
     mcpServers:{ ktree:{ type:'http', url:mcpUrl } }
   }, null, 2);
   const codexCfg=`[mcp_servers.ktree]\nurl = "${mcpUrl}"`;
-  const restSample=`curl "${restBase}/search?q=关键字&limit=10"`;
+  const restSample=`curl "${restBase}/search?q=关键字&limit=10"\ncurl "${restBase}/doc/136/md"`;
   return `
     <div class="ops-ai-block">
       <div class="ops-ai-intro">
@@ -986,8 +986,10 @@ function renderAiBlock(){
         <code class="ops-ai-cmd-body">${esc(restSample)}</code>
       </div>
       <div class="ops-ai-hint">
-        MCP 工具:<code>kb_search</code> / <code>kb_get_doc</code> / <code>kb_list_docs</code> /
-        <code>kb_upload</code> / <code>kb_list_notes</code>。
+        MCP 只接受 JSON-RPC POST,浏览器 GET 返回 405 属于正常现象。
+        常用流程:<code>kb_search</code> → <code>kb_get_doc</code> → <code>kb_list_docs</code>。
+        工具路径用 <code>vcs/...</code>,静态直链才带 <code>src/</code> 或 <code>docs/</code>。
+        其它工具:<code>kb_upload</code> / <code>kb_list_notes</code>。
         旧客户端不支持 HTTP MCP 时,可用 <code>npx -y mcp-remote ${esc(mcpUrl)}</code> 桥接。
         ${isLocal?'<br>当前访问的是 <code>'+esc(location.hostname)+'</code>,给其它机器用时请把 hostname 换成本机 LAN IP。':''}
       </div>
@@ -1017,7 +1019,6 @@ async function renderOpsList(host){
       </div>
       <div class="ops-actions">
         <button class="btn ghost" data-act="vcs-all">同步全部仓库</button>
-        <button class="btn ghost" data-act="vcs-check-all">全库检查</button>
         <span class="hint" style="align-self:center">绑定的添加 / 删除请在桌面端「Ktree → 设置」中配置</span>
       </div>
       <div class="vcs-list" data-vcs-host="1"><div class="ops-empty">加载仓库绑定…</div></div>
@@ -1047,7 +1048,6 @@ async function renderOpsList(host){
               </div>
               <div style="display:flex;gap:8px;flex-shrink:0">
                 <button class="btn ghost sm" data-act="vcs-one" ${b.syncing?'disabled':''}>${b.syncing?'同步中…':'同步'}</button>
-                <button class="btn ghost sm" data-act="vcs-check-one" ${b.syncing?'disabled':''}>全库检查</button>
               </div>
             </div>
             <div class="vcs-last">${renderVcsLast(b.last_sync, b.sync_interval_minutes, b.syncing)}</div>`;
@@ -1056,15 +1056,6 @@ async function renderOpsList(host){
             // 不 await 到底 —— 大仓库同步可能要几十分钟,连接断了服务端也会继续跑;
             // 完成与否靠下方轮询刷新状态。
             api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/${b.idx}/sync`,{method:'POST'})
-              .then(rr=>{ if(rr&&rr.report){ show(formatVcsReport(rr.report)); } reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm(rr&&rr.report?[rr.report]:[]); })
-              .catch(()=>{});
-            reloadVcs(); startSyncPolling();
-          });
-          row.querySelector('[data-act="vcs-check-one"]').addEventListener('click',async ()=>{
-            const ok=await confirmDialog('全库检查会遍历整个仓库并补齐缺失 docs,大仓库会比较久。继续吗?',{okText:'开始检查'});
-            if(!ok) return;
-            show(`全库检查 ${b.vcs_type}: ${b.url} …(可关闭此窗口,后台会继续)`);
-            api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/${b.idx}/check`,{method:'POST'})
               .then(rr=>{ if(rr&&rr.report){ show(formatVcsReport(rr.report)); } reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm(rr&&rr.report?[rr.report]:[]); })
               .catch(()=>{});
             reloadVcs(); startSyncPolling();
@@ -1094,15 +1085,6 @@ async function renderOpsList(host){
     block.querySelector('[data-act="vcs-all"]').addEventListener('click',()=>{
       show('同步所有仓库绑定…(增量更新,可关闭此窗口,后台会继续)');
       api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/sync`,{method:'POST'})
-        .then(r=>{ if(r) show(formatVcsReports(r.reports||[], r.errors||[])); reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm((r&&r.reports)||[]); })
-        .catch(()=>{});
-      reloadVcs(); startSyncPolling();
-    });
-    block.querySelector('[data-act="vcs-check-all"]').addEventListener('click',async ()=>{
-      const ok=await confirmDialog('全库检查会遍历此知识库的所有仓库绑定并补齐缺失 docs,大仓库会比较久。继续吗?',{okText:'开始检查'});
-      if(!ok) return;
-      show('全库检查所有仓库绑定…(可关闭此窗口,后台会继续)');
-      api(`/api/kb/${encodeURIComponent(kb.id)}/vcs/check`,{method:'POST'})
         .then(r=>{ if(r) show(formatVcsReports(r.reports||[], r.errors||[])); reloadVcs(); loadKbs(); refreshVcsTimes(kb.id); afterSyncConfirm((r&&r.reports)||[]); })
         .catch(()=>{});
       reloadVcs(); startSyncPolling();
