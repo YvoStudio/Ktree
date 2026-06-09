@@ -26,6 +26,7 @@
   .brand { padding:14px 18px 8px; font-size:18px; font-weight:600; color:#111;
     letter-spacing:-.01em; display:flex; align-items:center; gap:9px; }
   .brand img { width:26px; height:26px; flex-shrink:0; }
+  .brand-ver { font-size:11px; font-weight:500; color:var(--muted); letter-spacing:0; align-self:flex-end; padding-bottom:3px; }
   .brand-ops { margin-left:auto; width:28px; height:28px; border:none; background:transparent;
     color:#888; cursor:pointer; border-radius:6px; font-size:18px; font-weight:700;
     line-height:1; padding:0; display:flex; align-items:center; justify-content:center;
@@ -455,7 +456,7 @@
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="brand"><img src="/favicon.svg" alt="" />Ktree
+    <div class="brand"><img src="/favicon.svg" alt="" />Ktree<span class="brand-ver" id="brandVer"></span>
       <button class="brand-ops" id="btnOps" title="操作…">⋮</button>
     </div>
     <div class="nav-fav" id="navNotes">
@@ -1190,7 +1191,7 @@ function formatVcsReports(reports,errors){
 async function boot(){
   updateFavCount();
   // 拉自定义域名:复制地址会优先用它替代 location.origin
-  try { CUSTOM_DOMAIN=(await api('/api/env')).custom_domain||''; } catch(e){ CUSTOM_DOMAIN=''; }
+  try { const env=await api('/api/env'); CUSTOM_DOMAIN=env.custom_domain||''; if(env.version){ const bv=document.getElementById('brandVer'); if(bv) bv.textContent='v'+env.version; } } catch(e){ CUSTOM_DOMAIN=''; }
   restoreTreeState(); // 刷新后恢复折叠 / 展开 / 当前目录
   await loadKbs();
   // web 链接直达:记事板 / 某条公共记事 / 某个目录 / 操作弹窗

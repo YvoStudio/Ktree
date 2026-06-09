@@ -285,6 +285,7 @@ async fn api_env(AxState(state): AxState<AppState>) -> Response {
         "ok": true,
         "custom_domain": crate::commands::normalize_custom_domain(&cfg.custom_domain),
         "http_port": *state.http_port.lock().unwrap(),
+        "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 

@@ -23,6 +23,8 @@ pub struct ServiceInfo {
     pub documents: i64,
     /// 用户在「全局 → 自定义域名」里填的值(已规范化)。空 = 未启用。
     pub custom_domain: String,
+    /// 当前软件版本号(来自 Cargo.toml,即 env!("CARGO_PKG_VERSION"))。
+    pub app_version: &'static str,
 }
 
 #[tauri::command]
@@ -48,6 +50,7 @@ pub fn get_service_info(state: State<'_, AppState>) -> ServiceInfo {
         knowledge_bases: cfg.knowledge_bases.len(),
         documents,
         custom_domain: normalize_custom_domain(&cfg.custom_domain),
+        app_version: env!("CARGO_PKG_VERSION"),
     }
 }
 

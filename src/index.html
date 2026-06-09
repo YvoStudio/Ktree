@@ -95,6 +95,7 @@
     <span><span class="dot off" id="stDot"></span>服务 <b id="stPort">—</b></span>
     <span>知识库 <b id="stKbs">0</b></span>
     <span>文档 <b id="stDocs">0</b></span>
+    <span>版本 <b id="stVer">—</b></span>
     <span class="web">web 界面:<code id="stWeb">—</code></span>
   </div>
 
@@ -160,6 +161,7 @@ async function loadStatus(){
     document.getElementById('stPort').textContent = port ? (':'+port) : '启动中…';
     document.getElementById('stKbs').textContent = info.knowledge_bases;
     document.getElementById('stDocs').textContent = info.documents;
+    document.getElementById('stVer').textContent = info.app_version ? ('v'+info.app_version) : '—';
     // 自定义域名优先;否则 IP:port。后端已规范化了 scheme + 末尾斜杠。
     let webUrl = '—';
     if(info.custom_domain) webUrl = info.custom_domain;
