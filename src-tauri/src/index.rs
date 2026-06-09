@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED,
     STORED, STRING,
@@ -144,11 +144,37 @@ impl SearchIndex {
             return Ok(Vec::new());
         }
 
-        // 不设 conjunction:中文 jieba 分词后用 OR + BM25 排序,避免某个子词(如单字)
-        // 不在索引里导致整体查询失败,相关性由打分保证。
-        let parser =
-            QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
-        let (user_query, _errors) = parser.parse_query_lenient(trimmed);
+        // 中文 jieba 分词后逐词做 OR(任一词命中即可,相关度交给 BM25 打分)。
+        //
+        // 不能把整串直接交给 QueryParser:tantivy 会把"分词出的多个词元"编译成
+        // 必须相邻的 PhraseQuery(本索引带 positions),于是"配置表规范"匹配不到
+        // "配置表生成规范"(中间隔着"生成")。这里手动把每个词元拆成 Should 词项查询,
+        // 绕开短语相邻约束,回到真正的 OR 语义。
+        let mut analyzer = self
+            .index
+            .tokenizers()
+            .get(JIEBA)
+            .expect("jieba tokenizer registered at open()");
+        let mut token_stream = analyzer.token_stream(trimmed);
+        let mut seen = std::collections::HashSet::new();
+        let mut term_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        token_stream.process(&mut |token| {
+            if !seen.insert(token.text.clone()) {
+                return; // 同一词元只加一次,避免重复计分
+            }
+            for field in [self.fields.title, self.fields.body] {
+                let term = Term::from_field_text(field, &token.text);
+                term_clauses.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+                ));
+            }
+        });
+
+        if term_clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let user_query: Box<dyn Query> = Box::new(BooleanQuery::new(term_clauses));
 
         let final_query: Box<dyn Query> = match kb_id.filter(|k| !k.is_empty()) {
             Some(kb) => {
@@ -190,4 +216,61 @@ fn get_str(doc: &TantivyDocument, field: Field) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 给每个测试一个独立的临时索引目录(无需 tempfile 依赖)。
+    fn temp_index() -> (SearchIndex, std::path::PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ktree_idx_{}_{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        let index = SearchIndex::open(&dir).unwrap();
+        (index, dir)
+    }
+
+    /// 回归:查询词在标题里"不连续"(中间隔着别的词)时也应命中。
+    /// 历史 bug:整串交给 QueryParser 被编译成相邻短语,"配置表规范"搜不到
+    /// "配置表生成规范"。
+    #[test]
+    fn non_contiguous_query_matches() {
+        let (index, dir) = temp_index();
+        index
+            .add_or_update("吃播", 1, "配置表生成规范", "未分类", "配置表定义规则", "")
+            .unwrap();
+        index.commit().unwrap();
+        index.reader.reload().unwrap(); // OnCommitWithDelay:单测里需手动刷新可见性
+
+        let hits = index.search(Some("吃播"), "配置表规范", 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.doc_id == 1),
+            "「配置表规范」应命中「配置表生成规范」,实际: {:?}",
+            hits.iter().map(|h| &h.title).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 完全不相关的查询不应误命中。
+    #[test]
+    fn unrelated_query_misses() {
+        let (index, dir) = temp_index();
+        index
+            .add_or_update("吃播", 1, "配置表生成规范", "未分类", "配置表定义规则", "")
+            .unwrap();
+        index.commit().unwrap();
+        index.reader.reload().unwrap(); // OnCommitWithDelay:单测里需手动刷新可见性
+
+        let hits = index.search(Some("吃播"), "战斗数值公式", 10).unwrap();
+        assert!(
+            !hits.iter().any(|h| h.doc_id == 1),
+            "无关查询不应命中"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
