@@ -1,6 +1,6 @@
 {
   "name": "ktree",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "private": true,
   "description": "Ktree — 跨平台知识库服务:文档上传、转换、全文索引、REST/MCP 接口",
   "scripts": {
