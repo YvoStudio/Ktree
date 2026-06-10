@@ -1166,7 +1166,9 @@ fn count_docs_primary(kb_root: &Path, prefix: &str) -> usize {
                     continue; // 图片附件目录整体不计入主产物
                 }
                 walk(&e.path(), n);
-            } else if ft.is_file() {
+            } else if ft.is_file() || ft.is_symlink() {
+                // mirror_into_docs 对文本/不转换文件建的是符号链接(Windows 管理员 / unix),
+                // read_dir 下 symlink 既非 is_file 也非 is_dir,必须显式计入,否则少数。
                 *n += 1;
             }
         }
@@ -1396,6 +1398,15 @@ mod tests {
         std::fs::write(base.join("报告.assets/img2.png"), "x").unwrap();
 
         assert_eq!(count_docs_primary(&root, prefix), 3);
+
+        // mirror_into_docs 对文本文件建的是符号链接,也必须计入(否则在 dev1 上少数)
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../../../src/vcs/demo/note.md", base.join("linked.md"))
+                .unwrap();
+            assert_eq!(count_docs_primary(&root, prefix), 4, "符号链接镜像应计入主产物");
+        }
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
