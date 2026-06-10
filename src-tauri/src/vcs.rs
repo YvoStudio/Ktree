@@ -1142,6 +1142,40 @@ fn reconcile_incremental(
     Ok(())
 }
 
+/// src 镜像里会被入库的文件数:盘上文件(已严格镜像)排除忽略规则后的数量。
+fn count_src_ingestable(target: &Path, prefix: &str) -> usize {
+    list_repo_files(target)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| !ingest::path_has_ignored_component(&format!("{prefix}/{r}")))
+        .count()
+}
+
+/// docs/<prefix> 下「主产物」文件数:递归计文件,但跳过 `*.assets` 目录(转换出的图片附件)。
+/// 每个非忽略 src 文件恰好对应一个主产物,故正常时应与 [`count_src_ingestable`] 相等;
+/// 不等 = 有文件镜像了却没入库,或 docs 的 md 产物缺失。
+fn count_docs_primary(kb_root: &Path, prefix: &str) -> usize {
+    fn walk(dir: &Path, n: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if e.file_name().to_string_lossy().ends_with(".assets") {
+                    continue; // 图片附件目录整体不计入主产物
+                }
+                walk(&e.path(), n);
+            } else if ft.is_file() {
+                *n += 1;
+            }
+        }
+    }
+    let mut n = 0;
+    walk(&kb_root.join("docs").join(prefix), &mut n);
+    n
+}
+
 /// 对一个绑定执行一次同步:拉取/更新(严格镜像)→ diff store → 入库 / 删除。
 /// 阻塞调用,放在 spawn_blocking 里跑。
 fn sync_binding_inner(
@@ -1192,25 +1226,33 @@ fn sync_binding_inner(
                     .messages
                     .push("手动全库检查:比对 src 与 docs/store".to_string());
                 reconcile_full(state, kb, &target, &prefix, &mut report)?;
-            } else if changed.is_empty() && deleted.is_empty() {
-                report
-                    .messages
-                    .push("SVN 未返回文件变更,跳过入库检查".to_string());
             } else {
-                report.messages.push(format!(
-                    "SVN 增量对账:变更 {} 项,删除 {} 项",
-                    changed.len(),
-                    deleted.len()
-                ));
-                reconcile_incremental(
-                    state,
-                    kb,
-                    &target,
-                    &prefix,
-                    &changed,
-                    &deleted,
-                    &mut report,
-                )?;
+                // 先按 SVN 报告做增量入库
+                if changed.is_empty() && deleted.is_empty() {
+                    report
+                        .messages
+                        .push("SVN 未返回文件变更".to_string());
+                } else {
+                    report.messages.push(format!(
+                        "SVN 增量对账:变更 {} 项,删除 {} 项",
+                        changed.len(),
+                        deleted.len()
+                    ));
+                    reconcile_incremental(
+                        state, kb, &target, &prefix, &changed, &deleted, &mut report,
+                    )?;
+                }
+                // 兜底核对:不信任 SVN 增量报告是否完整 —— 盘上 src 文件数 ≠ docs 主产物数
+                // 就一定有遗漏(增量漏报、首轮边界、docs 产物被删等),补一次全库对账。
+                // 常态只数两次文件(零开销);不等才走重活,且 reconcile_full 幂等。
+                let src_n = count_src_ingestable(&target, &prefix);
+                let docs_n = count_docs_primary(&kb.root, &prefix);
+                if src_n != docs_n {
+                    report.messages.push(format!(
+                        "镜像核对不一致(src {src_n} ≠ docs {docs_n}),触发全库对账补漏"
+                    ));
+                    reconcile_full(state, kb, &target, &prefix, &mut report)?;
+                }
             }
         }
     }
@@ -1324,4 +1366,36 @@ pub fn check_kb_all_full_with_record(
     (0..kb.vcs_bindings.len())
         .map(|i| check_binding_full_with_record(state, kb, i, source))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp_dir() -> std::path::PathBuf {
+        static C: AtomicU64 = AtomicU64::new(0);
+        let n = C.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("ktree_vcs_{}_{}", std::process::id(), n))
+    }
+
+    /// docs 主产物计数:递归计 .md / 镜像文件,但 `*.assets` 目录里的图片附件不计。
+    #[test]
+    fn docs_primary_count_excludes_assets() {
+        let root = tmp_dir();
+        let prefix = "vcs/demo";
+        let base = root.join("docs").join(prefix);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::create_dir_all(base.join("报告.assets")).unwrap();
+        // 主产物 3 个(含子目录里的)
+        std::fs::write(base.join("报告.md"), "x").unwrap();
+        std::fs::write(base.join("monster.md"), "x").unwrap();
+        std::fs::write(base.join("sub/note.md"), "x").unwrap();
+        // .assets 内的图片附件:不应计入
+        std::fs::write(base.join("报告.assets/img1.png"), "x").unwrap();
+        std::fs::write(base.join("报告.assets/img2.png"), "x").unwrap();
+
+        assert_eq!(count_docs_primary(&root, prefix), 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
