@@ -17,9 +17,9 @@ jobs:
           - platform: 'macos-14'
             args: '--target aarch64-apple-darwin'
             label: 'macos-arm64'
-          - platform: 'macos-13'
-            args: '--target x86_64-apple-darwin'
-            label: 'macos-x64'
+          # macOS Intel(x64)暂不构建:ort 不提供 x86_64-darwin 交叉编译预编译库,
+          # 而 GitHub 的原生 Intel runner(macos-13)已基本无机可派、会无限排队。
+          # 需要时改 ort 为 load-dynamic 在 arm64 上交叉编,或用付费 Intel runner。
           - platform: 'ubuntu-24.04'
             args: ''
             label: 'linux'
@@ -41,7 +41,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.label == 'macos-arm64' && 'aarch64-apple-darwin' || (matrix.label == 'macos-x64' && 'x86_64-apple-darwin' || '') }}
+          targets: ${{ matrix.label == 'macos-arm64' && 'aarch64-apple-darwin' || '' }}
 
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
