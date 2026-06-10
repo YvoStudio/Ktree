@@ -17,10 +17,10 @@ jobs:
           - platform: 'macos-14'
             args: '--target aarch64-apple-darwin'
             label: 'macos-arm64'
-          - platform: 'macos-14'
+          - platform: 'macos-13'
             args: '--target x86_64-apple-darwin'
             label: 'macos-x64'
-          - platform: 'ubuntu-22.04'
+          - platform: 'ubuntu-24.04'
             args: ''
             label: 'linux'
           - platform: 'windows-latest'
@@ -41,7 +41,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.label == 'macos-arm64' && 'aarch64-apple-darwin' || (matrix.label == 'macos-x64' && 'x86_64-apple-darwin' || '') }}
 
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
@@ -50,7 +50,7 @@ jobs:
           key: ${{ matrix.label }}
 
       - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
