@@ -14,7 +14,13 @@ const path = require('path');
 const readline = require('readline');
 
 const MODEL = 'Xenova/bge-small-zh-v1.5';
-const CACHE_DIR = path.join(__dirname, 'models');
+
+// 模型目录定位:
+// - 打包后:由启动器(embed.exe)经 KTREE_MODEL_DIR 显式传入随包 models 的绝对路径
+//   (不能靠 process.pkg / execPath —— pkg 启动器 spawn 的子进程里这俩会指向启动器自身)。
+// - 开发期:无该环境变量,用 sidecar/models(__dirname)。
+const MODEL_DIR = process.env.KTREE_MODEL_DIR || path.join(__dirname, 'models');
+const OFFLINE = !!process.env.KTREE_MODEL_DIR; // 打包态纯离线,只用随包模型
 
 let extractorPromise = null;
 
@@ -23,8 +29,13 @@ async function getExtractor() {
   if (!extractorPromise) {
     extractorPromise = (async () => {
       const { pipeline, env } = await import('@xenova/transformers');
-      env.cacheDir = CACHE_DIR; // 模型缓存目录,首次下载后离线复用
-      env.allowRemoteModels = true; // 允许首次联网下载
+      // localModelPath 是「本地模型根目录」(从这里按 <root>/<modelId> 找);
+      // cacheDir 是远程下载缓存。模型在 <MODEL_DIR>/Xenova/bge-small-zh-v1.5,
+      // 两者都指向 MODEL_DIR,本地优先、命中即用。
+      env.localModelPath = MODEL_DIR;
+      env.cacheDir = MODEL_DIR;
+      env.allowLocalModels = true;
+      env.allowRemoteModels = !OFFLINE;
       return pipeline('feature-extraction', MODEL, { quantized: true });
     })();
   }
