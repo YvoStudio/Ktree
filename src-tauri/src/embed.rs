@@ -1,44 +1,35 @@
-//! 语义向量嵌入客户端 —— 驱动常驻的 Node `embed.js` sidecar。
+//! 语义向量嵌入 —— 进程内 ONNX 推理(ort + tokenizers),加载 bge-small-zh-v1.5。
 //!
-//! sidecar 启动一次、模型加载一次,之后请求-应答复用。本客户端懒启动子进程,
-//! 进程崩了下次调用自动重启。所有调用阻塞,放 `spawn_blocking` 里跑。
+//! 不再依赖 Node sidecar:模型(量化 ONNX + tokenizer.json)随发行版分发,
+//! onnxruntime 由 `ort` crate 按目标平台处理。模型懒加载一次后复用。
+//! 所有调用阻塞,放 `spawn_blocking` 里跑。
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
-use serde::Deserialize;
+use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::value::Tensor;
+use tokenizers::Tokenizer;
 
 /// bge 检索惯例:查询向量加这个指令前缀,文档向量不加。
 pub const QUERY_INSTRUCTION: &str = "为这个句子生成表示以用于检索相关文章:";
 
-#[derive(Deserialize)]
-struct EmbedResponse {
-    ok: bool,
-    #[serde(default)]
-    vectors: Vec<Vec<f32>>,
-    #[serde(default)]
-    error: String,
+/// bge-small 最大序列长度。
+const MAX_LEN: usize = 512;
+
+/// ort 的错误类型带非 Send 的上下文,无法直接 `?` 进 anyhow;统一转成字符串型错误。
+fn oe<E: std::fmt::Display>(e: E) -> anyhow::Error {
+    anyhow::anyhow!("onnx: {e}")
 }
 
-/// 持有常驻 sidecar 子进程及其 stdin/stdout 管道。
-struct EmbedProc {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+struct Model {
+    tokenizer: Tokenizer,
+    session: Session,
 }
 
-impl Drop for EmbedProc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// 常驻 embed sidecar 的客户端。
+/// 进程内嵌入器。模型懒加载(首个请求触发)。
 pub struct Embedder {
-    proc: Mutex<Option<EmbedProc>>,
+    model: Mutex<Option<Model>>,
 }
 
 impl Default for Embedder {
@@ -50,112 +41,146 @@ impl Default for Embedder {
 impl Embedder {
     pub fn new() -> Self {
         Self {
-            proc: Mutex::new(None),
+            model: Mutex::new(None),
         }
     }
 
-    /// 开发期:`node <project>/sidecar/embed.js`;打包后:同目录的 `embed` 二进制。
-    fn sidecar_command() -> (String, Vec<String>) {
-        #[cfg(debug_assertions)]
-        {
-            let script: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .map(|p| p.join("sidecar").join("embed.js"))
-                .unwrap_or_else(|| PathBuf::from("sidecar/embed.js"));
-            (
-                "node".to_string(),
-                vec![script.to_string_lossy().into_owned()],
-            )
+    /// 模型目录(内含 tokenizer.json 与 onnx/model_quantized.onnx)。
+    /// 优先 KTREE_MODEL_DIR(打包态由 lib.rs 按 Tauri 资源目录设置);
+    /// 否则开发期用源码树里的 src-tauri/resources/embed-model。
+    fn model_dir() -> PathBuf {
+        if let Ok(d) = std::env::var("KTREE_MODEL_DIR") {
+            if !d.is_empty() {
+                return PathBuf::from(d);
+            }
         }
-        #[cfg(not(debug_assertions))]
-        {
-            let bin = crate::convert::sidecar_binary_path("embed");
-            (bin.to_string_lossy().into_owned(), Vec::new())
-        }
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/embed-model")
     }
 
-    fn spawn() -> anyhow::Result<EmbedProc> {
-        let (program, args) = Self::sidecar_command();
-        let mut cmd = crate::convert::sidecar_process(&program);
-        let mut child = cmd
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null()) // 模型加载 / 下载日志不要污染
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("启动 embed sidecar 失败({program}): {e}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("无法获取 embed stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("无法获取 embed stdout"))?;
-        Ok(EmbedProc {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        })
+    fn load() -> anyhow::Result<Model> {
+        let dir = Self::model_dir();
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| anyhow::anyhow!("加载 tokenizer 失败({}): {e}", dir.display()))?;
+        let session = Session::builder()
+            .map_err(oe)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(oe)?
+            .commit_from_file(dir.join("onnx/model_quantized.onnx"))
+            .map_err(oe)?;
+        Ok(Model { tokenizer, session })
     }
 
-    /// 把一批文本编码成向量。`instruction` 非空时前置到每条文本(查询用)。
-    /// 阻塞调用 —— 放 `spawn_blocking` 里跑。
+    /// 把一批文本编码成单位长度句向量(CLS pooling + L2 归一化)。
+    /// `instruction` 非空时前置到每条文本(查询用)。阻塞调用。
     pub fn embed(&self, texts: &[String], instruction: &str) -> anyhow::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let req = serde_json::to_string(&serde_json::json!({
-            "texts": texts,
-            "instruction": instruction,
-        }))?;
 
-        let mut guard = self.proc.lock().unwrap();
-        let mut last_err = None;
-        // 试一次;管道坏了就重启再试一次。
-        for _ in 0..2 {
-            if guard.is_none() {
-                match Self::spawn() {
-                    Ok(p) => *guard = Some(p),
-                    Err(e) => {
-                        last_err = Some(e);
-                        continue;
-                    }
-                }
-            }
-            match Self::round_trip(guard.as_mut().unwrap(), &req) {
-                Ok(resp) => {
-                    if !resp.ok {
-                        anyhow::bail!("embed sidecar 报错: {}", resp.error);
-                    }
-                    if resp.vectors.len() != texts.len() {
-                        anyhow::bail!(
-                            "embed 返回向量数 {} 与文本数 {} 不符",
-                            resp.vectors.len(),
-                            texts.len()
-                        );
-                    }
-                    return Ok(resp.vectors);
-                }
-                Err(e) => {
-                    *guard = None; // 丢弃坏进程,下轮重启
-                    last_err = Some(e);
-                }
+        let mut guard = self.model.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(Self::load()?);
+        }
+        let model = guard.as_mut().unwrap();
+
+        let inputs: Vec<String> = if instruction.is_empty() {
+            texts.to_vec()
+        } else {
+            texts.iter().map(|t| format!("{instruction}{t}")).collect()
+        };
+        let encs = model
+            .tokenizer
+            .encode_batch(inputs, true)
+            .map_err(|e| anyhow::anyhow!("分词失败: {e}"))?;
+
+        let batch = encs.len();
+        let seq = encs
+            .iter()
+            .map(|e| e.get_ids().len().min(MAX_LEN))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+
+        // 行优先填充到 [batch, seq],右侧 pad 0,attention_mask 标真实 token。
+        let mut ids = vec![0i64; batch * seq];
+        let mut mask = vec![0i64; batch * seq];
+        let types = vec![0i64; batch * seq]; // 单句:token_type 全 0
+        for (b, e) in encs.iter().enumerate() {
+            let eids = e.get_ids();
+            let emask = e.get_attention_mask();
+            let n = eids.len().min(seq);
+            for j in 0..n {
+                ids[b * seq + j] = eids[j] as i64;
+                mask[b * seq + j] = emask[j] as i64;
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("embed 调用失败")))
+
+        let shape = [batch, seq];
+        let t_ids = Tensor::from_array((shape, ids)).map_err(oe)?;
+        let t_mask = Tensor::from_array((shape, mask)).map_err(oe)?;
+        let t_types = Tensor::from_array((shape, types)).map_err(oe)?;
+        let outputs = model
+            .session
+            .run(ort::inputs![
+                "input_ids" => t_ids,
+                "attention_mask" => t_mask,
+                "token_type_ids" => t_types,
+            ])
+            .map_err(oe)?;
+
+        let (oshape, data) = outputs["last_hidden_state"]
+            .try_extract_tensor::<f32>()
+            .map_err(oe)?;
+        // last_hidden_state: [batch, seq, hidden]
+        let hidden = *oshape.last().unwrap() as usize;
+
+        let mut out = Vec::with_capacity(batch);
+        for b in 0..batch {
+            // CLS pooling:取第 0 个 token 的隐藏向量
+            let base = b * seq * hidden;
+            let mut v: Vec<f32> = data[base..base + hidden].to_vec();
+            // L2 归一化 → 单位向量,cosine 相似度即点积
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in &mut v {
+                    *x /= norm;
+                }
+            }
+            out.push(v);
+        }
+        Ok(out)
     }
+}
 
-    /// 一次请求-应答:发一行 JSON,收一行 JSON。
-    fn round_trip(proc: &mut EmbedProc, req: &str) -> anyhow::Result<EmbedResponse> {
-        proc.stdin.write_all(req.as_bytes())?;
-        proc.stdin.write_all(b"\n")?;
-        proc.stdin.flush()?;
-        let mut line = String::new();
-        let n = proc.stdout.read_line(&mut line)?;
-        if n == 0 {
-            anyhow::bail!("embed sidecar 关闭了输出(可能启动失败)");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 嵌入维度与归一化正确,且与 transformers.js 参考向量一致(同模型应几乎相同)。
+    #[test]
+    fn embed_matches_reference() {
+        let e = Embedder::new();
+        let v = e.embed(&["配置表规范".to_string()], "").unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].len(), 512, "bge-small 应为 512 维");
+        // 单位向量
+        let norm: f32 = v[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "应为单位向量,实际 {norm}");
+        // 与 transformers.js 对同一文本的输出前几维对比(CLS pooling + normalize)
+        let reference = [
+            -0.0210349652916193f32,
+            0.018730543553829193,
+            0.0018874045927077532,
+            0.024844670668244362,
+            -0.00011936538066947833,
+        ];
+        for (i, r) in reference.iter().enumerate() {
+            assert!(
+                (v[0][i] - r).abs() < 0.02,
+                "第 {i} 维偏差过大: rust={} ref={}",
+                v[0][i],
+                r
+            );
         }
-        Ok(serde_json::from_str(line.trim())?)
     }
 }

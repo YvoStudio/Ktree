@@ -29,6 +29,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tantivy = "0.22"
 tantivy-jieba = "0.11.0"
 jieba-rs = "0.7"
+# 语义向量:进程内 ONNX 推理(bge-small-zh-v1.5),替代 Node embed sidecar。
+ort = "=2.0.0-rc.12"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 axum = { version = "0.7", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tokio = { version = "1", features = ["full"] }

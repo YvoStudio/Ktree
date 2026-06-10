@@ -62,6 +62,15 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // 告知嵌入器随包模型目录(Tauri 资源:resources/embed-model)。
+            // 开发期无需设置,embed.rs 回退到源码树 resources/embed-model。
+            if let Ok(res) = app.path().resource_dir() {
+                let md = res.join("resources").join("embed-model");
+                if md.join("tokenizer.json").exists() {
+                    std::env::set_var("KTREE_MODEL_DIR", md);
+                }
+            }
+
             // 配置与存储层
             let data_dir = app
                 .path()
