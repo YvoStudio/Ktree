@@ -135,6 +135,10 @@
   .note-ic svg { width:13px; height:13px; }
   .note-act.on { color:#5b21b6; }
   .note-card.pinned { border-color:#d8c9ee; }
+  /* 拖拽排序:被拖的卡片半透明,卡片显示可抓取光标 */
+  .note-card.dragging { opacity:.4; }
+  .notes-list.dnd-on .note-card { cursor:grab; }
+  .notes-list.dnd-on .note-card:active { cursor:grabbing; }
   @keyframes noteSelPulse {
     0%   { box-shadow:0 0 0 3px rgba(91,33,182,.85), 0 0 0 7px rgba(91,33,182,.4),  0 6px 18px rgba(91,33,182,.3); }
     70%  { box-shadow:0 0 0 3px rgba(91,33,182,.7),  0 0 0 22px rgba(91,33,182,0),  0 6px 18px rgba(91,33,182,.22); }
@@ -1728,6 +1732,7 @@ function showNotes(focusId){
       <div class="notes-section"><h4>本地记事</h4><div id="notesLocal" class="notes-list"></div></div>
     </div>`;
   bindNoteForm();
+  bindNoteDnD();
   loadNotes();
   if(NOTE_SELECTED) armClearNoteSelection();
 }
@@ -1865,6 +1870,89 @@ function findNote(id, scope){
   return arr.find(n=>String(n.id)===String(id));
 }
 
+// ---------- 记事卡片拖拽排序 ----------
+// 整卡可拖;置顶项始终浮在最上,拖拽只在「置顶组内」「非置顶组内」分别调换。
+// 公共记事顺序存后端(/api/notes/reorder,所有人共享);本地记事存 localStorage。
+let DRAG_CARD = null;   // 正在拖动的 .note-card
+let DRAG_SCOPE = null;  // 'public' | 'local',限制只能在同一区内拖
+
+function bindNoteDnD(){
+  bindOneNoteList(document.getElementById('notesPublic'), 'public');
+  bindOneNoteList(document.getElementById('notesLocal'), 'local');
+}
+
+function bindOneNoteList(box, scope){
+  if(!box) return;
+  box.classList.add('dnd-on');
+  box.addEventListener('dragstart', e=>{
+    const card=e.target.closest('.note-card');
+    // 不是卡片、或从操作按钮上按下 → 不发起拖拽(避免误拖)
+    if(!card || e.target.closest('.note-act')){ e.preventDefault(); return; }
+    DRAG_CARD=card; DRAG_SCOPE=scope;
+    e.dataTransfer.effectAllowed='move';
+    try{ e.dataTransfer.setData('text/plain', card.dataset.id||''); }catch(_){}
+    setTimeout(()=>card.classList.add('dragging'), 0); // 延后,避免拖拽快照也半透明
+  });
+  box.addEventListener('dragover', e=>{
+    if(!DRAG_CARD || DRAG_SCOPE!==scope) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect='move';
+    const pinned=DRAG_CARD.classList.contains('pinned');
+    // 候选只取「同置顶组」的其它卡片 → 拖拽不会跨置顶/非置顶组
+    const peers=[...box.querySelectorAll('.note-card')]
+      .filter(c=>c!==DRAG_CARD && c.classList.contains('pinned')===pinned);
+    if(!peers.length) return; // 本组只有这一张,无处可换
+    const ref=noteDropRef(peers, e.clientX, e.clientY);
+    if(ref===DRAG_CARD) return;
+    if(ref) box.insertBefore(DRAG_CARD, ref); else box.appendChild(DRAG_CARD);
+  });
+  box.addEventListener('drop', e=>{
+    if(!DRAG_CARD || DRAG_SCOPE!==scope) return;
+    e.preventDefault();
+    persistNoteOrder(scope);
+  });
+  box.addEventListener('dragend', ()=>{
+    if(DRAG_CARD) DRAG_CARD.classList.remove('dragging');
+    DRAG_CARD=null; DRAG_SCOPE=null;
+  });
+}
+
+// 在同组候选卡片 peers 里按指针位置找落点:返回应插到其前面的卡片(null = 本组末尾)。
+function noteDropRef(peers, x, y){
+  let best=null, bestDist=Infinity, before=true;
+  for(const c of peers){
+    const r=c.getBoundingClientRect();
+    const cx=r.left+r.width/2, cy=r.top+r.height/2;
+    const d=Math.hypot(x-cx, y-cy);
+    if(d<bestDist){ bestDist=d; best=c; before = x < cx; }
+  }
+  if(!best) return null;
+  return before ? best : best.nextElementSibling; // 插到最近卡片的左/右
+}
+
+// 拖拽落定后持久化新顺序。公共→后端共享;本地→localStorage。DOM 已是新序,无需重渲染。
+async function persistNoteOrder(scope){
+  const box=document.getElementById(scope==='public'?'notesPublic':'notesLocal');
+  if(!box) return;
+  const ids=[...box.querySelectorAll('.note-card')].map(c=>c.dataset.id);
+  if(scope==='local'){
+    const cur=localNotes();
+    const byId=new Map(cur.map(n=>[String(n.id), n]));
+    const next=ids.map(id=>byId.get(String(id))).filter(Boolean);
+    for(const n of cur) if(!ids.includes(String(n.id))) next.push(n); // 兜底:DOM 缺失的补末尾
+    saveLocalNotes(next);
+    NOTES_LOC=next.slice();
+  } else {
+    try{
+      await api('/api/notes/reorder',{ method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ ids: ids.map(Number) }) });
+      const byId=new Map(NOTES_PUB.map(n=>[String(n.id), n]));
+      NOTES_PUB=ids.map(id=>byId.get(String(id))).filter(Boolean);
+    }catch(e){ toast('排序保存失败:'+e); loadNotes(); }
+  }
+}
+
 function noteCard(n, scope){
   let line;
   if(n.note_type==='url') line='<span class="note-ic">'+NOTE_IC.url+'</span>'+esc(n.content);
@@ -1885,7 +1973,7 @@ function noteCard(n, scope){
   const mark = pinned ? '<span class="note-pin-mark">'+NOTE_IC.pin+'</span>' : '';
   const titleHtml = (n.title || pinned)
     ? `<div class="note-title">${mark}${esc(n.title||'')}</div>` : '';
-  return `<div class="note-card${pinned?' pinned':''}${selCls}" data-act="notecard" data-id="${n.id}" data-scope="${scope}"${bg}>
+  return `<div class="note-card${pinned?' pinned':''}${selCls}" draggable="true" data-act="notecard" data-id="${n.id}" data-scope="${scope}"${bg}>
     <div class="note-actions">
       <button class="note-act${pinned?' on':''}" data-act="notepin" data-id="${n.id}" data-scope="${scope}" title="${pinned?'取消置顶':'置顶'}">${NOTE_IC.pin}</button>
       ${copyBtn}

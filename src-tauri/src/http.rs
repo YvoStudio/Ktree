@@ -231,6 +231,7 @@ pub async fn serve(state: AppState) {
         .route("/api/doc/:id/md", get(get_doc_md))
         .route("/api/doc/:id/raw", get(get_doc_raw))
         .route("/api/notes", get(list_notes).post(add_note))
+        .route("/api/notes/reorder", post(reorder_notes))
         .route("/api/notes/:id", put(update_note).delete(delete_note))
         .route("/api/kb", post(add_kb))
         .route("/api/kb/:kb_id/vcs", get(list_kb_vcs).post(add_kb_vcs))
@@ -613,6 +614,20 @@ async fn delete_note(
     AxPath(id): AxPath<i64>,
 ) -> Result<Response, ApiError> {
     state.store.delete_note(id)?;
+    Ok(json_ok(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ReorderBody {
+    ids: Vec<i64>,
+}
+
+// 拖拽排序:按 ids 顺序重写公共记事的 sort_order(置顶分组由前端保证,后端只照单全收)。
+async fn reorder_notes(
+    AxState(state): AxState<AppState>,
+    Json(body): Json<ReorderBody>,
+) -> Result<Response, ApiError> {
+    state.store.reorder_notes(&body.ids)?;
     Ok(json_ok(json!({ "ok": true })))
 }
 

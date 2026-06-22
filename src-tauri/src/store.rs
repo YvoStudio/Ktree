@@ -70,6 +70,9 @@ pub struct Note {
     /// 是否置顶。
     #[serde(default)]
     pub pinned: bool,
+    /// 自定义排序值(拖拽排序写入,越小越靠前;同组内生效)。
+    #[serde(default)]
+    pub sort_order: i64,
     pub created_at: i64,
 }
 
@@ -144,6 +147,7 @@ impl Store {
                 kb_id       TEXT NOT NULL DEFAULT '',
                 color       TEXT NOT NULL DEFAULT '',
                 pinned      INTEGER NOT NULL DEFAULT 0,
+                sort_order  INTEGER NOT NULL DEFAULT 0,
                 created_at  INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -162,6 +166,10 @@ impl Store {
         );
         let _ = conn.execute(
             "ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE notes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
             [],
         );
         Ok(Self {
@@ -424,8 +432,8 @@ impl Store {
     pub fn list_notes(&self) -> anyhow::Result<Vec<Note>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, title, note_type, content, kb_id, color, pinned, created_at
-             FROM notes ORDER BY pinned DESC, created_at DESC, id DESC",
+            "SELECT id, title, note_type, content, kb_id, color, pinned, sort_order, created_at
+             FROM notes ORDER BY pinned DESC, sort_order ASC, created_at DESC, id DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(Note {
@@ -436,7 +444,8 @@ impl Store {
                 kb_id: r.get(4)?,
                 color: r.get(5)?,
                 pinned: r.get(6)?,
-                created_at: r.get(7)?,
+                sort_order: r.get(7)?,
+                created_at: r.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -463,6 +472,7 @@ impl Store {
             kb_id: n.kb_id.clone(),
             color: n.color.clone(),
             pinned: n.pinned,
+            sort_order: 0,
             created_at: ts,
         })
     }
@@ -483,6 +493,21 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
         Ok(n > 0)
+    }
+
+    /// 按给定 id 顺序重写 sort_order(下标即排序值,越靠前越小)。
+    /// 只更新传入的 id,未提及的记事保持原值;不存在的 id 静默跳过。
+    pub fn reorder_notes(&self, ids: &[i64]) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE notes SET sort_order = ?1 WHERE id = ?2",
+                params![i as i64, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// 列出还没有语义向量的文档(供启动时给存量文档补算)。
