@@ -104,6 +104,9 @@ pub struct AppConfig {
     /// 不带 scheme 默认补 `http://`;末尾的 `/` 会被去掉。
     #[serde(default)]
     pub custom_domain: String,
+    /// web UI 左上角与浏览器标题显示的站点名,空 = 回退到 "Ktree"。便于统一源对外分享时打自己的名。
+    #[serde(default)]
+    pub site_name: String,
     #[serde(default)]
     pub knowledge_bases: Vec<KnowledgeBase>,
 }
@@ -114,6 +117,7 @@ impl AppConfig {
         Self {
             http_port: 0,
             custom_domain: String::new(),
+            site_name: String::new(),
             knowledge_bases: vec![KnowledgeBase {
                 id: String::new(),
                 name: "默认知识库".to_string(),

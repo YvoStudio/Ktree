@@ -106,7 +106,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "搜索关键词" },
+                    "query": { "type": "string", "description": "搜索词。支持结构化算子过滤:tag:<标签>(嵌套按前缀,tag:a 命中 a/b)、path:<路径片段>、type:<扩展名>、kb:<知识库id>、title:<标题片段>;值含空格用引号 title:\"配置 表\";前缀 - 取反 -type:png。算子与自由文本可混用,如『配置表 tag:规范 -path:vcs』;只给算子不给自由文本则按条件列出文档(按更新时间倒序)。" },
                     "kb": { "type": "string", "description": "可选,限定某个知识库 id;不填搜全部" },
                     "limit": { "type": "integer", "description": "返回条数,默认 10,最多 50" }
                 },
@@ -119,6 +119,27 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "integer", "description": "文档 id" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "kb_backlinks",
+            "description": "反向链接:列出有出链指向某文档的其它文档(按去扩展名文件名匹配 [[wikilink]] 与相对 md 链接)。先用 kb_search 拿 id,再调用本工具,可发现引用关系 / 相关上下文。",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "integer", "description": "目标文档 id" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "kb_related",
+            "description": "语义相关文档:列出与某文档主题最相近的若干篇(基于离线语义向量 cosine)。Ktree 的 md 多为同步/上传时各自独立生成、彼此无显式互链,所以找关联优先用本工具而非 kb_backlinks。先用 kb_search 拿 id。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "目标文档 id" },
+                    "limit": { "type": "integer", "description": "返回条数,默认 6,最多 20" }
+                },
                 "required": ["id"]
             }
         },
@@ -282,6 +303,8 @@ async fn call_tool(
         "kb_list" => tool_list(state).await,
         "kb_search" => tool_search(state, &args).await,
         "kb_get_doc" => tool_get_doc(state, &args, base_url).await,
+        "kb_backlinks" => tool_backlinks(state, &args).await,
+        "kb_related" => tool_related(state, &args).await,
         "kb_list_docs" => tool_list_docs(state, &args).await,
         "kb_upload" => tool_upload(state, &args).await,
         "kb_get_config" => tool_get_config(state, &args).await,
@@ -373,6 +396,76 @@ async fn tool_search(state: &AppState, args: &Value) -> anyhow::Result<String> {
         ));
     }
     Ok(out)
+}
+
+async fn tool_backlinks(state: &AppState, args: &Value) -> anyhow::Result<String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("缺少文档 id"))?;
+    let doc = state
+        .store
+        .get_document(id)?
+        .ok_or_else(|| anyhow::anyhow!("文档 {id} 不存在"))?;
+    let key = crate::ingest::link_key_of(&doc.rel_path);
+    let docs = state.store.backlinks(&doc.kb_id, &key, id)?;
+    if docs.is_empty() {
+        return Ok(format!("没有文档链接到「{}」", doc.title));
+    }
+    let mut out = format!("「{}」的反向链接({} 条):\n\n", doc.title, docs.len());
+    for d in &docs {
+        out.push_str(&format!(
+            "### #{} {}\n- 知识库: {}\n- 路径: {}\n- 取全文: kb_get_doc(id={})\n\n",
+            d.id, d.title, d.kb_id, d.rel_path, d.id
+        ));
+    }
+    Ok(out)
+}
+
+async fn tool_related(state: &AppState, args: &Value) -> anyhow::Result<String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("缺少文档 id"))?;
+    let doc = state
+        .store
+        .get_document(id)?
+        .ok_or_else(|| anyhow::anyhow!("文档 {id} 不存在"))?;
+    let k = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(6)
+        .clamp(1, 20) as usize;
+    let vectors = state.store.all_vectors(Some(&doc.kb_id))?;
+    let tv = match vectors.iter().find(|(i, _)| *i == id) {
+        Some((_, v)) => v.clone(),
+        None => return Ok(format!("「{}」尚无语义向量,无法计算相关文档", doc.title)),
+    };
+    let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+    let mut sims: Vec<(i64, f32)> = vectors
+        .iter()
+        .filter(|(i, v)| *i != id && v.len() == tv.len())
+        .map(|(i, v)| (*i, dot(&tv, v)))
+        .filter(|(_, s)| *s >= 0.5)
+        .collect();
+    sims.sort_by(|a, b| b.1.total_cmp(&a.1));
+    sims.truncate(k);
+    let mut out = String::new();
+    for (i, s) in sims {
+        if let Some(d) = state.store.get_document(i)? {
+            if crate::ingest::path_has_ignored_component(&d.rel_path) {
+                continue;
+            }
+            out.push_str(&format!(
+                "### #{} {}  (相似度 {:.0})\n- 知识库: {}\n- 路径: {}\n- 取全文: kb_get_doc(id={})\n\n",
+                d.id, d.title, s * 100.0, d.kb_id, d.rel_path, d.id
+            ));
+        }
+    }
+    if out.is_empty() {
+        return Ok(format!("没有与「{}」语义相近的文档", doc.title));
+    }
+    Ok(format!("与「{}」语义最相近的文档:\n\n{}", doc.title, out))
 }
 
 async fn tool_get_doc(state: &AppState, args: &Value, base_url: &str) -> anyhow::Result<String> {

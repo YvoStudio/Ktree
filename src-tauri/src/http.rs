@@ -227,6 +227,8 @@ pub async fn serve(state: AppState) {
         .route("/api/folder", post(create_folder).delete(delete_folder_http))
         .route("/api/upload", post(upload))
         .route("/api/search", get(search))
+        .route("/api/backlinks", get(backlinks))
+        .route("/api/related", get(related))
         .route("/api/doc/:id", get(get_doc).delete(delete_doc))
         .route("/api/doc/:id/md", get(get_doc_md))
         .route("/api/doc/:id/raw", get(get_doc_raw))
@@ -247,6 +249,8 @@ pub async fn serve(state: AppState) {
         .route("/lib/marked.min.js", get(lib_marked))
         .route("/lib/highlight.min.js", get(lib_hljs))
         .route("/lib/github.min.css", get(lib_css))
+        .route("/lib/mermaid.min.js", get(lib_mermaid))
+        .route("/lib/tex-svg.js", get(lib_mathjax))
         // MCP 只支持 JSON-RPC POST;不注册 GET,axum 会自动回 405 + Allow: POST
         .route("/mcp", post(mcp::handle))
         // 知识库文件直链:/<知识库名>/<相对知识库根的路径>。放最后,优先匹配上面的固定路由。
@@ -285,6 +289,7 @@ async fn api_env(AxState(state): AxState<AppState>) -> Response {
     json_ok(json!({
         "ok": true,
         "custom_domain": crate::commands::normalize_custom_domain(&cfg.custom_domain),
+        "site_name": cfg.site_name,
         "http_port": *state.http_port.lock().unwrap(),
         "version": env!("CARGO_PKG_VERSION"),
     }))
@@ -334,6 +339,20 @@ async fn lib_css() -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("lib/github.min.css"),
+    )
+        .into_response()
+}
+async fn lib_mermaid() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        include_str!("lib/mermaid.min.js"),
+    )
+        .into_response()
+}
+async fn lib_mathjax() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        include_str!("lib/tex-svg.js"),
     )
         .into_response()
 }
@@ -1113,11 +1132,120 @@ async fn search(
                 "rel_path": doc.rel_path,
                 "md_path": doc.md_path,
                 "ext": doc.ext,
+                "updated_at": doc.updated_at,
+                "created_at": doc.created_at,
             }))
         })
         .collect();
     Ok(json_ok(json!({ "ok": true, "query": q.q, "hits": enriched })))
 }
+
+#[derive(Deserialize)]
+struct BacklinkQuery {
+    #[serde(default)]
+    kb: String,
+    #[serde(default)]
+    path: String,
+}
+
+/// 反向链接:同知识库内出链指向 `path`(按去扩展名文件名匹配)的文档。
+async fn backlinks(
+    AxState(state): AxState<AppState>,
+    Query(q): Query<BacklinkQuery>,
+) -> Result<Response, ApiError> {
+    if q.kb.is_empty() || q.path.is_empty() {
+        return Ok(bad_request("缺少 kb 或 path 参数"));
+    }
+    let key = crate::ingest::link_key_of(&q.path);
+    // 解析目标文档(排除自链 + 回传其属性);resolve_doc 兼容 src//docs/ 前缀与转换产物 md。
+    let target = state.store.resolve_doc(&q.kb, &q.path)?;
+    let self_id = target.as_ref().map(|d| d.id).unwrap_or(-1);
+    // 目标文档的属性(props 为 JSON 对象串,空串则置空对象)
+    let doc_meta = target.as_ref().map(|d| {
+        let props: Value = if d.props.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&d.props).unwrap_or_else(|_| json!({}))
+        };
+        json!({ "id": d.id, "title": d.title, "props": props })
+    });
+    let docs = state.store.backlinks(&q.kb, &key, self_id)?;
+    let hits: Vec<Value> = docs
+        .into_iter()
+        .filter(|d| !ingest::path_has_ignored_component(&d.rel_path))
+        .map(|d| {
+            json!({
+                "doc_id": d.id,
+                "title": d.title,
+                "kb_id": d.kb_id,
+                "rel_path": d.rel_path,
+                "md_path": d.md_path,
+                "ext": d.ext,
+                "category": crate::kbmeta::category_of(&d.rel_path),
+            })
+        })
+        .collect();
+    Ok(json_ok(json!({ "ok": true, "doc": doc_meta, "backlinks": hits })))
+}
+
+#[derive(Deserialize)]
+struct RelatedQuery {
+    #[serde(default)]
+    kb: String,
+    #[serde(default)]
+    path: String,
+    k: Option<usize>,
+}
+
+/// 语义相关文档:与目标文档向量最相近的若干篇(替代对生成式 md 恒空的「反向链接」)。
+async fn related(
+    AxState(state): AxState<AppState>,
+    Query(q): Query<RelatedQuery>,
+) -> Result<Response, ApiError> {
+    if q.kb.is_empty() || q.path.is_empty() {
+        return Ok(bad_request("缺少 kb 或 path 参数"));
+    }
+    let k = q.k.unwrap_or(6).clamp(1, 20);
+    let target = match state.store.resolve_doc(&q.kb, &q.path)? {
+        Some(d) => d,
+        None => return Ok(json_ok(json!({ "ok": true, "related": [] }))),
+    };
+    let vectors = state.store.all_vectors(Some(&q.kb))?;
+    let tv = match vectors.iter().find(|(id, _)| *id == target.id) {
+        Some((_, v)) => v.clone(),
+        None => return Ok(json_ok(json!({ "ok": true, "related": [] }))),
+    };
+    let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+    let mut sims: Vec<(i64, f32)> = vectors
+        .iter()
+        .filter(|(id, v)| *id != target.id && v.len() == tv.len())
+        .map(|(id, v)| (*id, dot(&tv, v)))
+        .filter(|(_, s)| *s >= 0.5) // 低于 0.5 视作不相关,不展示
+        .collect();
+    sims.sort_by(|a, b| b.1.total_cmp(&a.1));
+    sims.truncate(k);
+    let related: Vec<Value> = sims
+        .into_iter()
+        .filter_map(|(id, score)| {
+            let d = state.store.get_document(id).ok().flatten()?;
+            if ingest::path_has_ignored_component(&d.rel_path) {
+                return None;
+            }
+            Some(json!({
+                "doc_id": d.id,
+                "title": d.title,
+                "kb_id": d.kb_id,
+                "rel_path": d.rel_path,
+                "md_path": d.md_path,
+                "ext": d.ext,
+                "category": crate::kbmeta::category_of(&d.rel_path),
+                "score": (score * 100.0).round(),
+            }))
+        })
+        .collect();
+    Ok(json_ok(json!({ "ok": true, "related": related })))
+}
+
 
 async fn get_doc(
     AxState(state): AxState<AppState>,

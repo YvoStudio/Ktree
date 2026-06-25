@@ -266,6 +266,10 @@ pub fn ingest_file(
     );
     kbmeta::save_manifest(&kb.root, &manifest)?;
 
+    // frontmatter 属性(② 属性视图 / prop: 算子)与文档内链接(③ 反链 / 图谱),均从 md 正文解析。
+    let props = parse_frontmatter_props(&body);
+    let links = extract_links(&body);
+
     // 刷新 SQLite + tantivy 缓存
     let doc_id = state.store.upsert_document(&NewDocument {
         kb_id: kb.id.clone(),
@@ -276,9 +280,12 @@ pub fn ingest_file(
         md5,
         summary: summary.clone(),
         tags: tags.join(","),
+        props,
         md_path,
         source: source.to_string(),
     })?;
+    // 出链入库(失败不阻断:反链 / 图谱是增强项)
+    let _ = state.store.set_doc_links(doc_id, &kb.id, &links);
     state
         .index
         .add_or_update(&kb.id, doc_id, &stem, &category, &body, &summary)?;
@@ -474,6 +481,126 @@ pub(crate) fn forget_path_artifacts(
     Ok(true)
 }
 
+/// 从去扩展名的文件名得到链接归一化键(小写)。`[[Note]]` 与 `[x](dir/Note.md)` 都按此匹配。
+pub(crate) fn link_key_of(rel_path: &str) -> String {
+    let last = rel_path.rsplit(['/', '\\']).next().unwrap_or(rel_path);
+    let stem = last.rsplit_once('.').map(|(a, _)| a).unwrap_or(last);
+    stem.trim().to_lowercase()
+}
+
+/// 把链接目标(wikilink 内文 / md 链接 url)归一化成 target_key;外链 / 空 → None。
+fn link_key_from_ref(raw: &str) -> Option<String> {
+    let s = raw.split('|').next().unwrap_or(raw); // 去 wikilink 别名
+    let s = s.split('#').next().unwrap_or(s); // 去锚点
+    let s = s.split('?').next().unwrap_or(s); // 去查询串
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let low = s.to_ascii_lowercase();
+    if low.starts_with("http://")
+        || low.starts_with("https://")
+        || low.starts_with("mailto:")
+        || low.starts_with("//")
+        || low.starts_with("data:")
+    {
+        return None;
+    }
+    let key = link_key_of(s);
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+/// 从 markdown 正文提取出链:`[[wikilink]]` 与 `[text](target)`。去重,返回 (target_key, 显示文本)。
+pub(crate) fn extract_links(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |key: String, text: &str, seen: &mut std::collections::HashSet<String>| {
+        if seen.insert(key.clone()) {
+            out.push((key, text.trim().to_string()));
+        }
+    };
+    // [[wikilink]]
+    let mut i = 0;
+    while let Some(p) = body[i..].find("[[") {
+        let start = i + p + 2;
+        match body[start..].find("]]") {
+            Some(q) => {
+                let inner = &body[start..start + q];
+                if let Some(key) = link_key_from_ref(inner) {
+                    push(key, inner, &mut seen);
+                }
+                i = start + q + 2;
+            }
+            None => break,
+        }
+    }
+    // [text](target)
+    let mut j = 0;
+    while let Some(p) = body[j..].find("](") {
+        let start = j + p + 2;
+        match body[start..].find(')') {
+            Some(q) => {
+                let target = &body[start..start + q];
+                if let Some(key) = link_key_from_ref(target) {
+                    push(key, target, &mut seen);
+                }
+                j = start + q + 1;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// 解析 frontmatter 顶层 `key: value` 属性,返回 JSON 对象串(无则空串)。
+/// 只取顶层标量键值,跳过缩进的列表项 / 续行;`tags: [a, b]` 这类整串保留为字符串。
+/// 跳过 title/category/tags/summary 这四个系统保留键(已在标题 / 标签 / 摘要里单独呈现,
+/// 也是转换文件生成 frontmatter 的固定字段),只留用户自定义属性。
+pub(crate) fn parse_frontmatter_props(text: &str) -> String {
+    const RESERVED: [&str; 4] = ["title", "category", "tags", "summary"];
+    let rest = match text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+    {
+        Some(r) => r,
+        None => return String::new(),
+    };
+    let end = ["\n---\n", "\n---\r\n", "\n---"]
+        .iter()
+        .filter_map(|m| rest.find(m))
+        .min();
+    let block = match end {
+        Some(e) => &rest[..e],
+        None => return String::new(),
+    };
+    let mut map = serde_json::Map::new();
+    for line in block.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim();
+            if key.is_empty() || k.starts_with('-') || RESERVED.contains(&key.to_lowercase().as_str()) {
+                continue;
+            }
+            let val = v.trim().trim_matches('"').trim_matches('\'').trim();
+            map.insert(
+                key.to_string(),
+                serde_json::Value::String(val.to_string()),
+            );
+        }
+    }
+    if map.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&map).unwrap_or_default()
+    }
+}
+
 /// 去掉文件开头的 YAML frontmatter(`---` 包起来的块)。
 fn strip_frontmatter(s: &str) -> &str {
     if let Some(rest) = s.strip_prefix("---\n").or_else(|| s.strip_prefix("---\r\n")) {
@@ -633,7 +760,7 @@ pub fn backfill_vectors(state: &AppState) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::path_has_ignored_component;
+    use super::{extract_links, link_key_of, parse_frontmatter_props, path_has_ignored_component};
 
     #[test]
     fn explicit_ignore_prefix_only() {
@@ -642,5 +769,40 @@ mod tests {
         assert!(path_has_ignored_component("vcs/svn/策划/##!方案.md"));
         assert!(!path_has_ignored_component("vcs/svn/归档（AI不看）/方案.md"));
         assert!(!path_has_ignored_component("vcs/svn/策划/方案##!.md"));
+    }
+
+    #[test]
+    fn link_key_normalizes_basename() {
+        assert_eq!(link_key_of("upload/A 方案.md"), "a 方案");
+        assert_eq!(link_key_of("Note"), "note");
+        assert_eq!(link_key_of("dir/Sub/X.MARKDOWN"), "x");
+    }
+
+    #[test]
+    fn extract_links_wiki_and_md() {
+        let body = "见 [[设计方案]] 与 [[人物#背景|人物设定]],外链 [站](https://x.com),\
+                    本地 [配置](../config/表.md),锚点 [a](#sec) 不算。";
+        let keys: Vec<String> = extract_links(body).into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"设计方案".to_string()));
+        assert!(keys.contains(&"人物".to_string())); // 去别名 / 去锚点
+        assert!(keys.contains(&"表".to_string())); // 相对 md 链接取 basename 去扩展名
+        assert!(!keys.iter().any(|k| k.contains("x.com"))); // 外链排除
+        assert!(!keys.iter().any(|k| k.is_empty())); // 纯锚点排除
+    }
+
+    #[test]
+    fn frontmatter_props_skips_reserved_and_indent() {
+        let md = "---\ntitle: 标题\ntags: [a, b]\nstatus: Done\nowner: yvo\n  nested: x\n---\n正文";
+        let props = parse_frontmatter_props(md);
+        // 保留用户键
+        assert!(props.contains("\"status\""));
+        assert!(props.contains("Done"));
+        assert!(props.contains("\"owner\""));
+        // 跳过保留键与缩进续行
+        assert!(!props.contains("\"title\""));
+        assert!(!props.contains("\"tags\""));
+        assert!(!props.contains("nested"));
+        // 无 frontmatter → 空
+        assert_eq!(parse_frontmatter_props("正文无 frontmatter"), "");
     }
 }

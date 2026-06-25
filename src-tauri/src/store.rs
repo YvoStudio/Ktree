@@ -20,6 +20,9 @@ pub struct Document {
     pub summary: String,
     /// 逗号分隔的标签(来自 frontmatter tags)
     pub tags: String,
+    /// frontmatter 属性的 JSON 对象串(空串 = 无),供属性面板与 prop: 算子过滤。
+    #[serde(default)]
+    pub props: String,
     /// 转换后的 Markdown 相对知识库根的路径(docs/<rel_path>.md),未转换则 None
     pub md_path: Option<String>,
     /// 来源:upload / feishu / local
@@ -44,6 +47,8 @@ pub struct NewDocument {
     pub summary: String,
     #[serde(default)]
     pub tags: String,
+    #[serde(default)]
+    pub props: String,
     #[serde(default)]
     pub md_path: Option<String>,
     #[serde(default = "default_source")]
@@ -127,6 +132,7 @@ impl Store {
                 md5         TEXT NOT NULL DEFAULT '',
                 summary     TEXT NOT NULL DEFAULT '',
                 tags        TEXT NOT NULL DEFAULT '',
+                props       TEXT NOT NULL DEFAULT '',
                 md_path     TEXT,
                 source      TEXT NOT NULL DEFAULT 'upload',
                 created_at  INTEGER NOT NULL,
@@ -134,6 +140,16 @@ impl Store {
                 UNIQUE(kb_id, rel_path)
             );
             CREATE INDEX IF NOT EXISTS idx_documents_kb ON documents(kb_id);
+            -- 文档内链接([[wikilink]] / 相对 md 链接),target_key 为去扩展名小写的目标文件名。
+            -- 反向链接、关系图谱都查这张表;target_key 在查询时再解析到具体文档(小库定位)。
+            CREATE TABLE IF NOT EXISTS doc_links (
+                src_doc_id  INTEGER NOT NULL,
+                kb_id       TEXT NOT NULL,
+                target_key  TEXT NOT NULL,
+                link_text   TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (src_doc_id, target_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_doc_links_target ON doc_links(kb_id, target_key);
             CREATE TABLE IF NOT EXISTS doc_vectors (
                 doc_id  INTEGER PRIMARY KEY,
                 dim     INTEGER NOT NULL,
@@ -160,6 +176,10 @@ impl Store {
             "#,
         )?;
         // 老库补列(已存在则忽略报错)
+        let _ = conn.execute(
+            "ALTER TABLE documents ADD COLUMN props TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         let _ = conn.execute(
             "ALTER TABLE notes ADD COLUMN color TEXT NOT NULL DEFAULT ''",
             [],
@@ -188,6 +208,7 @@ impl Store {
             md5: row.get("md5")?,
             summary: row.get("summary")?,
             tags: row.get("tags")?,
+            props: row.get("props")?,
             md_path: row.get("md_path")?,
             source: row.get("source")?,
             created_at: row.get("created_at")?,
@@ -211,10 +232,10 @@ impl Store {
             Some(id) => {
                 conn.execute(
                     "UPDATE documents SET title=?1, ext=?2, size=?3, md5=?4, summary=?5,
-                        tags=?6, md_path=?7, source=?8, updated_at=?9 WHERE id=?10",
+                        tags=?6, props=?7, md_path=?8, source=?9, updated_at=?10 WHERE id=?11",
                     params![
                         doc.title, doc.ext, doc.size, doc.md5, doc.summary, doc.tags,
-                        doc.md_path, doc.source, ts, id
+                        doc.props, doc.md_path, doc.source, ts, id
                     ],
                 )?;
                 Ok(id)
@@ -222,12 +243,12 @@ impl Store {
             None => {
                 conn.execute(
                     "INSERT INTO documents
-                        (kb_id, rel_path, title, ext, size, md5, summary, tags, md_path,
+                        (kb_id, rel_path, title, ext, size, md5, summary, tags, props, md_path,
                          source, created_at, updated_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
                     params![
                         doc.kb_id, doc.rel_path, doc.title, doc.ext, doc.size, doc.md5,
-                        doc.summary, doc.tags, doc.md_path, doc.source, ts
+                        doc.summary, doc.tags, doc.props, doc.md_path, doc.source, ts
                     ],
                 )?;
                 Ok(conn.last_insert_rowid())
@@ -251,6 +272,23 @@ impl Store {
             .query_row(
                 "SELECT * FROM documents WHERE id = ?1",
                 params![id],
+                Self::row_to_doc,
+            )
+            .optional()?)
+    }
+
+    /// 按「预览路径」解析文档:可能是 src 相对路径(rel_path)、带 src//docs/ 前缀,
+    /// 或转换产物的 docs/<...>.md(此时存的 rel_path 是源扩展名,需按 md_path 匹配)。
+    pub fn resolve_doc(&self, kb_id: &str, path: &str) -> anyhow::Result<Option<Document>> {
+        let conn = self.conn.lock().unwrap();
+        let src = path.strip_prefix("src/").unwrap_or(path);
+        let docs = path.strip_prefix("docs/").unwrap_or(path);
+        Ok(conn
+            .query_row(
+                "SELECT * FROM documents WHERE kb_id = ?1
+                   AND (rel_path = ?2 OR md_path = ?2 OR rel_path = ?3 OR rel_path = ?4)
+                 LIMIT 1",
+                params![kb_id, path, src, docs],
                 Self::row_to_doc,
             )
             .optional()?)
@@ -303,6 +341,7 @@ impl Store {
     pub fn delete_document(&self, id: i64) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM doc_vectors WHERE doc_id = ?1", params![id])?;
+        conn.execute("DELETE FROM doc_links WHERE src_doc_id = ?1", params![id])?;
         let n = conn.execute("DELETE FROM documents WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -315,6 +354,7 @@ impl Store {
                 (SELECT id FROM documents WHERE kb_id = ?1)",
             params![kb_id],
         )?;
+        conn.execute("DELETE FROM doc_links WHERE kb_id = ?1", params![kb_id])?;
         let n = conn.execute("DELETE FROM documents WHERE kb_id = ?1", params![kb_id])?;
         Ok(n)
     }
@@ -359,6 +399,93 @@ impl Store {
             .into_iter()
             .map(|(id, bytes)| (id, bytes_to_vec(&bytes)))
             .collect())
+    }
+
+    /// 按结构化约束算出允许的 doc_id 集合(kb_id 非空时先按知识库过滤)。
+    /// 约束语义见 query_parser::doc_allowed。小库定位下直接遍历过滤,够用;
+    /// 大库若有性能/选择性问题,再把热点过滤下推为 tantivy 索引字段(见设计文档 ①)。
+    pub fn doc_ids_matching(
+        &self,
+        kb_id: Option<&str>,
+        constraints: &[crate::query_parser::Constraint],
+    ) -> anyhow::Result<std::collections::HashSet<i64>> {
+        let conn = self.conn.lock().unwrap();
+        type Row = (i64, String, String, String, String, String, String);
+        let map = |r: &rusqlite::Row| -> rusqlite::Result<Row> {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        };
+        let rows: Vec<Row> = match kb_id.filter(|k| !k.is_empty()) {
+            Some(kb) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, kb_id, rel_path, ext, tags, title, props FROM documents WHERE kb_id = ?1",
+                )?;
+                let it = stmt.query_map(params![kb], map)?;
+                it.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, kb_id, rel_path, ext, tags, title, props FROM documents",
+                )?;
+                let it = stmt.query_map([], map)?;
+                it.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        let mut out = std::collections::HashSet::new();
+        for (id, kb, rel, ext, tags, title, props) in rows {
+            if crate::query_parser::doc_allowed(constraints, &kb, &rel, &ext, &tags, &title, &props) {
+                out.insert(id);
+            }
+        }
+        Ok(out)
+    }
+
+    // ----- 文档链接(doc_links):反向链接 / 关系图谱 -----
+
+    /// 重写一篇文档的出链(先删旧再插新)。`links` 为 (target_key, link_text) 列表。
+    pub fn set_doc_links(
+        &self,
+        src_doc_id: i64,
+        kb_id: &str,
+        links: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM doc_links WHERE src_doc_id = ?1", params![src_doc_id])?;
+        for (key, text) in links {
+            if key.is_empty() {
+                continue;
+            }
+            // PRIMARY KEY(src, target_key) 去重:同一文档多次链同一目标只存一条
+            tx.execute(
+                "INSERT OR IGNORE INTO doc_links (src_doc_id, kb_id, target_key, link_text)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![src_doc_id, kb_id, key, text],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 反向链接:同知识库内、出链目标解析到 `target_key` 的所有文档(排除自身)。
+    pub fn backlinks(
+        &self,
+        kb_id: &str,
+        target_key: &str,
+        self_id: i64,
+    ) -> anyhow::Result<Vec<Document>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT d.* FROM documents d
+             JOIN doc_links l ON l.src_doc_id = d.id
+             WHERE l.kb_id = ?1 AND l.target_key = ?2 AND d.id != ?3
+             ORDER BY d.rel_path",
+        )?;
+        let rows = stmt.query_map(params![kb_id, target_key, self_id], Self::row_to_doc)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// 列出 kb_id 已不在配置里的孤儿文档 id —— 知识库改名 / 删除会留下这些。
@@ -538,5 +665,82 @@ impl Store {
             None => conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?,
         };
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_store() -> (Store, std::path::PathBuf) {
+        static C: AtomicU64 = AtomicU64::new(0);
+        let n = C.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("ktree_store_{}_{}.db", std::process::id(), n));
+        let _ = std::fs::remove_file(&p);
+        (Store::open(&p).unwrap(), p)
+    }
+
+    fn newdoc(kb: &str, rel: &str, props: &str) -> NewDocument {
+        NewDocument {
+            kb_id: kb.into(),
+            rel_path: rel.into(),
+            title: "t".into(),
+            ext: "md".into(),
+            size: 0,
+            md5: String::new(),
+            summary: String::new(),
+            tags: String::new(),
+            props: props.into(),
+            md_path: None,
+            source: "upload".into(),
+        }
+    }
+
+    #[test]
+    fn backlinks_resolve_by_basename_excluding_self() {
+        let (s, p) = temp_store();
+        let a = s.upsert_document(&newdoc("kb", "upload/A.md", "")).unwrap();
+        let b = s.upsert_document(&newdoc("kb", "dir/B.md", "")).unwrap();
+        s.set_doc_links(a, "kb", &[("b".to_string(), "B".to_string())]).unwrap();
+        let back = s.backlinks("kb", "b", b).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].id, a);
+        // 自链不计入(以 a 为目标查时,a 自己不返回)
+        assert!(s.backlinks("kb", "b", a).unwrap().iter().all(|d| d.id != a));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn resolve_doc_matches_relpath_and_mdpath() {
+        let (s, p) = temp_store();
+        let mut nd = newdoc("kb", "vcs/数值/recipe.xlsx", "");
+        nd.md_path = Some("docs/vcs/数值/recipe.md".to_string());
+        let id = s.upsert_document(&nd).unwrap();
+        // 按 src rel_path(源扩展名)
+        assert_eq!(s.resolve_doc("kb", "vcs/数值/recipe.xlsx").unwrap().unwrap().id, id);
+        // 按转换产物 md_path(前端预览路径常是这个)
+        assert_eq!(s.resolve_doc("kb", "docs/vcs/数值/recipe.md").unwrap().unwrap().id, id);
+        // 带 src/ 前缀
+        assert_eq!(s.resolve_doc("kb", "src/vcs/数值/recipe.xlsx").unwrap().unwrap().id, id);
+        // 不存在
+        assert!(s.resolve_doc("kb", "docs/不存在.md").unwrap().is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn doc_ids_matching_filters_by_prop() {
+        let (s, p) = temp_store();
+        let d1 = s.upsert_document(&newdoc("kb", "upload/x.md", r#"{"status":"done"}"#)).unwrap();
+        let _d2 = s.upsert_document(&newdoc("kb", "vcs/y.md", r#"{"status":"wip"}"#)).unwrap();
+        let cs = vec![crate::query_parser::Constraint {
+            field: crate::query_parser::Field::Prop,
+            value: "status=done".to_string(),
+            negate: false,
+        }];
+        let ids = s.doc_ids_matching(Some("kb"), &cs).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&d1));
+        let _ = std::fs::remove_file(&p);
     }
 }

@@ -25,6 +25,7 @@ mod index;
 mod ingest;
 mod kbmeta;
 mod mcp;
+mod query_parser;
 mod scheduler;
 mod search;
 mod textproc;

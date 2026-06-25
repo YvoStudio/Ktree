@@ -216,27 +216,30 @@ pub fn rebuild_cache_if_needed(state: &AppState, kb: &KnowledgeBase) -> anyhow::
             .unwrap_or("untitled")
             .to_string();
 
-        let (title, category, tags, summary, body) = if entry.output.is_empty() {
-            (stem.clone(), category_of(rel_path), Vec::new(), String::new(), String::new())
+        let (title, category, tags, summary, body, props) = if entry.output.is_empty() {
+            (stem.clone(), category_of(rel_path), Vec::new(), String::new(), String::new(), String::new())
         } else {
             let md_abs = kb.root.join(&entry.output);
             match fs::read_to_string(&md_abs) {
                 Ok(content) => {
                     let (t, c, tg, s, b) = parse_frontmatter(&content);
+                    let props = crate::ingest::parse_frontmatter_props(&content);
                     (
                         if t.is_empty() { stem.clone() } else { t },
                         if c.is_empty() { category_of(rel_path) } else { c },
                         tg,
                         s,
                         b,
+                        props,
                     )
                 }
-                Err(_) => (stem.clone(), category_of(rel_path), Vec::new(), String::new(), String::new()),
+                Err(_) => (stem.clone(), category_of(rel_path), Vec::new(), String::new(), String::new(), String::new()),
             }
         };
 
         // HTML 等用纯文本做索引(原文件不动)。摘要若为空留待 backfill_meta 补算。
         let body = crate::textproc::clean_body(&body, &ext);
+        let links = crate::ingest::extract_links(&body);
 
         let md_path = if entry.output.is_empty() {
             None
@@ -253,9 +256,11 @@ pub fn rebuild_cache_if_needed(state: &AppState, kb: &KnowledgeBase) -> anyhow::
             md5: entry.md5.clone(),
             summary: summary.clone(),
             tags: tags_str,
+            props,
             md_path,
             source: "local".to_string(),
         })?;
+        let _ = state.store.set_doc_links(doc_id, &kb.id, &links);
         state
             .index
             .add_or_update(&kb.id, doc_id, &title, &category, &body, &summary)?;
