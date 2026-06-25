@@ -102,6 +102,9 @@
   <div class="section">
     <h3>全局</h3>
     <div class="row">
+      <label class="field" style="flex:1;min-width:160px">站点名称(显示在 web 界面左上角与浏览器标题,空 = Ktree)
+        <input type="text" id="cfgSiteName" placeholder="Ktree" />
+      </label>
       <label class="field" style="flex:1;min-width:200px">HTTP 端口(留当前值 = 沿用自动选取;手填则固定该端口)
         <input type="number" id="cfgPort" min="0" max="65535" />
       </label>
@@ -183,6 +186,7 @@ async function loadConfig(){
   portInp.dataset.actualPort = actualPort;
   portInp.dataset.configured  = configured;
   document.getElementById('cfgDomain').value = CFG.custom_domain ?? '';
+  document.getElementById('cfgSiteName').value = CFG.site_name ?? '';
   snapshotSavedCounts();
   renderKbs();
 }
@@ -295,6 +299,7 @@ function collect(){
   const wasAuto = (parseInt(portInp.dataset.configured)||0) === 0;
   CFG.http_port = (wasAuto && newPort === actual) ? 0 : newPort;
   CFG.custom_domain = document.getElementById('cfgDomain').value.trim();
+  CFG.site_name = document.getElementById('cfgSiteName').value.trim();
 }
 
 // 删除「已保存」的绑定:走 Tauri invoke(本机直连后端),连同本地镜像目录 + 已入库内容一起清掉。

@@ -8,6 +8,18 @@
 <link rel="stylesheet" href="/lib/github.min.css" />
 <script src="/lib/highlight.min.js"></script>
 <script src="/lib/marked.min.js"></script>
+<script>
+  // MathJax 必须在加载 tex-svg.js 之前配置:启用 $...$ 行内与 $$...$$ 块级公式,
+  // SVG 输出(自带字形,无需另行随包字体文件);不自动扫描整页,按需对预览容器 typeset。
+  window.MathJax = {
+    tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] },
+    svg: { fontCache: 'local' },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    startup: { typeset: false }
+  };
+</script>
+<script src="/lib/tex-svg.js" async></script>
+<script src="/lib/mermaid.min.js"></script>
 <style>
   :root {
     --bg:#fff; --fg:#333; --sidebar:#f8f8f8; --muted:#999; --line:#eee;
@@ -93,7 +105,10 @@
   .nav-fav.active { background:var(--accent-bg); color:var(--accent); font-weight:500; }
   .nav-fav .star { color:var(--star); width:15px; height:15px; }
   .nav-fav .nico { width:15px; height:15px; flex-shrink:0; }
-  #navNotes { margin-top:10px; }
+  /* 记事板 + 我的收藏 并排一行 */
+  .nav-row { display:flex; gap:6px; margin:10px 8px 4px; }
+  .nav-row .nav-fav { flex:1; min-width:0; margin:0; }
+  .nav-row .nav-fav span:first-of-type { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .kb-list { flex:1; padding:4px 8px; }
 
   /* 记事板 */
@@ -240,6 +255,24 @@
   .sh-item { padding:7px 11px; font-size:13px; color:#444; cursor:pointer;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .sh-item:hover { background:#f2f0f7; color:#111; }
+  .sh-hint { padding:7px 11px; font-size:11px; color:#999; border-top:1px solid #f0f0f0;
+    line-height:1.7; white-space:normal; }
+  .sh-hint b { color:#5b21b6; font-weight:600; }
+  /* 文档属性 / 反向链接面板(markdown 预览内) */
+  .doc-props { border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin:0 0 14px;
+    background:var(--card); font-size:13px; }
+  .doc-props .dp-title, .doc-backlinks .dp-title { font-size:11px; color:var(--muted);
+    letter-spacing:.04em; margin-bottom:6px; }
+  .dp-row { display:flex; gap:10px; padding:2px 0; }
+  .dp-k { flex:0 0 120px; color:#666; word-break:break-word; }
+  .dp-v { flex:1; color:#222; word-break:break-word; }
+  .doc-backlinks { border-top:1px solid var(--line); margin-top:22px; padding-top:12px; }
+  .bl-row { display:flex; justify-content:space-between; align-items:center; gap:10px;
+    padding:6px 10px; border:1px solid var(--card-line); border-radius:6px; margin:5px 0;
+    cursor:pointer; background:var(--card); }
+  .bl-row:hover { background:#f2f0f7; }
+  .bl-title { color:var(--link); font-size:13px; }
+  .bl-path { color:var(--muted); font-size:11px; white-space:nowrap; }
   .content { flex:1; overflow-y:auto; position:relative; padding:8px 24px 24px; }
   .content.drag-over::after { content:"松开上传文件 / 文件夹到当前目录"; position:absolute; inset:8px;
     border:2px dashed var(--accent); border-radius:12px; background:rgba(232,224,240,.5);
@@ -333,6 +366,11 @@
   .sr-row .t { font-weight:600; color:#333; display:flex; align-items:center; gap:8px; }
   .sr-row:hover .t { color:var(--link); }
   .sr-row .m { color:var(--muted); font-size:12px; }
+  .sr-score { display:inline-block; padding:1px 7px; border-radius:10px; font-weight:700;
+    font-size:12px; color:#fff; vertical-align:middle; }
+  .sr-score.hi { background:#16a34a; }   /* 高相关 */
+  .sr-score.mid { background:var(--accent); }
+  .sr-score.lo { background:#9ca3af; }
   .sr-row .m .sr-path { color:#9b96c4; cursor:pointer; }
   .sr-row .m .sr-path:hover { color:var(--accent); text-decoration:underline; }
   .sr-row .s { color:#666; font-size:13px; margin-top:2px; }
@@ -460,16 +498,18 @@
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="brand"><img src="/favicon.svg" alt="" />Ktree<span class="brand-ver" id="brandVer"></span>
+    <div class="brand"><img src="/favicon.svg" alt="" /><span id="brandName">Ktree</span><span class="brand-ver" id="brandVer"></span>
       <button class="brand-ops" id="btnOps" title="操作…">⋮</button>
     </div>
-    <div class="nav-fav" id="navNotes">
-      <svg class="nico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h9l4 4v14H6z"/><path d="M9 9h6M9 13h6M9 17h4"/></svg>
-      <span>记事板</span>
-    </div>
-    <div class="nav-fav" id="navFav">
-      <svg class="star" viewBox="0 0 24 24"><path d="M12 3l2.7 5.5 6 .9-4.3 4.2 1 6-5.4-2.8-5.4 2.8 1-6L3.3 9.4l6-.9z" fill="currentColor"/></svg>
-      <span>我的收藏</span><span id="favCount" style="margin-left:auto;color:#999;font-size:12px"></span>
+    <div class="nav-row">
+      <div class="nav-fav" id="navNotes">
+        <svg class="nico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h9l4 4v14H6z"/><path d="M9 9h6M9 13h6M9 17h4"/></svg>
+        <span>记事板</span>
+      </div>
+      <div class="nav-fav" id="navFav">
+        <svg class="star" viewBox="0 0 24 24"><path d="M12 3l2.7 5.5 6 .9-4.3 4.2 1 6-5.4-2.8-5.4 2.8 1-6L3.3 9.4l6-.9z" fill="currentColor"/></svg>
+        <span>我的收藏</span><span id="favCount" style="margin-left:auto;color:#999;font-size:12px"></span>
+      </div>
     </div>
     <div class="kb-list" id="kbList"></div>
     <div class="side-status" id="sideStatus"></div>
@@ -482,7 +522,7 @@
       <div class="topbar-actions">
         <button class="btn" id="btnNewNote" style="display:none">＋ 新增记事</button>
         <div class="search-wrap">
-          <input type="text" id="globalSearch" class="search-input" placeholder="搜索… (回车)" autocomplete="off" />
+          <input type="text" id="globalSearch" class="search-input" placeholder="搜索…(支持 tag: path: type: 等算子,回车)" autocomplete="off" />
           <button class="search-clear" id="searchClear" style="display:none" title="清空搜索">×</button>
           <div class="search-hist" id="searchHist" style="display:none"></div>
         </div>
@@ -709,6 +749,11 @@ function fmtDate(sec){
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 function extOf(name){ return (name.split('.').pop()||'').toLowerCase(); }
+// 搜索相关度徽标:按分数高/中/低着色,醒目展示。
+function scorePill(s){
+  const v=Number(s)||0; const tier=v>=90?'hi':v>=70?'mid':'lo';
+  return `<span class="sr-score ${tier}">${v.toFixed(1)}</span>`;
+}
 // 静态文件直链:/<知识库名>/<相对知识库根的路径>
 function rawUrl(path,kb){
   const segs=String(path).split('/').filter(Boolean).map(encodeURIComponent).join('/');
@@ -1195,7 +1240,13 @@ function formatVcsReports(reports,errors){
 async function boot(){
   updateFavCount();
   // 拉自定义域名:复制地址会优先用它替代 location.origin
-  try { const env=await api('/api/env'); CUSTOM_DOMAIN=env.custom_domain||''; if(env.version){ const bv=document.getElementById('brandVer'); if(bv) bv.textContent='v'+env.version; } } catch(e){ CUSTOM_DOMAIN=''; }
+  try {
+    const env=await api('/api/env'); CUSTOM_DOMAIN=env.custom_domain||'';
+    if(env.version){ const bv=document.getElementById('brandVer'); if(bv) bv.textContent='v'+env.version; }
+    const name=(env.site_name||'').trim()||'Ktree';
+    const bn=document.getElementById('brandName'); if(bn) bn.textContent=name;
+    document.title=name==='Ktree'?'Ktree 知识库':name;
+  } catch(e){ CUSTOM_DOMAIN=''; }
   restoreTreeState(); // 刷新后恢复折叠 / 展开 / 当前目录
   await loadKbs();
   // web 链接直达:记事板 / 某条公共记事 / 某个目录 / 操作弹窗
@@ -2123,17 +2174,26 @@ function hideSearchHist(){ const b=document.getElementById('searchHist'); if(b) 
 function showSearchHist(){
   const box=document.getElementById('searchHist');
   const h=searchHistory();
-  if(!h.length){ hideSearchHist(); return; }
-  box.innerHTML='<div class="sh-head"><span>搜索历史</span><span class="sh-clear">清空</span></div>'
-    + h.map(()=>'<div class="sh-item"></div>').join('');
-  const items=box.querySelectorAll('.sh-item');
-  h.forEach((q,i)=>{
-    items[i].textContent=q;
-    items[i].onmousedown=ev=>{ ev.preventDefault(); gs.value=q; syncSearchClear(); hideSearchHist(); doSearch(); };
-  });
-  box.querySelector('.sh-clear').onmousedown=ev=>{
-    ev.preventDefault(); localStorage.removeItem('ktree-search-hist'); showSearchHist();
-  };
+  // 算子语法提示常驻底部(即使没有历史也展示,作为搜索能力的发现入口)
+  const hint='<div class="sh-hint">算子过滤:'
+    +'<b>tag:</b>规范 <b>path:</b>vcs <b>type:</b>md <b>kb:</b>id <b>title:</b>"配置 表" <b>prop:</b>status=done'
+    +' ・ <b>-</b>取反 ・ 与关键词混用 ・ 仅算子则按更新时间列出</div>';
+  let html='';
+  if(h.length){
+    html='<div class="sh-head"><span>搜索历史</span><span class="sh-clear">清空</span></div>'
+      + h.map(()=>'<div class="sh-item"></div>').join('');
+  }
+  box.innerHTML = html + hint;
+  if(h.length){
+    const items=box.querySelectorAll('.sh-item');
+    h.forEach((q,i)=>{
+      items[i].textContent=q;
+      items[i].onmousedown=ev=>{ ev.preventDefault(); gs.value=q; syncSearchClear(); hideSearchHist(); doSearch(); };
+    });
+    box.querySelector('.sh-clear').onmousedown=ev=>{
+      ev.preventDefault(); localStorage.removeItem('ktree-search-hist'); showSearchHist();
+    };
+  }
   box.style.display='';
 }
 gs.addEventListener('focus', showSearchHist);
@@ -2173,13 +2233,13 @@ async function doSearch(){
         return `<div class="sr-row" data-act="view" data-kb="${esc(h.kb_id)}"
             data-path="${esc(previewPath)}" data-name="${esc(previewName)}">
           <div class="t">${esc(h.title)} <span class="tag">${esc(h.category||'未分类')}</span></div>
-          <div class="m">#${h.doc_id} · 相关度 ${h.score.toFixed(2)}${pathHtml}</div>
+          <div class="m">#${h.doc_id} · 相关度 ${scorePill(h.score)}${h.updated_at?' · '+fmtDate(h.updated_at):''}${pathHtml}</div>
           <div class="s">${esc(h.summary)}</div>
         </div>`;
       }
       return `<div class="sr-row" data-act="viewmd" data-id="${h.doc_id}" data-name="${esc(h.title)}.md">
         <div class="t">${esc(h.title)} <span class="tag">${esc(h.category||'未分类')}</span></div>
-        <div class="m">#${h.doc_id} · 相关度 ${h.score.toFixed(2)}</div>
+        <div class="m">#${h.doc_id} · 相关度 ${scorePill(h.score)}${h.updated_at?' · '+fmtDate(h.updated_at):''}</div>
         <div class="s">${esc(h.summary)}</div>
       </div>`;
     }).join('');
@@ -2382,27 +2442,143 @@ function rewriteMarkdownResourceUrls(root,baseUrl){
     el.setAttribute('srcset', rewriteSrcset(el.getAttribute('srcset'), baseUrl));
   });
 }
+// ---- 富渲染:Mermaid 图 + MathJax 公式(库均离线随包,见 /lib/*) ----
+let _mermaidReady=false;
+function ensureMermaid(){
+  if(_mermaidReady) return true;
+  if(!window.mermaid) return false;
+  try { mermaid.initialize({ startOnLoad:false, theme:'default', securityLevel:'strict' }); _mermaidReady=true; }
+  catch(e){ _mermaidReady=false; }
+  return _mermaidReady;
+}
+// 把 $...$ / $$...$$ 用占位符保护起来,避开 markdown 对其中下划线/星号的转义;
+// 占位符用控制字符,markdown 不会改写。还原在 marked 之后、MathJax 之前。
+function protectMath(src){
+  const store=[];
+  const stash=(m)=>{ store.push(m); return 'M'+(store.length-1)+''; };
+  src = src.replace(/\$\$([\s\S]+?)\$\$/g, stash);
+  try {
+    // 行内:$ 后紧跟非空白、$ 前为非空白 —— lookbehind 排除「$100 and $200」这类货币误判
+    const inline = new RegExp('\\$(?!\\s)([^\\n$]*?)(?<!\\s)\\$','g');
+    src = src.replace(inline, stash);
+  } catch(e){
+    // 引擎不支持 lookbehind:退化为较宽松的行内匹配
+    src = src.replace(/\$(\S[^\n$]*?)\$/g, stash);
+  }
+  return { src, store };
+}
+function restoreMath(html, store){
+  return html.replace(/M(\d+)/g, (m,i)=> (i in store ? store[i] : m));
+}
+async function enhanceMarkdown(container){
+  // 代码高亮:marked v12 已移除内置 highlight 选项,改为渲染后逐块用 hljs 上色(跳过 mermaid)
+  if(window.hljs){
+    container.querySelectorAll('pre code').forEach(el=>{
+      if(el.classList.contains('language-mermaid')) return;
+      try { hljs.highlightElement(el); } catch(e){}
+    });
+  }
+  // Mermaid:把 ```mermaid 代码块换成 <div class="mermaid"> 再渲染
+  const blocks = container.querySelectorAll('code.language-mermaid');
+  if(blocks.length && ensureMermaid()){
+    blocks.forEach(code=>{
+      const div=document.createElement('div');
+      div.className='mermaid';
+      div.textContent=code.textContent;
+      (code.closest('pre')||code).replaceWith(div);
+    });
+    const nodes=container.querySelectorAll('.mermaid');
+    try {
+      if(typeof mermaid.run==='function') await mermaid.run({ nodes });
+      else mermaid.init(undefined, nodes); // v9.3 及更早的回退
+    } catch(e){ /* 渲染失败时保留 .mermaid 里的源码文本 */ }
+  }
+  // MathJax:对容器做公式排版
+  if(window.MathJax && MathJax.typesetPromise){
+    try { await MathJax.typesetPromise([container]); } catch(e){}
+  }
+}
 async function showMarkdownPreview(url,name){
   const body=createModal(name,url);
   body.innerHTML='<div class="md-body"><p style="color:#ccc">加载中…</p></div>';
   try {
     const text=await (await fetch(url)).text();
     if(window.marked){
-      if(window.hljs){
-        marked.setOptions({ highlight:(code,lang)=>{
-          try { return lang&&hljs.getLanguage(lang)
-            ? hljs.highlight(code,{language:lang}).value : hljs.highlightAuto(code).value; }
-          catch(e){ return code; }
-        }});
-      }
+      const { src, store } = protectMath(text);
       const md=document.createElement('div');
       md.className='md-body';
-      md.innerHTML=marked.parse(text);
+      md.innerHTML=restoreMath(marked.parse(src), store);
       rewriteMarkdownResourceUrls(md,url);
       body.innerHTML='';
       body.appendChild(md);
+      enhanceMarkdown(md);
+      attachDocPanels(md, url);
     } else { body.innerHTML='<pre class="pv-code">'+esc(text)+'</pre>'; }
   } catch(e){ body.innerHTML='<div class="md-body"><p style="color:#c00">加载失败:'+esc(e)+'</p></div>'; }
+}
+// 从预览 URL 反推 {kb, path, props}:支持 /<kb>/<path> 与 /api/doc/<id>/md 两种形态。
+async function resolveDocCtx(url){
+  const m=String(url).match(/\/api\/doc\/(\d+)\/md/);
+  if(m){
+    try {
+      const d=(await api('/api/doc/'+m[1])).document;
+      if(d) return { kb:d.kb_id, path:d.rel_path, props:safeJson(d.props) };
+    } catch(e){}
+    return null;
+  }
+  try {
+    const u=new URL(url, location.origin);
+    const parts=u.pathname.replace(/^\/+/,'').split('/').map(decodeURIComponent);
+    const kb=parts.shift()||''; const path=parts.join('/');
+    if(!kb||!path) return null;
+    return { kb, path, props:null };
+  } catch(e){ return null; }
+}
+function safeJson(s){ if(!s) return null; try { return JSON.parse(s); } catch(e){ return null; } }
+// 打开一条反向链接来源文档(复用文件列表的预览路径判定)。
+function openBacklink(b){
+  const previewPath=previewPathOf(b);
+  const name=previewPath?previewPath.split('/').pop():((b.title||'doc')+'.md');
+  if(previewPath && b.kb_id) previewFile(rawUrl(previewPath, b.kb_id), name);
+  else showMarkdownPreview('/api/doc/'+b.doc_id+'/md', name);
+}
+// 给打开的 markdown 预览挂上「属性」(置顶)与「反向链接」(底部)两块面板。
+function relPanel(title, items, showScore){
+  const panel=document.createElement('div'); panel.className='doc-backlinks';
+  const head=document.createElement('div'); head.className='dp-title'; head.textContent=title+' · '+items.length;
+  panel.appendChild(head);
+  items.forEach(b=>{
+    const row=document.createElement('div'); row.className='bl-row';
+    const right=(showScore && b.score!=null) ? (b.score+'%') : (b.category||'');
+    row.innerHTML=`<span class="bl-title">${esc(b.title)}</span><span class="bl-path">${esc(right)}</span>`;
+    row.onclick=()=>openBacklink(b);
+    panel.appendChild(row);
+  });
+  return panel;
+}
+async function attachDocPanels(md, url){
+  const ctx=await resolveDocCtx(url);
+  if(!ctx || !ctx.kb || !ctx.path) return;
+  const qs=`kb=${encodeURIComponent(ctx.kb)}&path=${encodeURIComponent(ctx.path)}`;
+  // 并行取:反向链接(含目标 props)+ 语义相关文档
+  const [data, rel] = await Promise.all([
+    api('/api/backlinks?'+qs).catch(()=>({})),
+    api('/api/related?'+qs).catch(()=>({}))
+  ]);
+  // 属性面板(置顶)
+  const props=(data.doc && data.doc.props) || ctx.props || null;
+  if(props && typeof props==='object' && Object.keys(props).length){
+    const panel=document.createElement('div'); panel.className='doc-props';
+    panel.innerHTML='<div class="dp-title">属性</div>'+Object.entries(props).map(([k,v])=>
+      `<div class="dp-row"><span class="dp-k">${esc(k)}</span><span class="dp-v">${esc(String(v))}</span></div>`).join('');
+    md.parentNode.insertBefore(panel, md);
+  }
+  // 相关文档(语义)——对生成式 md 真正有用的关系信号
+  const related=(rel&&rel.related)||[];
+  if(related.length) md.parentNode.appendChild(relPanel('相关文档', related, true));
+  // 反向链接——仅当确有互链时才显示(多见于手写 md wiki),否则不展示空面板
+  const bl=data.backlinks||[];
+  if(bl.length) md.parentNode.appendChild(relPanel('反向链接', bl, false));
 }
 async function showCodePreview(url,name){
   const body=createModal(name,url);
