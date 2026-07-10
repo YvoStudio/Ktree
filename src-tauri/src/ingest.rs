@@ -181,7 +181,8 @@ pub fn ingest_file(
         .to_string();
     let category = kbmeta::category_of(rel_path);
 
-    // 增量:manifest md5 未变 且 SQLite 已有 且 docs 产物文件仍在 → 跳过。
+    // 增量:manifest / SQLite md5 均未变、二者记录的产物路径一致,
+    // 且 docs 产物文件仍在 → 跳过。
     // 多加一道"docs 产物存在性"检查:换 URL / 改结构 / 软链断裂等导致 docs 失步时,
     // 不能因 md5 匹配就短路 —— 那样缺失的 docs 产物永远补不回来。docs 不在则重新生成。
     let mut manifest = kbmeta::load_manifest(&kb.root);
@@ -189,12 +190,14 @@ pub fn ingest_file(
         if let Some(entry) = manifest.get(rel_path) {
             if entry.md5 == md5 {
                 if let Some(doc) = state.store.get_by_path(&kb.id, rel_path)? {
+                    let store_ok = doc.md5 == md5
+                        && entry.output == doc.md_path.as_deref().unwrap_or_default();
                     let docs_ok = doc
                         .md_path
                         .as_ref()
-                        .map(|md| kb.root.join(md).exists())
-                        .unwrap_or(true);
-                    if docs_ok {
+                        .map(|md| kb.root.join(md).is_file())
+                        .unwrap_or(false);
+                    if store_ok && docs_ok {
                         return Ok(doc);
                     }
                 }
@@ -312,20 +315,34 @@ pub fn ingest_file(
         .ok_or_else(|| anyhow::anyhow!("入库后无法读回文档 id={doc_id}"))
 }
 
-/// 严格镜像收尾:清理 docs/<prefix> 区下不属于当前 store 文档的孤儿文件与空目录。
-/// vcs/cloud 区是只读镜像,docs 产物应与 store 严格一一对应;基于 store diff 的
-/// delete_doc 清不掉"store 已无记录"的历史失步残留,这里以 store 为真相兜底自愈。
+/// 严格镜像收尾:清理 docs/<prefix> 区下不再同时对应 src 原件与 store 文档的
+/// 孤儿文件、断链软链接和空目录。src 是来源真相,store 只作为产物路径映射。
 /// `prefix` 是相对 src/ 的区前缀(如 "vcs/svn"、"cloud/feishu/xxx")。返回清理的文件数。
 pub fn prune_docs_orphans(
     state: &AppState,
     kb: &KnowledgeBase,
     prefix: &str,
 ) -> anyhow::Result<usize> {
-    // 当前 store 里该区的全部文档 → 合法的 docs 产物路径(相对 docs/)+ .assets 目录
-    let docs = state.store.list_documents(&kb.id, Some(prefix))?;
+    prune_docs_orphans_with_store(&state.store, kb, prefix)
+}
+
+fn prune_docs_orphans_with_store(
+    store: &crate::store::Store,
+    kb: &KnowledgeBase,
+    prefix: &str,
+) -> anyhow::Result<usize> {
+    // 当前 store 里该区且 src 原件仍存在的文档 → 合法 docs 产物路径 + .assets 目录。
+    // store 可能因一次漏掉的 SVN 删除而残留旧记录,不能仅凭 store 就保留 docs,
+    // 否则源文件已删除的断链软链接会永久留在阅读视图。
+    let docs = store.list_documents(&kb.id, Some(prefix))?;
     let mut keep_files: HashSet<String> = HashSet::new();
     let mut keep_assets: HashSet<String> = HashSet::new();
     for d in &docs {
+        if path_has_ignored_component(&d.rel_path)
+            || !kb.root.join("src").join(&d.rel_path).is_file()
+        {
+            continue;
+        }
         if let Some(md) = &d.md_path {
             if let Some(rel) = md.strip_prefix("docs/") {
                 keep_files.insert(rel.to_string());
@@ -341,26 +358,26 @@ pub fn prune_docs_orphans(
     }
 
     // 递归收集 docs/<prefix> 下所有文件(相对 docs/ 的正斜杠路径)
-    fn walk(base: &Path, rel: &str, out: &mut Vec<String>) {
-        let Ok(entries) = fs::read_dir(base.join(rel)) else {
-            return;
-        };
-        for e in entries.flatten() {
+    fn walk(base: &Path, rel: &str, out: &mut Vec<String>) -> std::io::Result<()> {
+        for entry in fs::read_dir(base.join(rel))? {
+            let e = entry?;
             let name = e.file_name().to_string_lossy().into_owned();
             let child = if rel.is_empty() {
                 name.clone()
             } else {
                 format!("{rel}/{name}")
             };
-            match e.file_type() {
-                Ok(t) if t.is_dir() => walk(base, &child, out),
-                Ok(_) => out.push(child),
-                _ => {}
+            if e.file_type()?.is_dir() {
+                walk(base, &child, out)?;
+            } else {
+                // 包含普通文件和软链接(包括源文件已删除后的断链软链接)。
+                out.push(child);
             }
         }
+        Ok(())
     }
     let mut files = Vec::new();
-    walk(&docs_base, prefix, &mut files);
+    walk(&docs_base, prefix, &mut files)?;
 
     let mut removed = 0;
     for f in files {
@@ -371,23 +388,30 @@ pub fn prune_docs_orphans(
         if keep_assets.iter().any(|a| f.starts_with(&format!("{a}/"))) {
             continue;
         }
-        if fs::remove_file(docs_base.join(&f)).is_ok() {
-            removed += 1;
-        }
+        let stale = docs_base.join(&f);
+        fs::remove_file(&stale)
+            .map_err(|e| anyhow::anyhow!("清理 docs 孤儿文件失败({}): {e}", stale.display()))?;
+        removed += 1;
     }
 
     // 自底向上删空目录(scan_root 本身若空也删,下次同步会重建)
-    fn rm_empty(dir: &Path) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for e in entries.flatten() {
-                if e.path().is_dir() {
-                    rm_empty(&e.path());
-                }
+    fn rm_empty(dir: &Path) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let e = entry?;
+            if e.file_type()?.is_dir() {
+                rm_empty(&e.path())?;
             }
         }
-        let _ = fs::remove_dir(dir); // 非空会失败,忽略
+        // 目录仍有合法产物时保留;已经为空则删除,此时权限等失败需要向上报告。
+        if fs::read_dir(dir)?.next().transpose()?.is_some() {
+            Ok(())
+        } else {
+            fs::remove_dir(dir)
+        }
     }
-    rm_empty(&scan_root);
+    rm_empty(&scan_root).map_err(|e| {
+        anyhow::anyhow!("清理 docs 空目录失败({}): {e}", scan_root.display())
+    })?;
 
     Ok(removed)
 }
@@ -760,7 +784,10 @@ pub fn backfill_vectors(state: &AppState) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_links, link_key_of, parse_frontmatter_props, path_has_ignored_component};
+    use super::{
+        extract_links, link_key_of, parse_frontmatter_props, path_has_ignored_component,
+        prune_docs_orphans_with_store,
+    };
 
     #[test]
     fn explicit_ignore_prefix_only() {
@@ -804,5 +831,76 @@ mod tests {
         assert!(!props.contains("nested"));
         // 无 frontmatter → 空
         assert_eq!(parse_frontmatter_props("正文无 frontmatter"), "");
+    }
+
+    #[test]
+    fn prune_removes_outputs_whose_sources_were_deleted() {
+        use crate::config::KnowledgeBase;
+        use crate::store::{NewDocument, Store};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static C: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ktree_prune_{}_{}",
+            std::process::id(),
+            C.fetch_add(1, Ordering::SeqCst)
+        ));
+        let prefix = "vcs/svn";
+        let stale_dir = root.join("docs/vcs/svn/docs/旧目录");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(stale_dir.join("旧转换.md"), "stale").unwrap();
+
+        let store = Store::open(&root.join("test.db")).unwrap();
+        let add_doc = |rel_path: &str, md_path: &str| {
+            store
+                .upsert_document(&NewDocument {
+                    kb_id: "kb".to_string(),
+                    rel_path: rel_path.to_string(),
+                    title: "stale".to_string(),
+                    ext: "md".to_string(),
+                    size: 0,
+                    md5: String::new(),
+                    summary: String::new(),
+                    tags: String::new(),
+                    props: String::new(),
+                    md_path: Some(md_path.to_string()),
+                    source: "vcs".to_string(),
+                })
+                .unwrap();
+        };
+        add_doc(
+            "vcs/svn/docs/旧目录/旧转换.docx",
+            "docs/vcs/svn/docs/旧目录/旧转换.md",
+        );
+
+        let mut expected_removed = 1;
+        #[cfg(unix)]
+        {
+            // Markdown / 文本源文件使用软链接镜像;源删除后会变成截图中的断链项。
+            std::os::unix::fs::symlink(
+                "../../../../../../src/vcs/svn/docs/旧目录/断链.md",
+                stale_dir.join("断链.md"),
+            )
+            .unwrap();
+            add_doc(
+                "vcs/svn/docs/旧目录/断链.md",
+                "docs/vcs/svn/docs/旧目录/断链.md",
+            );
+            expected_removed += 1;
+        }
+
+        let kb = KnowledgeBase {
+            id: "kb".to_string(),
+            name: "kb".to_string(),
+            root: root.clone(),
+            vcs_bindings: Vec::new(),
+            cloud_bindings: Vec::new(),
+        };
+        let removed = prune_docs_orphans_with_store(&store, &kb, prefix).unwrap();
+        assert_eq!(removed, expected_removed);
+        assert!(!stale_dir.exists(), "清完断链文件后应递归删除空目录");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

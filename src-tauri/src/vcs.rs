@@ -1065,11 +1065,16 @@ fn ingest_vcs_rel_path(
 
     let old_doc = state.store.get_by_path(&kb.id, rel_path).ok().flatten();
     let old_md5 = old_doc.as_ref().map(|d| d.md5.as_str());
+    let old_output_ok = old_doc
+        .as_ref()
+        .and_then(|d| d.md_path.as_ref())
+        .map(|md| kb.root.join(md).is_file())
+        .unwrap_or(false);
     match ingest::ingest_file(state, kb, rel_path, "vcs", true, false) {
         Ok(doc) => {
             if old_doc.is_none() {
                 report.added.push(rel_path.to_string());
-            } else if old_md5 != Some(doc.md5.as_str()) {
+            } else if old_md5 != Some(doc.md5.as_str()) || !old_output_ok {
                 report.updated.push(rel_path.to_string());
             }
         }
@@ -1120,7 +1125,9 @@ fn reconcile_full(
         delete_vcs_rel_path(state, kb, rel_path, report);
     }
 
-    let _ = ingest::prune_docs_orphans(state, kb, prefix);
+    // docs 是 VCS 的严格镜像;清理失败必须让本次同步失败并在 UI 中可见,
+    // 不能静默留下点开后报“文件不存在”的断链目录。
+    ingest::prune_docs_orphans(state, kb, prefix)?;
     Ok(())
 }
 
@@ -1142,40 +1149,112 @@ fn reconcile_incremental(
     Ok(())
 }
 
-/// src 镜像里会被入库的文件数:盘上文件(已严格镜像)排除忽略规则后的数量。
-fn count_src_ingestable(target: &Path, prefix: &str) -> usize {
-    list_repo_files(target)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| !ingest::path_has_ignored_component(&format!("{prefix}/{r}")))
-        .count()
+/// SVN 增量同步后的逐文件一致性审计。
+///
+/// 过去只比较 src / docs 文件总数,当“漏一个新产物 + 留一个旧产物”时数量会抵消,
+/// 仍会错误地判定同步完整。这里以 src 为真相,逐项核对 store、manifest、内容 md5
+/// 和 docs 主产物,也检查 store 中是否残留已从 src 消失的记录。
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ReconcileAudit {
+    source_files: usize,
+    stored_docs: usize,
+    missing_store: Vec<String>,
+    stale_store: Vec<String>,
+    stale_content: Vec<String>,
+    missing_outputs: Vec<String>,
+    manifest_mismatches: Vec<String>,
+    unreadable_sources: Vec<String>,
 }
 
-/// docs/<prefix> 下「主产物」文件数:递归计文件,但跳过 `*.assets` 目录(转换出的图片附件)。
-/// 每个非忽略 src 文件恰好对应一个主产物,故正常时应与 [`count_src_ingestable`] 相等;
-/// 不等 = 有文件镜像了却没入库,或 docs 的 md 产物缺失。
-fn count_docs_primary(kb_root: &Path, prefix: &str) -> usize {
-    fn walk(dir: &Path, n: &mut usize) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
+impl ReconcileAudit {
+    fn is_consistent(&self) -> bool {
+        self.missing_store.is_empty()
+            && self.stale_store.is_empty()
+            && self.stale_content.is_empty()
+            && self.missing_outputs.is_empty()
+            && self.manifest_mismatches.is_empty()
+            && self.unreadable_sources.is_empty()
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "src {}, store {}; 缺记录 {}, 多余记录 {}, 内容失步 {}, 缺产物 {}, manifest 失步 {}, 源文件不可读 {}",
+            self.source_files,
+            self.stored_docs,
+            self.missing_store.len(),
+            self.stale_store.len(),
+            self.stale_content.len(),
+            self.missing_outputs.len(),
+            self.manifest_mismatches.len(),
+            self.unreadable_sources.len(),
+        )
+    }
+}
+
+fn audit_reconcile_state(
+    store: &crate::store::Store,
+    kb: &KnowledgeBase,
+    target: &Path,
+    prefix: &str,
+) -> anyhow::Result<ReconcileAudit> {
+    let manifest = crate::kbmeta::load_manifest(&kb.root);
+    let docs = store.list_documents(&kb.id, Some(prefix))?;
+    let stored_by_path: std::collections::HashMap<&str, &crate::store::Document> = docs
+        .iter()
+        .map(|doc| (doc.rel_path.as_str(), doc))
+        .collect();
+
+    let mut audit = ReconcileAudit {
+        stored_docs: docs.len(),
+        ..ReconcileAudit::default()
+    };
+    let mut expected = HashSet::new();
+
+    for repo_rel in list_repo_files(target)? {
+        let rel_path = format!("{prefix}/{repo_rel}");
+        if ingest::path_has_ignored_component(&rel_path) {
+            continue;
+        }
+        audit.source_files += 1;
+        expected.insert(rel_path.clone());
+
+        let Some(doc) = stored_by_path.get(rel_path.as_str()).copied() else {
+            audit.missing_store.push(rel_path);
+            continue;
         };
-        for e in entries.flatten() {
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() {
-                if e.file_name().to_string_lossy().ends_with(".assets") {
-                    continue; // 图片附件目录整体不计入主产物
-                }
-                walk(&e.path(), n);
-            } else if ft.is_file() || ft.is_symlink() {
-                // mirror_into_docs 对文本/不转换文件建的是符号链接(Windows 管理员 / unix),
-                // read_dir 下 symlink 既非 is_file 也非 is_dir,必须显式计入,否则少数。
-                *n += 1;
+
+        let source_md5 = match fs::read(target.join(&repo_rel)) {
+            Ok(bytes) => format!("{:x}", Md5::digest(&bytes)),
+            Err(_) => {
+                audit.unreadable_sources.push(rel_path);
+                continue;
             }
+        };
+        if doc.md5 != source_md5 {
+            audit.stale_content.push(rel_path.clone());
+        }
+
+        let output = doc.md_path.as_deref().unwrap_or_default();
+        if output.is_empty() || !kb.root.join(output).is_file() {
+            audit.missing_outputs.push(rel_path.clone());
+        }
+
+        let manifest_ok = manifest
+            .get(&rel_path)
+            .map(|entry| entry.md5 == source_md5 && entry.output == output)
+            .unwrap_or(false);
+        if !manifest_ok {
+            audit.manifest_mismatches.push(rel_path);
         }
     }
-    let mut n = 0;
-    walk(&kb_root.join("docs").join(prefix), &mut n);
-    n
+
+    for doc in &docs {
+        if !expected.contains(&doc.rel_path) {
+            audit.stale_store.push(doc.rel_path.clone());
+        }
+    }
+
+    Ok(audit)
 }
 
 /// 对一个绑定执行一次同步:拉取/更新(严格镜像)→ diff store → 入库 / 删除。
@@ -1244,16 +1323,23 @@ fn sync_binding_inner(
                         state, kb, &target, &prefix, &changed, &deleted, &mut report,
                     )?;
                 }
-                // 兜底核对:不信任 SVN 增量报告是否完整 —— 盘上 src 文件数 ≠ docs 主产物数
-                // 就一定有遗漏(增量漏报、首轮边界、docs 产物被删等),补一次全库对账。
-                // 常态只数两次文件(零开销);不等才走重活,且 reconcile_full 幂等。
-                let src_n = count_src_ingestable(&target, &prefix);
-                let docs_n = count_docs_primary(&kb.root, &prefix);
-                if src_n != docs_n {
+                // 不信任 SVN 增量报告是否完整:逐文件核对 src / store / manifest / docs。
+                // 数量相等也可能是一漏一残留互相抵消;内容 md5 还能发现 SVN 漏报修改。
+                let audit = audit_reconcile_state(&state.store, kb, &target, &prefix)?;
+                if !audit.is_consistent() {
                     report.messages.push(format!(
-                        "镜像核对不一致(src {src_n} ≠ docs {docs_n}),触发全库对账补漏"
+                        "逐文件核对不一致({}),触发全库对账补漏",
+                        audit.summary()
                     ));
                     reconcile_full(state, kb, &target, &prefix, &mut report)?;
+
+                    let remaining = audit_reconcile_state(&state.store, kb, &target, &prefix)?;
+                    if !remaining.is_consistent() {
+                        report.messages.push(format!(
+                            "全库补漏后仍有不一致: {}",
+                            remaining.summary()
+                        ));
+                    }
                 }
             }
         }
@@ -1381,31 +1467,85 @@ mod tests {
         std::env::temp_dir().join(format!("ktree_vcs_{}_{}", std::process::id(), n))
     }
 
-    /// docs 主产物计数:递归计 .md / 镜像文件,但 `*.assets` 目录里的图片附件不计。
     #[test]
-    fn docs_primary_count_excludes_assets() {
+    fn audit_detects_equal_counts_with_different_paths() {
         let root = tmp_dir();
         let prefix = "vcs/demo";
-        let base = root.join("docs").join(prefix);
-        std::fs::create_dir_all(base.join("sub")).unwrap();
-        std::fs::create_dir_all(base.join("报告.assets")).unwrap();
-        // 主产物 3 个(含子目录里的)
-        std::fs::write(base.join("报告.md"), "x").unwrap();
-        std::fs::write(base.join("monster.md"), "x").unwrap();
-        std::fs::write(base.join("sub/note.md"), "x").unwrap();
-        // .assets 内的图片附件:不应计入
-        std::fs::write(base.join("报告.assets/img1.png"), "x").unwrap();
-        std::fs::write(base.join("报告.assets/img2.png"), "x").unwrap();
+        let target = root.join("src").join(prefix);
+        std::fs::create_dir_all(target.join("new-dir")).unwrap();
+        std::fs::create_dir_all(root.join("docs").join(prefix).join("old-dir")).unwrap();
+        std::fs::write(target.join("new-dir/missed.txt"), "new").unwrap();
+        std::fs::write(
+            root.join("docs").join(prefix).join("old-dir/stale.txt"),
+            "old",
+        )
+        .unwrap();
 
-        assert_eq!(count_docs_primary(&root, prefix), 3);
+        let store = crate::store::Store::open(&root.join("test.db")).unwrap();
+        store
+            .upsert_document(&crate::store::NewDocument {
+                kb_id: "kb".to_string(),
+                rel_path: format!("{prefix}/old-dir/stale.txt"),
+                title: "stale".to_string(),
+                ext: "txt".to_string(),
+                size: 3,
+                md5: format!("{:x}", Md5::digest(b"old")),
+                summary: String::new(),
+                tags: String::new(),
+                props: String::new(),
+                md_path: Some(format!("docs/{prefix}/old-dir/stale.txt")),
+                source: "vcs".to_string(),
+            })
+            .unwrap();
 
-        // mirror_into_docs 对文本文件建的是符号链接,也必须计入(否则在 dev1 上少数)
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink("../../../src/vcs/demo/note.md", base.join("linked.md"))
-                .unwrap();
-            assert_eq!(count_docs_primary(&root, prefix), 4, "符号链接镜像应计入主产物");
-        }
+        // 旧实现只看数量:src=1、docs=1,会误判正常。逐文件审计必须同时发现漏项与残留。
+        let kb = KnowledgeBase {
+            id: "kb".to_string(),
+            name: "kb".to_string(),
+            root: root.clone(),
+            vcs_bindings: Vec::new(),
+            cloud_bindings: Vec::new(),
+        };
+        let audit = audit_reconcile_state(&store, &kb, &target, prefix).unwrap();
+        assert_eq!(audit.source_files, 1);
+        assert_eq!(audit.stored_docs, 1);
+        assert_eq!(audit.missing_store, vec![format!("{prefix}/new-dir/missed.txt")]);
+        assert_eq!(audit.stale_store, vec![format!("{prefix}/old-dir/stale.txt")]);
+        assert!(!audit.is_consistent());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn audit_detects_whole_missing_directory() {
+        let root = tmp_dir();
+        let prefix = "vcs/demo";
+        let target = root.join("src").join(prefix);
+        std::fs::create_dir_all(target.join("missed-dir/sub-dir")).unwrap();
+        std::fs::write(target.join("missed-dir/a.docx"), "a").unwrap();
+        std::fs::write(target.join("missed-dir/sub-dir/b.xlsx"), "b").unwrap();
+
+        let store = crate::store::Store::open(&root.join("test.db")).unwrap();
+        let kb = KnowledgeBase {
+            id: "kb".to_string(),
+            name: "kb".to_string(),
+            root: root.clone(),
+            vcs_bindings: Vec::new(),
+            cloud_bindings: Vec::new(),
+        };
+
+        let mut audit = audit_reconcile_state(&store, &kb, &target, prefix).unwrap();
+        audit.missing_store.sort();
+        assert_eq!(audit.source_files, 2);
+        assert_eq!(audit.stored_docs, 0);
+        assert_eq!(
+            audit.missing_store,
+            vec![
+                format!("{prefix}/missed-dir/a.docx"),
+                format!("{prefix}/missed-dir/sub-dir/b.xlsx"),
+            ]
+        );
+        assert!(!audit.is_consistent());
 
         let _ = std::fs::remove_dir_all(&root);
     }
