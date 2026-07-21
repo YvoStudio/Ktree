@@ -43,7 +43,11 @@ pub fn save_manifest(kb_root: &Path, m: &Manifest) -> anyhow::Result<()> {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&p, serde_json::to_string_pretty(m)?)?;
+    // 原子写:manifest 可达数 MB,写一半被打断会留下解析不了的半截 JSON,
+    // load_manifest 会退化成空表,引发整库重新入库。先写临时文件再改名。
+    let tmp = p.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(m)?)?;
+    fs::rename(&tmp, &p)?;
     Ok(())
 }
 

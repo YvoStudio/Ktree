@@ -48,6 +48,9 @@ pub struct AppState {
     /// 正在同步中的绑定:key=(kind "vcs"|"cloud", kb_id, binding_idx)。
     /// 防止同一绑定并发同步(并发的 git/svn 进程会互相打架、留锁)。
     pub syncing: Arc<Mutex<HashSet<(String, String, usize)>>>,
+    /// 进行中同步的阶段描述(如「全库对账:入库核对 3500/14406」),同 key。
+    /// 大库一轮同步可达几十分钟,webui 需要能看到卡在哪个阶段,而不是干等"同步中…"。
+    pub sync_progress: Arc<Mutex<HashMap<(String, String, usize), String>>>,
 }
 
 impl AppState {
@@ -90,10 +93,27 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// 标记某绑定同步结束。
+    /// 标记某绑定同步结束(顺带清掉进度描述)。
     pub fn end_sync(&self, kind: &str, kb_id: &str, idx: usize) {
         if let Ok(mut s) = self.syncing.lock() {
             s.remove(&(kind.to_string(), kb_id.to_string(), idx));
         }
+        if let Ok(mut p) = self.sync_progress.lock() {
+            p.remove(&(kind.to_string(), kb_id.to_string(), idx));
+        }
+    }
+
+    /// 更新进行中同步的阶段描述,供 webui 轮询展示。
+    pub fn set_sync_progress(&self, kind: &str, kb_id: &str, idx: usize, msg: &str) {
+        if let Ok(mut p) = self.sync_progress.lock() {
+            p.insert((kind.to_string(), kb_id.to_string(), idx), msg.to_string());
+        }
+    }
+
+    pub fn get_sync_progress(&self, kind: &str, kb_id: &str, idx: usize) -> Option<String> {
+        self.sync_progress
+            .lock()
+            .ok()
+            .and_then(|p| p.get(&(kind.to_string(), kb_id.to_string(), idx)).cloned())
     }
 }

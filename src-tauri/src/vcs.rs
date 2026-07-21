@@ -16,6 +16,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::config::{KnowledgeBase, VcsBinding, AREA_VCS};
 use crate::ingest::{self, safe_component};
+use crate::kbmeta;
 use crate::state::{AppState, LastVcsSync};
 
 #[cfg(target_os = "windows")]
@@ -709,6 +710,17 @@ fn svn_export_rel_path(rel: &str) -> Option<PathBuf> {
     Some(out)
 }
 
+/// 路径任一组件以 '.' 开头(隐藏文件/目录,如 .claude/.obsidian)。
+///
+/// `list_repo_files` 扫描本地镜像时跳过隐藏路径,远端枚举、变更集必须用同一口径:
+/// 否则远端点文件每轮都被判成"本地缺失"→ 重复拉取入库,而审计的期望集合又不含
+/// 它们 → store 记录每轮被判残留 → 每轮都触发全库对账,同步永远做不完。
+fn path_has_hidden_component(rel: &str) -> bool {
+    rel.split('/')
+        .filter(|p| !p.is_empty())
+        .any(|p| p.starts_with('.'))
+}
+
 fn split_svn_entries_for_windows(
     entries: Vec<SvnListEntry>,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
@@ -716,6 +728,10 @@ fn split_svn_entries_for_windows(
     let mut files = Vec::new();
     let mut skipped = Vec::new();
     for entry in entries {
+        // 隐藏路径不属于镜像范围(与 list_repo_files 口径一致),静默略过
+        if path_has_hidden_component(&entry.rel) {
+            continue;
+        }
         if svn_export_rel_path(&entry.rel).is_none() {
             skipped.push(entry.rel);
             continue;
@@ -739,7 +755,7 @@ fn svn_update_targets(
     target: &Path,
     b: &VcsBinding,
     targets: &[String],
-    set_depth_empty: bool,
+    set_depth: Option<&str>,
     ctx: &str,
 ) -> anyhow::Result<String> {
     if targets.is_empty() {
@@ -751,13 +767,7 @@ fn svn_update_targets(
     for t in targets {
         let next_len = batch_len + t.len() + 8;
         if !batch.is_empty() && (batch.len() >= 200 || next_len > 12_000) {
-            combined.push_str(&svn_update_target_batch(
-                target,
-                b,
-                &batch,
-                set_depth_empty,
-                ctx,
-            )?);
+            combined.push_str(&svn_update_target_batch(target, b, &batch, set_depth, ctx)?);
             batch.clear();
             batch_len = 0;
         }
@@ -765,13 +775,7 @@ fn svn_update_targets(
         batch_len += t.len() + 8;
     }
     if !batch.is_empty() {
-        combined.push_str(&svn_update_target_batch(
-            target,
-            b,
-            &batch,
-            set_depth_empty,
-            ctx,
-        )?);
+        combined.push_str(&svn_update_target_batch(target, b, &batch, set_depth, ctx)?);
     }
     Ok(combined)
 }
@@ -780,14 +784,14 @@ fn svn_update_target_batch(
     target: &Path,
     b: &VcsBinding,
     targets: &[String],
-    set_depth_empty: bool,
+    set_depth: Option<&str>,
     ctx: &str,
 ) -> anyhow::Result<String> {
     let mut up = vcs_command("svn");
     up.current_dir(target).arg("update");
     svn_add_auth(&mut up, b);
-    if set_depth_empty {
-        up.arg("--set-depth").arg("empty");
+    if let Some(depth) = set_depth {
+        up.arg("--set-depth").arg(depth);
     }
     for t in targets {
         up.arg(t);
@@ -814,7 +818,7 @@ fn svn_update_dirs_by_depth(
             target,
             b,
             &dirs[start..end],
-            true,
+            Some("empty"),
             "svn update sparse dirs",
         )?);
         start = end;
@@ -870,7 +874,7 @@ fn svn_sparse_checkout_valid_paths(target: &Path, b: &VcsBinding) -> anyhow::Res
 
     let (dirs, files, skipped) = split_svn_entries_for_windows(svn_list_recursive_entries(b)?);
     svn_update_dirs_by_depth(target, b, &dirs)?;
-    svn_update_targets(target, b, &files, false, "svn update sparse files")?;
+    svn_update_targets(target, b, &files, None, "svn update sparse files")?;
     write_svn_sparse_marker(target, &revision, &skipped)?;
     Ok(revision)
 }
@@ -887,9 +891,20 @@ fn svn_refresh_sparse_workcopy(
     let valid_dirs: HashSet<String> = dirs.into_iter().collect();
     let local_files: HashSet<String> = list_repo_files(target)?.into_iter().collect();
 
+    // 本地有、远端没有 → 上游删除的残留。必须先 --set-depth exclude 从工作副本
+    // 反注册再删:仍登记在工作副本里的文件若只做文件系统删除,下一次 `svn update`
+    // 会按"丢失文件"从 pristine 原样恢复,和这里的清理形成删除/恢复的无限振荡。
     let stale: Vec<String> = local_files.difference(&remote_files).cloned().collect();
     for rel in &stale {
         if let Some(path) = safe_vcs_rel_path(rel) {
+            let mut ex = vcs_command("svn");
+            ex.current_dir(target)
+                .arg("update")
+                .arg("--set-depth")
+                .arg("exclude");
+            svn_add_auth(&mut ex, b);
+            ex.arg(rel);
+            let _ = run_cmd(ex, "svn exclude stale");
             let p = target.join(path);
             let _ = fs::remove_file(&p);
             deleted.insert(rel.clone());
@@ -897,7 +912,17 @@ fn svn_refresh_sparse_workcopy(
     }
 
     let missing: HashSet<String> = remote_files.difference(&local_files).cloned().collect();
-    let dirs_to_update = ancestor_dirs_for_files(&missing, &valid_dirs);
+    // 只物化盘上尚不存在的目录。对已有内容的目录执行 --set-depth empty 会把
+    // 整棵子树从工作副本清掉(仅按 missing 名单拉回部分文件):上游在大目录下
+    // 新增一个文件,就会引发整个子树被清空重拉 → 同步永远在全量重灌。
+    let dirs_to_update: Vec<String> = ancestor_dirs_for_files(&missing, &valid_dirs)
+        .into_iter()
+        .filter(|d| {
+            safe_vcs_rel_path(d)
+                .map(|p| !target.join(p).exists())
+                .unwrap_or(false)
+        })
+        .collect();
     svn_update_dirs_by_depth(target, b, &dirs_to_update)?;
     let mut missing_files: Vec<String> = missing.iter().cloned().collect();
     missing_files.sort();
@@ -905,7 +930,7 @@ fn svn_refresh_sparse_workcopy(
         target,
         b,
         &missing_files,
-        false,
+        None,
         "svn update sparse missing files",
     )?;
     let (more_changed, more_deleted) = parse_svn_update_changes(&out);
@@ -1002,6 +1027,10 @@ fn expand_changed_repo_files(
 ) -> anyhow::Result<HashSet<String>> {
     let mut out = HashSet::new();
     for rel in changed {
+        // svn update 输出里可能出现 .claude 等隐藏路径,不属于镜像范围
+        if path_has_hidden_component(rel) {
+            continue;
+        }
         let Some(rel_path) = safe_vcs_rel_path(rel) else {
             continue;
         };
@@ -1045,9 +1074,11 @@ fn ingest_vcs_rel_path(
     kb: &KnowledgeBase,
     rel_path: &str,
     report: &mut VcsSyncReport,
+    manifest: &mut kbmeta::Manifest,
+    manifest_dirty: &mut bool,
 ) {
     if ingest::path_has_ignored_component(rel_path) {
-        match ingest::forget_path_artifacts(state, kb, rel_path) {
+        match ingest::forget_path_artifacts_with_manifest(state, kb, rel_path, manifest, manifest_dirty) {
             Ok(true) => {
                 report.deleted.push(rel_path.to_string());
                 report
@@ -1070,7 +1101,9 @@ fn ingest_vcs_rel_path(
         .and_then(|d| d.md_path.as_ref())
         .map(|md| kb.root.join(md).is_file())
         .unwrap_or(false);
-    match ingest::ingest_file(state, kb, rel_path, "vcs", true, false) {
+    match ingest::ingest_file_with_manifest(
+        state, kb, rel_path, "vcs", true, false, manifest, manifest_dirty,
+    ) {
         Ok(doc) => {
             if old_doc.is_none() {
                 report.added.push(rel_path.to_string());
@@ -1090,9 +1123,21 @@ fn delete_vcs_rel_path(
     kb: &KnowledgeBase,
     rel_path: &str,
     report: &mut VcsSyncReport,
+    manifest: &mut kbmeta::Manifest,
+    manifest_dirty: &mut bool,
 ) {
     if let Ok(Some(doc)) = state.store.get_by_path(&kb.id, rel_path) {
-        if let Err(e) = ingest::delete_doc(state, kb, &doc) {
+        // 隐藏路径(.claude/.obsidian…)不属于索引范围,但仍是仓库里合法的版本化文件:
+        // 只清索引产物、保留 src 原件。否则会把它们从工作副本删掉、下轮又被
+        // svn update 恢复,来回空转。真正被上游删除的文件才连 src 一起清。
+        let src_exists = kb.root.join("src").join(rel_path).exists();
+        let keep_source = src_exists && path_has_hidden_component(rel_path);
+        let res = if keep_source {
+            ingest::forget_doc_artifacts_with_manifest(state, kb, &doc, manifest, manifest_dirty)
+        } else {
+            ingest::delete_doc_with_manifest(state, kb, &doc, manifest, manifest_dirty)
+        };
+        if let Err(e) = res {
             report.failed.push(rel_path.to_string());
             report.messages.push(format!("清理失败「{rel_path}」: {e}"));
         } else {
@@ -1101,11 +1146,17 @@ fn delete_vcs_rel_path(
     }
 }
 
+/// 批量入库/清理过程中每积累这么多次 manifest 变更就落盘一次:
+/// 全库对账可能长达几十分钟,中途崩溃时已完成的工作不至于全部作废重来。
+const MANIFEST_FLUSH_EVERY: usize = 500;
+
 fn reconcile_full(
     state: &AppState,
     kb: &KnowledgeBase,
     target: &Path,
     prefix: &str,
+    binding_idx: usize,
+    manifest: &mut kbmeta::Manifest,
     report: &mut VcsSyncReport,
 ) -> anyhow::Result<()> {
     let before: HashSet<String> = state
@@ -1117,16 +1168,54 @@ fn reconcile_full(
     let files = list_repo_files(target)?;
     let after: HashSet<String> = files.iter().map(|r| format!("{prefix}/{r}")).collect();
 
-    for rel_path in &after {
-        ingest_vcs_rel_path(state, kb, rel_path, report);
+    let total = after.len();
+    let mut dirty_ops = 0usize;
+    let mut flushed_at = 0usize;
+    for (i, rel_path) in after.iter().enumerate() {
+        if i % 100 == 0 {
+            state.set_sync_progress(
+                "vcs",
+                &kb.id,
+                binding_idx,
+                &format!("全库对账:核对入库 {i}/{total}"),
+            );
+        }
+        let mut dirty = false;
+        ingest_vcs_rel_path(state, kb, rel_path, report, manifest, &mut dirty);
+        if dirty {
+            dirty_ops += 1;
+        }
+        if dirty_ops - flushed_at >= MANIFEST_FLUSH_EVERY {
+            kbmeta::save_manifest(&kb.root, manifest)?;
+            flushed_at = dirty_ops;
+        }
     }
 
-    for rel_path in before.difference(&after) {
-        delete_vcs_rel_path(state, kb, rel_path, report);
+    let stale: Vec<&String> = before.difference(&after).collect();
+    let total_del = stale.len();
+    for (i, rel_path) in stale.into_iter().enumerate() {
+        if i % 100 == 0 {
+            state.set_sync_progress(
+                "vcs",
+                &kb.id,
+                binding_idx,
+                &format!("全库对账:清理残留 {i}/{total_del}"),
+            );
+        }
+        let mut dirty = false;
+        delete_vcs_rel_path(state, kb, rel_path, report, manifest, &mut dirty);
+        if dirty {
+            dirty_ops += 1;
+        }
+        if dirty_ops - flushed_at >= MANIFEST_FLUSH_EVERY {
+            kbmeta::save_manifest(&kb.root, manifest)?;
+            flushed_at = dirty_ops;
+        }
     }
 
     // docs 是 VCS 的严格镜像;清理失败必须让本次同步失败并在 UI 中可见,
     // 不能静默留下点开后报“文件不存在”的断链目录。
+    state.set_sync_progress("vcs", &kb.id, binding_idx, "全库对账:清理 docs 孤儿产物…");
     ingest::prune_docs_orphans(state, kb, prefix)?;
     Ok(())
 }
@@ -1136,15 +1225,45 @@ fn reconcile_incremental(
     kb: &KnowledgeBase,
     target: &Path,
     prefix: &str,
+    binding_idx: usize,
     changed: &HashSet<String>,
     deleted: &HashSet<String>,
+    manifest: &mut kbmeta::Manifest,
     report: &mut VcsSyncReport,
 ) -> anyhow::Result<()> {
-    for rel in expand_changed_repo_files(target, changed)? {
-        ingest_vcs_rel_path(state, kb, &format!("{prefix}/{rel}"), report);
+    let to_ingest = expand_changed_repo_files(target, changed)?;
+    let total = to_ingest.len();
+    let mut dirty_ops = 0usize;
+    let mut flushed_at = 0usize;
+    for (i, rel) in to_ingest.iter().enumerate() {
+        if i % 100 == 0 {
+            state.set_sync_progress(
+                "vcs",
+                &kb.id,
+                binding_idx,
+                &format!("增量入库 {i}/{total}"),
+            );
+        }
+        let mut dirty = false;
+        ingest_vcs_rel_path(state, kb, &format!("{prefix}/{rel}"), report, manifest, &mut dirty);
+        if dirty {
+            dirty_ops += 1;
+        }
+        if dirty_ops - flushed_at >= MANIFEST_FLUSH_EVERY {
+            kbmeta::save_manifest(&kb.root, manifest)?;
+            flushed_at = dirty_ops;
+        }
     }
     for rel_path in collect_deleted_rel_paths(state, kb, prefix, deleted)? {
-        delete_vcs_rel_path(state, kb, &rel_path, report);
+        let mut dirty = false;
+        delete_vcs_rel_path(state, kb, &rel_path, report, manifest, &mut dirty);
+        if dirty {
+            dirty_ops += 1;
+        }
+        if dirty_ops - flushed_at >= MANIFEST_FLUSH_EVERY {
+            kbmeta::save_manifest(&kb.root, manifest)?;
+            flushed_at = dirty_ops;
+        }
     }
     Ok(())
 }
@@ -1196,8 +1315,8 @@ fn audit_reconcile_state(
     kb: &KnowledgeBase,
     target: &Path,
     prefix: &str,
+    manifest: &kbmeta::Manifest,
 ) -> anyhow::Result<ReconcileAudit> {
-    let manifest = crate::kbmeta::load_manifest(&kb.root);
     let docs = store.list_documents(&kb.id, Some(prefix))?;
     let stored_by_path: std::collections::HashMap<&str, &crate::store::Document> = docs
         .iter()
@@ -1289,7 +1408,20 @@ fn sync_binding_inner(
         messages: Vec::new(),
     };
 
+    // 上一次「干净收尾」的修订号:据此决定本轮无变更时能否跳过逐文件核对。
+    let last_clean_revision = state
+        .last_vcs_sync
+        .lock()
+        .ok()
+        .and_then(|m| {
+            m.get(&(kb.id.clone(), binding_idx))
+                .filter(|e| e.ok && e.failed == 0)
+                .map(|e| e.revision.clone())
+        })
+        .filter(|r| !r.is_empty());
+
     // 拉取 / 更新(内部已做严格镜像,盘上只剩仓库里的文件)
+    state.set_sync_progress("vcs", &kb.id, binding_idx, "拉取远端更新…");
     let pull = match b.vcs_type.as_str() {
         "git" => VcsPullResult::full(git_sync(kb, &target, &b)?),
         "svn" => svn_update_or_checkout(&target, &b)?,
@@ -1297,43 +1429,55 @@ fn sync_binding_inner(
     };
     report.revision = pull.revision.clone();
 
+    // manifest 一轮同步只读一次、结束落一次盘(循环内按批落盘防崩溃丢工作);
+    // 过去每个文件 load+save 整个 manifest,大库一轮就是几十 GB 的 JSON 序列化。
+    let mut manifest = kbmeta::load_manifest(&kb.root);
+
     match pull.reconcile {
         ReconcileMode::Full => {
-            reconcile_full(state, kb, &target, &prefix, &mut report)?;
+            reconcile_full(state, kb, &target, &prefix, binding_idx, &mut manifest, &mut report)?;
         }
         ReconcileMode::Incremental { changed, deleted } => {
             if force_full_check {
                 report
                     .messages
                     .push("手动全库检查:比对 src 与 docs/store".to_string());
-                reconcile_full(state, kb, &target, &prefix, &mut report)?;
+                reconcile_full(state, kb, &target, &prefix, binding_idx, &mut manifest, &mut report)?;
+            } else if changed.is_empty()
+                && deleted.is_empty()
+                && last_clean_revision.as_deref() == Some(report.revision.as_str())
+            {
+                // 修订号与上次干净收尾时相同、SVN 也没报任何变更 → 本轮无事可做。
+                // 逐文件核对要通读全库算 md5,定时同步每几分钟一轮,不能每轮全库扫描。
+                // 修订号变了、或上轮有失败 / 从未成功过,仍会走下面的核对补漏。
+                report
+                    .messages
+                    .push("SVN 未返回文件变更(修订未变,跳过全库核对)".to_string());
             } else {
-                // 先按 SVN 报告做增量入库
-                if changed.is_empty() && deleted.is_empty() {
-                    report
-                        .messages
-                        .push("SVN 未返回文件变更".to_string());
-                } else {
-                    report.messages.push(format!(
-                        "SVN 增量对账:变更 {} 项,删除 {} 项",
-                        changed.len(),
-                        deleted.len()
-                    ));
-                    reconcile_incremental(
-                        state, kb, &target, &prefix, &changed, &deleted, &mut report,
-                    )?;
-                }
+                report.messages.push(format!(
+                    "SVN 增量对账:变更 {} 项,删除 {} 项",
+                    changed.len(),
+                    deleted.len()
+                ));
+                reconcile_incremental(
+                    state, kb, &target, &prefix, binding_idx, &changed, &deleted, &mut manifest,
+                    &mut report,
+                )?;
                 // 不信任 SVN 增量报告是否完整:逐文件核对 src / store / manifest / docs。
                 // 数量相等也可能是一漏一残留互相抵消;内容 md5 还能发现 SVN 漏报修改。
-                let audit = audit_reconcile_state(&state.store, kb, &target, &prefix)?;
+                state.set_sync_progress("vcs", &kb.id, binding_idx, "逐文件核对一致性…");
+                let audit = audit_reconcile_state(&state.store, kb, &target, &prefix, &manifest)?;
                 if !audit.is_consistent() {
                     report.messages.push(format!(
                         "逐文件核对不一致({}),触发全库对账补漏",
                         audit.summary()
                     ));
-                    reconcile_full(state, kb, &target, &prefix, &mut report)?;
+                    reconcile_full(
+                        state, kb, &target, &prefix, binding_idx, &mut manifest, &mut report,
+                    )?;
 
-                    let remaining = audit_reconcile_state(&state.store, kb, &target, &prefix)?;
+                    let remaining =
+                        audit_reconcile_state(&state.store, kb, &target, &prefix, &manifest)?;
                     if !remaining.is_consistent() {
                         report.messages.push(format!(
                             "全库补漏后仍有不一致: {}",
@@ -1345,7 +1489,10 @@ fn sync_binding_inner(
         }
     }
 
+    kbmeta::save_manifest(&kb.root, &manifest)?;
+
     // 刷新 .ktree 元数据
+    state.set_sync_progress("vcs", &kb.id, binding_idx, "刷新知识库元数据…");
     let _ = ingest::refresh_kb_meta(state, kb);
 
     Ok(report)
@@ -1506,7 +1653,8 @@ mod tests {
             vcs_bindings: Vec::new(),
             cloud_bindings: Vec::new(),
         };
-        let audit = audit_reconcile_state(&store, &kb, &target, prefix).unwrap();
+        let audit =
+            audit_reconcile_state(&store, &kb, &target, prefix, &kbmeta::Manifest::new()).unwrap();
         assert_eq!(audit.source_files, 1);
         assert_eq!(audit.stored_docs, 1);
         assert_eq!(audit.missing_store, vec![format!("{prefix}/new-dir/missed.txt")]);
@@ -1534,7 +1682,8 @@ mod tests {
             cloud_bindings: Vec::new(),
         };
 
-        let mut audit = audit_reconcile_state(&store, &kb, &target, prefix).unwrap();
+        let mut audit =
+            audit_reconcile_state(&store, &kb, &target, prefix, &kbmeta::Manifest::new()).unwrap();
         audit.missing_store.sort();
         assert_eq!(audit.source_files, 2);
         assert_eq!(audit.stored_docs, 0);
@@ -1546,6 +1695,53 @@ mod tests {
             ]
         );
         assert!(!audit.is_consistent());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_drops_hidden_and_reserved_paths() {
+        // 隐藏路径要与 list_repo_files 口径一致地静默排除;Windows 保留名进 skipped。
+        // 否则远端点文件每轮被判"本地缺失"反复拉取入库,审计永远不一致 → 同步死循环。
+        let entries = vec![
+            SvnListEntry {
+                rel: ".claude/agents/x.md".into(),
+                kind: SvnEntryKind::File,
+            },
+            SvnListEntry {
+                rel: ".obsidian".into(),
+                kind: SvnEntryKind::Dir,
+            },
+            SvnListEntry {
+                rel: "docs/a.md".into(),
+                kind: SvnEntryKind::File,
+            },
+            SvnListEntry {
+                rel: "docs".into(),
+                kind: SvnEntryKind::Dir,
+            },
+            SvnListEntry {
+                rel: "scripts/nul".into(),
+                kind: SvnEntryKind::File,
+            },
+        ];
+        let (dirs, files, skipped) = split_svn_entries_for_windows(entries);
+        assert_eq!(dirs, vec!["docs".to_string()]);
+        assert_eq!(files, vec!["docs/a.md".to_string()]);
+        assert_eq!(skipped, vec!["scripts/nul".to_string()]);
+    }
+
+    #[test]
+    fn expand_changed_skips_hidden_paths() {
+        let root = tmp_dir();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude/settings.json"), "{}").unwrap();
+        std::fs::write(root.join("a.md"), "hi").unwrap();
+
+        let changed: HashSet<String> =
+            [".claude/settings.json".to_string(), "a.md".to_string()].into();
+        let out = expand_changed_repo_files(&root, &changed).unwrap();
+        assert_eq!(out, ["a.md".to_string()].into());
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -152,6 +152,10 @@ fn with_name(rel_path: &str, name: &str) -> String {
 ///
 /// 不刷新 INDEX.md / KEYWORDS.md —— 由调用方在批量结束后调 `refresh_kb_meta`。
 /// `force` 为 true 时即使 md5 未变也重新处理。
+///
+/// 单文件入口:自带 manifest 读写。批量同步(VCS)必须用 `ingest_file_with_manifest`,
+/// 否则每个文件都要解析+重写整个 manifest.json(大库为 MB 级,16k 文件就是几十 GB 的
+/// JSON 序列化),一轮同步会被拖到小时级。
 pub fn ingest_file(
     state: &AppState,
     kb: &KnowledgeBase,
@@ -160,8 +164,32 @@ pub fn ingest_file(
     convert_md: bool,
     force: bool,
 ) -> anyhow::Result<Document> {
+    let mut manifest = kbmeta::load_manifest(&kb.root);
+    let mut dirty = false;
+    let doc = ingest_file_with_manifest(
+        state, kb, rel_path, source, convert_md, force, &mut manifest, &mut dirty,
+    )?;
+    if dirty {
+        kbmeta::save_manifest(&kb.root, &manifest)?;
+    }
+    Ok(doc)
+}
+
+/// `ingest_file` 的批量版本:manifest 由调用方加载、传入并负责落盘。
+/// 修改过 manifest 时置位 `manifest_dirty`(跳过路径不落盘,调用方据此省掉无谓写)。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ingest_file_with_manifest(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    rel_path: &str,
+    source: &str,
+    convert_md: bool,
+    force: bool,
+    manifest: &mut kbmeta::Manifest,
+    manifest_dirty: &mut bool,
+) -> anyhow::Result<Document> {
     if path_has_ignored_component(rel_path) {
-        let _ = forget_path_artifacts(state, kb, rel_path);
+        let _ = forget_path_artifacts_with_manifest(state, kb, rel_path, manifest, manifest_dirty);
         anyhow::bail!("{}", ignore_rule_description());
     }
 
@@ -185,7 +213,6 @@ pub fn ingest_file(
     // 且 docs 产物文件仍在 → 跳过。
     // 多加一道"docs 产物存在性"检查:换 URL / 改结构 / 软链断裂等导致 docs 失步时,
     // 不能因 md5 匹配就短路 —— 那样缺失的 docs 产物永远补不回来。docs 不在则重新生成。
-    let mut manifest = kbmeta::load_manifest(&kb.root);
     if !force {
         if let Some(entry) = manifest.get(rel_path) {
             if entry.md5 == md5 {
@@ -258,7 +285,7 @@ pub fn ingest_file(
             (Some(format!("docs/{rel_path}")), body, summary, tags)
         };
 
-    // 更新 manifest.json
+    // 更新 manifest(落盘时机由调用方决定)
     manifest.insert(
         rel_path.to_string(),
         kbmeta::ManifestEntry {
@@ -267,7 +294,7 @@ pub fn ingest_file(
             converted_at: kbmeta::timestamp_str(),
         },
     );
-    kbmeta::save_manifest(&kb.root, &manifest)?;
+    *manifest_dirty = true;
 
     // frontmatter 属性(② 属性视图 / prop: 算子)与文档内链接(③ 反链 / 图谱),均从 md 正文解析。
     let props = parse_frontmatter_props(&body);
@@ -462,10 +489,27 @@ pub fn delete_folder(
 }
 
 /// 从知识库删除一个文档:删 src 原件、docs 转换产物及其 .assets 伴生资源、
-/// manifest 条目、SQLite + tantivy 缓存。
+/// manifest 条目、SQLite + tantivy 缓存。单文件入口,自带 manifest 读写;
+/// 批量删除(VCS 严格镜像)用 `delete_doc_with_manifest`。
 pub fn delete_doc(state: &AppState, kb: &KnowledgeBase, doc: &Document) -> anyhow::Result<()> {
+    let mut manifest = kbmeta::load_manifest(&kb.root);
+    let mut dirty = false;
+    delete_doc_with_manifest(state, kb, doc, &mut manifest, &mut dirty)?;
+    if dirty {
+        kbmeta::save_manifest(&kb.root, &manifest)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_doc_with_manifest(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    doc: &Document,
+    manifest: &mut kbmeta::Manifest,
+    manifest_dirty: &mut bool,
+) -> anyhow::Result<()> {
     let _ = fs::remove_file(kb.root.join("src").join(&doc.rel_path));
-    forget_doc_artifacts(state, kb, doc)
+    forget_doc_artifacts_with_manifest(state, kb, doc, manifest, manifest_dirty)
 }
 
 /// 只清理某文档的 docs 产物 / manifest / SQLite / tantivy,保留 src 原件。
@@ -475,6 +519,22 @@ pub(crate) fn forget_doc_artifacts(
     kb: &KnowledgeBase,
     doc: &Document,
 ) -> anyhow::Result<()> {
+    let mut manifest = kbmeta::load_manifest(&kb.root);
+    let mut dirty = false;
+    forget_doc_artifacts_with_manifest(state, kb, doc, &mut manifest, &mut dirty)?;
+    if dirty {
+        kbmeta::save_manifest(&kb.root, &manifest)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn forget_doc_artifacts_with_manifest(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    doc: &Document,
+    manifest: &mut kbmeta::Manifest,
+    manifest_dirty: &mut bool,
+) -> anyhow::Result<()> {
     if let Some(md) = &doc.md_path {
         let _ = fs::remove_file(kb.root.join(md));
     }
@@ -483,9 +543,9 @@ pub(crate) fn forget_doc_artifacts(
         kb.root.join("docs").join(assets_rel_of(&doc.rel_path)),
     );
 
-    let mut manifest = kbmeta::load_manifest(&kb.root);
-    manifest.remove(&doc.rel_path);
-    kbmeta::save_manifest(&kb.root, &manifest)?;
+    if manifest.remove(&doc.rel_path).is_some() {
+        *manifest_dirty = true;
+    }
 
     state.store.delete_document(doc.id)?;
     state.index.delete(doc.id)?;
@@ -502,6 +562,20 @@ pub(crate) fn forget_path_artifacts(
         return Ok(false);
     };
     forget_doc_artifacts(state, kb, &doc)?;
+    Ok(true)
+}
+
+pub(crate) fn forget_path_artifacts_with_manifest(
+    state: &AppState,
+    kb: &KnowledgeBase,
+    rel_path: &str,
+    manifest: &mut kbmeta::Manifest,
+    manifest_dirty: &mut bool,
+) -> anyhow::Result<bool> {
+    let Some(doc) = state.store.get_by_path(&kb.id, rel_path)? else {
+        return Ok(false);
+    };
+    forget_doc_artifacts_with_manifest(state, kb, &doc, manifest, manifest_dirty)?;
     Ok(true)
 }
 

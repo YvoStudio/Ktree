@@ -90,6 +90,7 @@ pub fn run() {
                 last_vcs_sync: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 last_cloud_sync: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 syncing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                sync_progress: Arc::new(Mutex::new(std::collections::HashMap::new())),
             };
             app.manage(app_state.clone());
 

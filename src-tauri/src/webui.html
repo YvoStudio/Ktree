@@ -1102,7 +1102,7 @@ async function renderOpsList(host){
                 <button class="btn ghost sm" data-act="vcs-one" ${b.syncing?'disabled':''}>${b.syncing?'同步中…':'同步'}</button>
               </div>
             </div>
-            <div class="vcs-last">${renderVcsLast(b.last_sync, b.sync_interval_minutes, b.syncing)}</div>`;
+            <div class="vcs-last">${renderVcsLast(b.last_sync, b.sync_interval_minutes, b.syncing, b.progress)}</div>`;
           row.querySelector('[data-act="vcs-one"]').addEventListener('click',()=>{
             show(`同步 ${b.vcs_type}: ${b.url} …(增量更新,可关闭此窗口,后台会继续)`);
             // 不 await 到底 —— 大仓库同步可能要几十分钟,连接断了服务端也会继续跑;
@@ -1179,11 +1179,11 @@ async function afterSyncConfirm(reports){
 }
 
 // 单条绑定的"最近一次同步"摘要,显示在绑定行下方。
-// syncing=true 表示后端正在同步 → 优先显示进行中状态。
+// syncing=true 表示后端正在同步 → 优先显示进行中状态(progress 有值时展示具体阶段)。
 // last 可能为 null(后端从未同步过) → 看 interval 决定提示"待自动同步"还是"未同步"。
-function renderVcsLast(last, intervalMinutes, syncing){
+function renderVcsLast(last, intervalMinutes, syncing, progress){
   if(syncing){
-    return `<span class="empty">⏳ 同步进行中…</span>`;
+    return `<span class="empty">⏳ ${progress?esc(progress):'同步进行中…'}</span>`;
   }
   if(!last){
     if(intervalMinutes>0) return `<span class="empty">暂无同步记录 · 自动每 ${intervalMinutes} 分钟</span>`;

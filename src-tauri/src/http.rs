@@ -502,6 +502,9 @@ async fn list_kb_cloud(
                 .as_ref()
                 .map(|s| s.contains(&("cloud".to_string(), kb_id.clone(), i)))
                 .unwrap_or(false);
+            let progress = in_progress
+                .then(|| state.get_sync_progress("cloud", &kb_id, i))
+                .flatten();
             json!({
                 "idx": i,
                 "name": b.name,
@@ -513,6 +516,7 @@ async fn list_kb_cloud(
                 "sync_interval_minutes": b.sync_interval_minutes,
                 "last_sync": last,
                 "syncing": in_progress,
+                "progress": progress,
             })
         })
         .collect();
@@ -1358,6 +1362,9 @@ async fn list_kb_vcs(
                 .as_ref()
                 .map(|s| s.contains(&("vcs".to_string(), kb_id.clone(), i)))
                 .unwrap_or(false);
+            let progress = in_progress
+                .then(|| state.get_sync_progress("vcs", &kb_id, i))
+                .flatten();
             json!({
                 "idx": i,
                 "name": b.name,
@@ -1369,6 +1376,7 @@ async fn list_kb_vcs(
                 "sync_interval_minutes": b.sync_interval_minutes,
                 "last_sync": last,
                 "syncing": in_progress,
+                "progress": progress,
             })
         })
         .collect();
