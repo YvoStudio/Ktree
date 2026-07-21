@@ -51,6 +51,13 @@ pub struct AppState {
     /// 进行中同步的阶段描述(如「全库对账:入库核对 3500/14406」),同 key。
     /// 大库一轮同步可达几十分钟,webui 需要能看到卡在哪个阶段,而不是干等"同步中…"。
     pub sync_progress: Arc<Mutex<HashMap<(String, String, usize), String>>>,
+    /// 本进程内「逐文件核对确认过一致」的修订号:key=(kb_id, binding_idx)。
+    ///
+    /// 只有在本进程真的跑完一次一致的核对后才写入,故意**不持久化**:
+    /// 重启后必须重新核对一次,才能再走"无变更即跳过核对"的快路径。
+    /// 若改用持久化的 last_sync 记录判断,旧版本/异常退出留下的"看着干净"的记录
+    /// 会让新进程永远跳过核对,盘上已有的漂移再也没机会自愈。
+    pub audited_revision: Arc<Mutex<HashMap<(String, usize), String>>>,
 }
 
 impl AppState {
@@ -115,5 +122,34 @@ impl AppState {
             .lock()
             .ok()
             .and_then(|p| p.get(&(kind.to_string(), kb_id.to_string(), idx)).cloned())
+    }
+
+    /// 本进程是否已在该修订号上核对通过(可跳过重复的全库核对)。
+    pub fn is_audited_at(&self, kb_id: &str, idx: usize, revision: &str) -> bool {
+        if revision.is_empty() {
+            return false;
+        }
+        self.audited_revision
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&(kb_id.to_string(), idx)).cloned())
+            .as_deref()
+            == Some(revision)
+    }
+
+    /// 记录「该修订号上已核对一致」。核对发现不一致时应改调 `clear_audited`。
+    pub fn mark_audited(&self, kb_id: &str, idx: usize, revision: &str) {
+        if revision.is_empty() {
+            return;
+        }
+        if let Ok(mut m) = self.audited_revision.lock() {
+            m.insert((kb_id.to_string(), idx), revision.to_string());
+        }
+    }
+
+    pub fn clear_audited(&self, kb_id: &str, idx: usize) {
+        if let Ok(mut m) = self.audited_revision.lock() {
+            m.remove(&(kb_id.to_string(), idx));
+        }
     }
 }

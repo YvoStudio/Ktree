@@ -1408,18 +1408,6 @@ fn sync_binding_inner(
         messages: Vec::new(),
     };
 
-    // 上一次「干净收尾」的修订号:据此决定本轮无变更时能否跳过逐文件核对。
-    let last_clean_revision = state
-        .last_vcs_sync
-        .lock()
-        .ok()
-        .and_then(|m| {
-            m.get(&(kb.id.clone(), binding_idx))
-                .filter(|e| e.ok && e.failed == 0)
-                .map(|e| e.revision.clone())
-        })
-        .filter(|r| !r.is_empty());
-
     // 拉取 / 更新(内部已做严格镜像,盘上只剩仓库里的文件)
     state.set_sync_progress("vcs", &kb.id, binding_idx, "拉取远端更新…");
     let pull = match b.vcs_type.as_str() {
@@ -1433,6 +1421,15 @@ fn sync_binding_inner(
     // 过去每个文件 load+save 整个 manifest,大库一轮就是几十 GB 的 JSON 序列化。
     let mut manifest = kbmeta::load_manifest(&kb.root);
 
+    // 本进程此前核对通过的修订号(读完即撤销标记:中途出错就不会留下"已核对"的假象,
+    // 下一轮会重新核对)。
+    let audited_before = state
+        .audited_revision
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(kb.id.clone(), binding_idx)).cloned());
+    state.clear_audited(&kb.id, binding_idx);
+
     match pull.reconcile {
         ReconcileMode::Full => {
             reconcile_full(state, kb, &target, &prefix, binding_idx, &mut manifest, &mut report)?;
@@ -1445,14 +1442,16 @@ fn sync_binding_inner(
                 reconcile_full(state, kb, &target, &prefix, binding_idx, &mut manifest, &mut report)?;
             } else if changed.is_empty()
                 && deleted.is_empty()
-                && last_clean_revision.as_deref() == Some(report.revision.as_str())
+                && audited_before.as_deref() == Some(report.revision.as_str())
             {
-                // 修订号与上次干净收尾时相同、SVN 也没报任何变更 → 本轮无事可做。
+                // 本进程已在该修订号上核对一致过,且 SVN 没报任何变更 → 真的无事可做。
                 // 逐文件核对要通读全库算 md5,定时同步每几分钟一轮,不能每轮全库扫描。
-                // 修订号变了、或上轮有失败 / 从未成功过,仍会走下面的核对补漏。
+                // 注意这里只认**本进程内**的核对结论:重启后必须重新核对一次,
+                // 否则旧版本或异常退出留下的"看着干净"的持久化记录会让漂移永远不自愈。
                 report
                     .messages
-                    .push("SVN 未返回文件变更(修订未变,跳过全库核对)".to_string());
+                    .push("SVN 未返回文件变更(本进程已核对过该修订,跳过全库核对)".to_string());
+                state.mark_audited(&kb.id, binding_idx, &report.revision);
             } else {
                 report.messages.push(format!(
                     "SVN 增量对账:变更 {} 项,删除 {} 项",
@@ -1467,7 +1466,9 @@ fn sync_binding_inner(
                 // 数量相等也可能是一漏一残留互相抵消;内容 md5 还能发现 SVN 漏报修改。
                 state.set_sync_progress("vcs", &kb.id, binding_idx, "逐文件核对一致性…");
                 let audit = audit_reconcile_state(&state.store, kb, &target, &prefix, &manifest)?;
-                if !audit.is_consistent() {
+                if audit.is_consistent() {
+                    state.mark_audited(&kb.id, binding_idx, &report.revision);
+                } else {
                     report.messages.push(format!(
                         "逐文件核对不一致({}),触发全库对账补漏",
                         audit.summary()
@@ -1478,7 +1479,9 @@ fn sync_binding_inner(
 
                     let remaining =
                         audit_reconcile_state(&state.store, kb, &target, &prefix, &manifest)?;
-                    if !remaining.is_consistent() {
+                    if remaining.is_consistent() {
+                        state.mark_audited(&kb.id, binding_idx, &report.revision);
+                    } else {
                         report.messages.push(format!(
                             "全库补漏后仍有不一致: {}",
                             remaining.summary()
@@ -1547,8 +1550,17 @@ fn run_binding_with_record(
     if !state.try_begin_sync("vcs", &kb.id, binding_idx) {
         anyhow::bail!("该绑定正在同步中,请等当前同步结束");
     }
+    // 用 Drop 释放:同步体 panic 时若直接跳过 end_sync,该绑定会被永久标记成
+    // "同步中",此后每次同步都被并发保护挡掉 —— 只能重启进程才能恢复。
+    struct SyncGuard<'a>(&'a AppState, &'a str, usize);
+    impl Drop for SyncGuard<'_> {
+        fn drop(&mut self) {
+            self.0.end_sync("vcs", self.1, self.2);
+        }
+    }
+    let _guard = SyncGuard(state, &kb.id, binding_idx);
+
     let result = sync_binding_inner(state, kb, binding_idx, force_full_check);
-    state.end_sync("vcs", &kb.id, binding_idx);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
