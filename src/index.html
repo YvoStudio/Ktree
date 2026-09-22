@@ -119,6 +119,7 @@
   <div class="row"><button class="btn ghost" id="btnAddKb">＋ 添加知识库</button></div>
 
   <div class="row" style="justify-content:flex-end">
+    <button class="btn ghost" id="btnCheckUpdate">检查更新</button>
     <button class="btn" id="btnSave">保存配置</button>
   </div>
 </div>
@@ -151,6 +152,23 @@ function confirmDialog(message,{okText='确定',danger=false}={}){
   });
 }
 function esc(s){ return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// 只读提示框(单个「知道了」)。用于检查更新失败这类要把原因说清楚、
+// 又可能多行(网络错误)的场景 —— toast 单行放不下。
+function alertDialog(message){
+  return new Promise(resolve=>{
+    const ov=document.createElement('div'); ov.className='dlg-overlay';
+    const box=document.createElement('div'); box.className='dlg-box';
+    const msg=document.createElement('div'); msg.className='dlg-msg'; msg.textContent=message;
+    const acts=document.createElement('div'); acts.className='dlg-actions';
+    const ok=document.createElement('button'); ok.className='btn'; ok.textContent='知道了';
+    acts.appendChild(ok); box.append(msg,acts); ov.appendChild(box); document.body.appendChild(ov);
+    function done(){ ov.remove(); document.removeEventListener('keydown',onkey); resolve(); }
+    function onkey(e){ if(e.key==='Escape'||e.key==='Enter') done(); }
+    ok.onclick=done;
+    ov.onclick=e=>{ if(e.target===ov) done(); };
+    document.addEventListener('keydown',onkey);
+  });
+}
 
 // HTTP 服务端口:绑定的删除 / 同步要调本机 REST API(带本地数据清理),从状态轮询里取。
 let SERVICE_PORT = 0;
@@ -444,6 +462,27 @@ document.getElementById('btnSave').addEventListener('click', async ()=>{
     toast('配置已保存。同步操作请到 web 界面的「知识库操作」里执行');
     await loadConfig(); await loadStatus();
   } catch(e){ toast('保存失败:'+e); }
+});
+
+// 手动检查更新:结果只在这里展示一次(失败原因完整弹出来,不静默吞掉)。
+document.getElementById('btnCheckUpdate').addEventListener('click', async ()=>{
+  const btn = document.getElementById('btnCheckUpdate');
+  if(!window.KtreeUpdater){ await alertDialog('更新模块没加载起来,重启应用后再试。'); return; }
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '检查中…';
+  try{
+    await window.KtreeUpdater.check({
+      silent: false,
+      onResult: r=>{
+        if(!r) return;
+        if(!r.ok) alertDialog('检查更新失败。\n\n' + (r.error||'未知错误'));
+        else if(r.available) toast(`发现新版本 v${r.version},请在弹出的窗口里选择`);
+        else toast('当前已是最新版本' + (r.currentVersion ? `(v${r.currentVersion})` : ''));
+      },
+    });
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
 });
 
 loadStatus();
