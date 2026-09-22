@@ -308,6 +308,7 @@ pub fn sync_binding_with_record(
             deleted: r.deleted.len(),
             failed: r.failed.len(),
             error: None,
+            note: (!r.messages.is_empty()).then(|| r.messages.join(" | ")),
         },
         Err(e) => LastSync {
             at_unix_ms: now_ms,
@@ -319,6 +320,7 @@ pub fn sync_binding_with_record(
             deleted: 0,
             failed: 0,
             error: Some(e.to_string()),
+            note: None,
         },
     };
     // 写内存 map + 持久化到 SQLite(重启后仍能显示最近同步时间)

@@ -105,11 +105,15 @@ pub(crate) fn is_textual(ext: &str) -> bool {
 /// 在 `docs/<rel_path>` 处建立一个指向 `src/<rel_path>` 的镜像。
 ///
 /// 三层 fallback,优先级从高到低:
-/// 1. **相对软链**(symlink):Linux / macOS 原生支持;Windows NTFS 需要管理员或开发者模式。
+/// 1. **软链**(symlink):Linux / macOS 用相对目标;Windows 用绝对目标(见下)。
 /// 2. **硬链接**(hard_link):无需特权,但要求同卷且只能链接文件 —— 知识库内部完全够用。
 /// 3. **文件复制**(copy):前两种都失败时的最后兜底,代价是 src 改了 docs 不会自动跟。
 ///
 /// 这样 Windows 普通用户(没开发者模式)也能跑通整个 ingest 流程。
+///
+/// Windows 上符号链接的目标用**绝对路径**:相对目标(里含 `/`)在 Windows 上
+/// 建出来的链接打不开 —— `is_file()` 恒为 false,阅读视图一路回落 src,
+/// 短路判定与逐文件核对也把产物当成缺失(见 `docs_artifact_present`)。
 fn mirror_into_docs(kb_root: &Path, rel_path: &str) -> std::io::Result<()> {
     let docs_abs = kb_root.join("docs").join(rel_path);
     if let Some(parent) = docs_abs.parent() {
@@ -117,24 +121,44 @@ fn mirror_into_docs(kb_root: &Path, rel_path: &str) -> std::io::Result<()> {
     }
     let _ = fs::remove_file(&docs_abs); // 删旧(普通文件或旧链)
 
-    let depth = rel_path.matches('/').count();
-    let up = "../".repeat(depth + 1);
-    let link_target = format!("{up}src/{rel_path}");
-
     #[cfg(unix)]
     {
+        let depth = rel_path.matches('/').count();
+        let up = "../".repeat(depth + 1);
+        let link_target = format!("{up}src/{rel_path}");
         std::os::unix::fs::symlink(&link_target, &docs_abs)
     }
     #[cfg(windows)]
     {
         let src_abs = kb_root.join("src").join(rel_path);
-        if std::os::windows::fs::symlink_file(&link_target, &docs_abs).is_ok() {
+        if std::os::windows::fs::symlink_file(&src_abs, &docs_abs).is_ok() {
             return Ok(());
         }
         if fs::hard_link(&src_abs, &docs_abs).is_ok() {
             return Ok(());
         }
         fs::copy(&src_abs, &docs_abs).map(|_| ())
+    }
+}
+
+/// docs 产物是否"在"。
+///
+/// **不能**用 `is_file()`:Windows 上镜像类产物是符号链接,`is_file()` 跟随链接,
+/// 链接不可解析时恒为 false。实测(2026-09-22 / v0.1.22,萌喵+吃播库):盘上这批
+/// 链接打不开,于是每个"原样镜像"的文件(html/md/py/png/mp4/csv…)每轮同步都被
+/// 判成产物缺失 → 整库重新转换 + 重新向量化,一轮二十多分钟,且与 SVN 端
+/// 是否真有提交无关 —— 转换类产物(xlsx→.md 是真实文件)则一切正常。
+///
+/// 这里改成"目录项存在即算在":普通文件、有效链接、断链链接都算有产物
+/// (断链内容由 `serve_kb_file` 回落 src 兜底,阅读视图不受影响);
+/// 只有产物真被删掉才返回 false,让它重建。
+pub(crate) fn docs_artifact_present(kb_root: &Path, md_path: &str) -> bool {
+    if md_path.is_empty() {
+        return false;
+    }
+    match fs::symlink_metadata(kb_root.join(md_path)) {
+        Ok(m) => m.is_file() || m.file_type().is_symlink(),
+        Err(_) => false,
     }
 }
 
@@ -221,8 +245,8 @@ pub(crate) fn ingest_file_with_manifest(
                         && entry.output == doc.md_path.as_deref().unwrap_or_default();
                     let docs_ok = doc
                         .md_path
-                        .as_ref()
-                        .map(|md| kb.root.join(md).is_file())
+                        .as_deref()
+                        .map(|md| docs_artifact_present(&kb.root, md))
                         .unwrap_or(false);
                     if store_ok && docs_ok {
                         return Ok(doc);
@@ -859,9 +883,29 @@ pub fn backfill_vectors(state: &AppState) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_links, link_key_of, parse_frontmatter_props, path_has_ignored_component,
-        prune_docs_orphans_with_store,
+        docs_artifact_present, extract_links, link_key_of, parse_frontmatter_props,
+        path_has_ignored_component, prune_docs_orphans_with_store,
     };
+
+    /// 断链软链必须算「产物在」:Windows 上「原样镜像」类文件的 docs 产物就是这个
+    /// 形态。若按 is_file() 判定,每个镜像类文件每轮同步都被判缺失 → 整库重灌。
+    #[test]
+    fn docs_artifact_present_counts_dangling_symlink_as_present() {
+        let base = std::env::temp_dir().join(format!("ktree_dap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("docs")).unwrap();
+        std::fs::write(base.join("docs/real.md"), "hi").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("nowhere.md", base.join("docs/dangling.md")).unwrap();
+
+        assert!(docs_artifact_present(&base, "docs/real.md"));
+        assert!(!docs_artifact_present(&base, "docs/absent.md"));
+        assert!(!docs_artifact_present(&base, ""));
+        #[cfg(unix)]
+        assert!(docs_artifact_present(&base, "docs/dangling.md"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn explicit_ignore_prefix_only() {

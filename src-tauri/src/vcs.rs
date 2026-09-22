@@ -1098,8 +1098,8 @@ fn ingest_vcs_rel_path(
     let old_md5 = old_doc.as_ref().map(|d| d.md5.as_str());
     let old_output_ok = old_doc
         .as_ref()
-        .and_then(|d| d.md_path.as_ref())
-        .map(|md| kb.root.join(md).is_file())
+        .and_then(|d| d.md_path.as_deref())
+        .map(|md| ingest::docs_artifact_present(&kb.root, md))
         .unwrap_or(false);
     match ingest::ingest_file_with_manifest(
         state, kb, rel_path, "vcs", true, false, manifest, manifest_dirty,
@@ -1354,7 +1354,10 @@ fn audit_reconcile_state(
         }
 
         let output = doc.md_path.as_deref().unwrap_or_default();
-        if output.is_empty() || !kb.root.join(output).is_file() {
+        // 存在性判定与 ingest 的短路口径一致(见 docs_artifact_present):
+        // 这里若用 is_file(),Windows 上"原样镜像"的产物会被整批判成缺失,
+        // 逐文件核对每轮都报不一致 → 每轮触发全库对账重灌。
+        if !ingest::docs_artifact_present(&kb.root, output) {
             audit.missing_outputs.push(rel_path.clone());
         }
 
@@ -1576,6 +1579,7 @@ fn run_binding_with_record(
             deleted: r.deleted.len(),
             failed: r.failed.len(),
             error: None,
+            note: (!r.messages.is_empty()).then(|| r.messages.join(" | ")),
         },
         Err(e) => LastVcsSync {
             at_unix_ms: now_ms,
@@ -1587,6 +1591,7 @@ fn run_binding_with_record(
             deleted: 0,
             failed: 0,
             error: Some(e.to_string()),
+            note: None,
         },
     };
     // 写内存 map + 持久化到 SQLite(重启后 webui 仍能显示最近同步时间)

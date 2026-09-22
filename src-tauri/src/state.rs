@@ -25,6 +25,13 @@ pub struct LastSync {
     pub failed: usize,
     /// ok=false 时填错误摘要;ok=true 但 ingest 中有失败项时,这里仍是 None。
     pub error: Option<String>,
+    /// 本轮同步的结论留痕(如「SVN 增量对账:变更 1 项 | 逐文件核对不一致
+    /// (src 9694, store 9696; 缺记录 0, ..., 缺产物 9645, ...),触发全库对账补漏」)。
+    ///
+    /// 自动同步(REST 之外的 scheduler 触发)的 report 不经过任何 HTTP 响应,
+    /// 不落到这里就完全没有留痕 —— 下次再出现「每轮全量重灌」只能从头查一遍。
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// 兼容旧名(vcs.rs 等处仍按 LastVcsSync 引用)。

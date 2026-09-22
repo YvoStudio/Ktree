@@ -34,6 +34,9 @@ Thumbs.db
 .env
 .env.local
 
+# Agent 本地数据(项目记忆等,不入库)
+.workbuddy/
+
 # Tauri signing keys(本地生成,绝不入库)
 *.key
 *.key.pub
