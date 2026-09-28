@@ -470,6 +470,11 @@
     font-size:13px; line-height:1.6; overflow:auto; }
   .pv-binary { padding:60px 20px; text-align:center; color:var(--muted); }
   .pv-binary svg { width:64px; height:64px; }
+  .pv-pptx { min-height:100%; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:12px; background:#e7e7eb; padding:20px; }
+  .pv-pptx img { width:100%; max-width:960px; max-height:calc(100vh - 160px);
+    object-fit:contain; box-shadow:0 3px 18px rgba(0,0,0,.18); background:#fff; }
+  .pv-pptx-nav { display:flex; align-items:center; gap:14px; color:#555; font-size:13px; }
   .md-body { padding:28px 36px; font-size:15px; line-height:1.8; color:#333; }
   .md-body h1 { font-size:1.6em; font-weight:600; margin:.8em 0 .4em; padding-bottom:.3em; border-bottom:1px solid #eee; }
   .md-body h2 { font-size:1.35em; font-weight:600; margin:.7em 0 .3em; padding-bottom:.2em; border-bottom:1px solid #f0f0f0; }
@@ -649,7 +654,7 @@ function fileIcon(name){
   if(MD_EXT.has(ext)) return SVG.markdown;
   if(ext==='json') return SVG.json;
   if(ext==='pdf') return SVG.pdf;
-  if(ext==='doc'||ext==='docx'||ext==='txt') return SVG.doc;
+  if(ext==='doc'||ext==='docx'||ext==='pptx'||ext==='txt') return SVG.doc;
   if(ext==='xls'||ext==='xlsx') return SVG.spreadsheet;
   if(IMG_EXT.has(ext)) return SVG.image;
   if(VIDEO_EXT.has(ext)) return SVG.video;
@@ -660,7 +665,7 @@ function fileIcon(name){
 }
 
 // ---------- 状态 ----------
-let KBS=[], TREES={}, EXPANDED=new Set(), COLLAPSED=new Set(); // COLLAPSED key: `${kbId}|${path}`
+let KBS=[], KBS_READY=false, TREES={}, EXPANDED=new Set(), COLLAPSED=new Set(); // COLLAPSED key: `${kbId}|${path}`
 let VIEW='list', CUR_KB='', CUR_PATH='', WRITABLE=false, LAST_QUERY='';
 let LAST_FILES=[]; // 当前目录最近一次列出的文件(供图片预览的「上一张/下一张」用)
 let CUSTOM_DOMAIN=''; // 后台 /api/env 拿到的自定义域名;非空则复制地址用它替代 location.origin
@@ -1281,25 +1286,40 @@ async function boot(){
   else {
     renderCrumb();
     document.getElementById('listArea').innerHTML=
-      '<div class="empty">还没有知识库,请在桌面端菜单栏「Ktree → 设置」中添加</div>';
+      '<div class="empty">没有可见知识库，请在桌面端「Ktree → 设置」中添加或取消隐藏</div>';
   }
   // 带 #ops 链接打开:底层视图加载完后弹出操作窗
   if(opsTab) showOpsDialog(opsTab);
 }
 function updateFavCount(){
-  const n=Object.keys(FAVS).length;
+  const n=Object.keys(FAVS).filter(visibleStoredKey).length;
   document.getElementById('favCount').textContent=n?n:'';
+}
+function visibleStoredKey(key){
+  const slash=key.indexOf('/');
+  return slash>0 && KBS.some(kb=>kb.id===key.slice(0,slash));
 }
 async function loadKbs(){
   try { KBS=(await api('/api/kbs')).knowledge_bases||[]; } catch(e){ KBS=[]; }
+  KBS_READY=true;
+  updateFavCount();
   renderSidebar();
   const total=KBS.reduce((s,k)=>s+(k.documents||0),0);
   document.getElementById('sideStatus').textContent=
     `${KBS.length} 个知识库 · ${total} 篇文档 · :${location.port||'80'}`;
 }
+// 从桌面设置切回网页时，知识库可见集合若改变就刷新当前视图，
+// 防止侧栏、收藏或旧搜索结果继续显示刚刚隐藏的库。
+window.addEventListener('focus', async()=>{
+  if(!KBS_READY) return;
+  try{
+    const next=(await api('/api/kbs')).knowledge_bases||[];
+    if(next.map(k=>k.id).join('\0')!==KBS.map(k=>k.id).join('\0')) location.reload();
+  }catch(e){}
+});
 function renderSidebar(){
   const box=document.getElementById('kbList');
-  if(!KBS.length){ box.innerHTML='<div class="hint" style="padding:8px 12px">无知识库</div>'; return; }
+  if(!KBS.length){ box.innerHTML='<div class="hint" style="padding:8px 12px">无可见知识库</div>'; return; }
   box.innerHTML=KBS.map(kb=>{
     const open=EXPANDED.has(kb.id);
     const folders=TREES[kb.id]||[];
@@ -1427,6 +1447,7 @@ function fileIconHtml(kb,f,thumbSm){
 function previewPathOf(f){
   const rel=String(f.rel_path||'');
   const md=String(f.md_path||'');
+  if(extOf(rel)==='pptx') return rel; // src 点击看原件幻灯片；docs 中的 .md 仍按 Markdown 阅读。
   if(!md) return rel;
   // md_path 只是 docs/ 下的同名镜像时,预览直接走 src 原文件;真正转换出来的 md 仍走 md_path。
   if(rel.startsWith('src/') && md==='docs/'+rel.slice(4)) return rel;
@@ -1559,7 +1580,7 @@ function refreshDrawer(){
 function renderDrawerFilter(){
   const box = document.getElementById('drawerFilter');
   box.innerHTML = '';
-  const used = new Set(Object.values(COLORS));
+  const used = new Set(Object.entries(COLORS).filter(([key])=>visibleStoredKey(key)).map(([,color])=>color));
   if (used.size === 0) return;
   // 「全部」按钮
   const all = document.createElement('div');
@@ -1584,9 +1605,9 @@ function renderDrawerContent(){
   body.innerHTML = '';
   let keys;
   if (DRAWER_FILTER) {
-    keys = Object.keys(COLORS).filter(k => COLORS[k] === DRAWER_FILTER);
+    keys = Object.keys(COLORS).filter(k => visibleStoredKey(k) && COLORS[k] === DRAWER_FILTER);
   } else {
-    keys = Object.keys(FAVS);
+    keys = Object.keys(FAVS).filter(visibleStoredKey);
   }
   if (!keys.length) {
     body.innerHTML = '<div class="bm-empty">' +
@@ -2269,6 +2290,10 @@ document.getElementById('listArea').addEventListener('click',e=>{
   else if(act==='notedel') deleteNote(el.dataset.id, el.dataset.scope);
 });
 function openUrl(url,ext){
+  if((ext||'').toLowerCase()==='pptx'){
+    const name=decodeURIComponent(new URL(url,location.href).pathname.split('/').pop()||'slides.pptx');
+    return showPptxPreview(url,name);
+  }
   if(PREVIEWABLE.has((ext||'').toLowerCase())){ window.open(url,'_blank'); }
   else { const a=document.createElement('a'); a.href=url; a.download=''; document.body.appendChild(a); a.click(); a.remove(); }
 }
@@ -2405,6 +2430,7 @@ function createModal(name, openUrl){
 }
 function previewFile(url,name){
   const ext=extOf(name);
+  if(ext==='pptx') return showPptxPreview(url,name);
   if(MD_EXT.has(ext)) return showMarkdownPreview(url,name);
   if(IMG_EXT.has(ext)) return showImagePreview(url,name);
   if(HTML_EXT.has(ext)) return showHtmlPreview(url,name);
@@ -2413,6 +2439,71 @@ function previewFile(url,name){
   if(AUDIO_EXT.has(ext)) return showMediaPreview(url,name,'audio');
   if(CODE_EXT.has(ext)||TEXT_EXT.has(ext)||ext==='json') return showCodePreview(url,name);
   return showBinaryPreview(url,name);
+}
+let pptxRendererPromise;
+function loadPptxRenderer(){
+  if(window.KtreePptx) return Promise.resolve(window.KtreePptx);
+  if(!pptxRendererPromise) pptxRendererPromise=new Promise((resolve,reject)=>{
+    const script=document.createElement('script'); script.src='/lib/pptx-preview.js';
+    script.onload=()=>window.KtreePptx?resolve(window.KtreePptx):reject(new Error('PPTX 预览模块未初始化'));
+    script.onerror=()=>reject(new Error('PPTX 预览模块加载失败'));
+    document.head.appendChild(script);
+  }).catch(e=>{ pptxRendererPromise=null; throw e; });
+  return pptxRendererPromise;
+}
+async function showPptxPreview(url,name){
+  const body=createModal(name,url);
+  body.innerHTML='<div class="pv-binary">正在加载幻灯片…</div>';
+  const overlay=body.closest('.pv-overlay');
+  let objectUrl='';
+  let onKey=null;
+  const observer=new MutationObserver(()=>{
+    if(!overlay.isConnected){
+      if(objectUrl) URL.revokeObjectURL(objectUrl);
+      if(onKey) document.removeEventListener('keydown',onKey);
+      observer.disconnect();
+    }
+  });
+  observer.observe(document.body,{childList:true});
+  try {
+    const response=await fetch(url);
+    if(!response.ok) throw new Error(`HTTP ${response.status}`);
+    const renderer=await loadPptxRenderer();
+    const deck=await renderer.open(await response.arrayBuffer());
+    if(!overlay.isConnected) return;
+    if(!deck.count) throw new Error('PPTX 中没有幻灯片');
+    const wrap=document.createElement('div'); wrap.className='pv-pptx';
+    const img=document.createElement('img'); img.alt='幻灯片预览';
+    const nav=document.createElement('div'); nav.className='pv-pptx-nav';
+    const prev=document.createElement('button'); prev.className='btn ghost sm'; prev.textContent='上一页';
+    const counter=document.createElement('span');
+    const next=document.createElement('button'); next.className='btn ghost sm'; next.textContent='下一页';
+    nav.append(prev,counter,next); wrap.append(img,nav); body.replaceChildren(wrap);
+    let index=0;
+    function show(i){
+      if(i<0||i>=deck.count) return;
+      try {
+        const svg=deck.render(i);
+        const newUrl=URL.createObjectURL(new Blob([svg],{type:'image/svg+xml'}));
+        const oldUrl=objectUrl; objectUrl=newUrl; img.src=newUrl;
+        if(oldUrl) URL.revokeObjectURL(oldUrl);
+        index=i; counter.textContent=`${i+1} / ${deck.count}`;
+        prev.disabled=i===0; next.disabled=i===deck.count-1;
+      } catch(e){
+        counter.textContent=`第 ${i+1} 页渲染失败：${e.message||e}`;
+      }
+    }
+    prev.onclick=()=>show(index-1);
+    next.onclick=()=>show(index+1);
+    onKey=e=>{
+      if(e.key==='ArrowLeft') show(index-1);
+      if(e.key==='ArrowRight') show(index+1);
+    };
+    document.addEventListener('keydown',onKey);
+    show(0);
+  } catch(e){
+    if(overlay.isConnected) body.innerHTML='<div class="pv-binary">PPTX 预览失败：'+esc(e.message||e)+'</div>';
+  }
 }
 function isRelativeResourceUrl(value){
   const s=String(value||'').trim();

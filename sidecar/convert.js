@@ -10,7 +10,7 @@
 // ref_dir   转换产生的图片等资源的输出目录(绝对路径)
 // ref_prefix Markdown 中引用这些资源时用的相对路径前缀
 //
-// 支持:docx / xlsx / xls / pdf / html / htm / md / markdown / txt
+// 支持:pptx / docx / xlsx / xls / pdf / html / htm / md / markdown / txt
 // 老格式 .doc(二进制)不支持,返回错误。
 
 const fs = require('fs');
@@ -164,6 +164,11 @@ function convertPlain(input) {
 async function convert(input, ext, ctx) {
   const e = (ext || path.extname(input).slice(1)).toLowerCase();
   switch (e) {
+    case 'pptx': {
+      const { convertPptx } = require('./pptx-convert.cjs');
+      const { createImageAnalyzer } = require('./bailian-vision.js');
+      return convertPptx(input, ctx, { analyzeImage: createImageAnalyzer(ctx.vision) });
+    }
     case 'docx':
       return convertDocx(input, ctx);
     case 'xlsx':
@@ -207,20 +212,30 @@ function readStdin() {
   try {
     const raw = await readStdin();
     const req = JSON.parse(raw);
-    if (!req.input) throw new Error('缺少 input 字段');
-    if (!fs.existsSync(req.input)) throw new Error(`文件不存在: ${req.input}`);
-    const ctx = {
-      refDir: req.ref_dir || '',
-      refPrefix: (req.ref_prefix || '').replace(/\/+$/, ''),
-      wrote: false,
-    };
-    const markdown = (await convert(req.input, req.ext, ctx)) || '';
-    out = {
-      ok: true,
-      markdown,
-      title: path.basename(req.input, path.extname(req.input)),
-      summary: summarize(markdown),
-    };
+    if (req.operation === 'vision_test') {
+      const { createImageAnalyzer } = require('./bailian-vision.js');
+      const analyzer = createImageAnalyzer(req.vision);
+      if (!analyzer) throw new Error('请先配置百炼 API Key');
+      const result = await analyzer(Buffer.from(req.image_base64 || '', 'base64'), 'png');
+      if (!result.description && !result.visibleText) throw new Error('百炼没有返回图片识别结果');
+      out = { ok: true };
+    } else {
+      if (!req.input) throw new Error('缺少 input 字段');
+      if (!fs.existsSync(req.input)) throw new Error(`文件不存在: ${req.input}`);
+      const ctx = {
+        refDir: req.ref_dir || '',
+        refPrefix: (req.ref_prefix || '').replace(/\/+$/, ''),
+        wrote: false,
+        vision: req.vision || null,
+      };
+      const markdown = (await convert(req.input, req.ext, ctx)) || '';
+      out = {
+        ok: true,
+        markdown,
+        title: path.basename(req.input, path.extname(req.input)),
+        summary: summarize(markdown),
+      };
+    }
   } catch (err) {
     out = { ok: false, error: String((err && err.message) || err) };
   }

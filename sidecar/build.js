@@ -52,6 +52,20 @@ const SIDECAR_DIR = __dirname;
 const BIN_DIR = path.join(SIDECAR_DIR, '..', 'src-tauri', 'binaries');
 const ENTRIES = ['convert', 'feishu-sync'];
 
+function buildPptxModules() {
+  const esbuild = require('esbuild');
+  esbuild.buildSync({
+    entryPoints: [path.join(SIDECAR_DIR, 'pptx-convert.mjs')],
+    bundle: true, platform: 'node', format: 'cjs', target: 'node22', minify: true,
+    outfile: path.join(SIDECAR_DIR, 'pptx-convert.cjs'),
+  });
+  esbuild.buildSync({
+    entryPoints: [path.join(SIDECAR_DIR, 'pptx-browser.mjs')],
+    bundle: true, platform: 'browser', format: 'iife', target: 'es2020', minify: true,
+    outfile: path.join(SIDECAR_DIR, '..', 'src-tauri', 'src', 'lib', 'pptx-preview.js'),
+  });
+}
+
 function pkgBin() {
   const bin = process.platform === 'win32' ? 'pkg.cmd' : 'pkg';
   const local = path.join(SIDECAR_DIR, 'node_modules', '.bin', bin);
@@ -59,9 +73,14 @@ function pkgBin() {
 }
 
 function main() {
+  if (process.argv[2] === '--pptx-only') {
+    buildPptxModules();
+    return;
+  }
   const { pkg, triple, ext } = resolveTarget();
   const pkgCmd = pkgBin();
   fs.mkdirSync(BIN_DIR, { recursive: true });
+  buildPptxModules();
   console.log(`目标平台: ${pkg}  (triple: ${triple})`);
 
   for (const name of ENTRIES) {

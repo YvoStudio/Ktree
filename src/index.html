@@ -43,6 +43,8 @@
     border-radius:7px; font-size:13px; width:100%; }
   input:focus { outline:none; border-color:#c7b8e0; box-shadow:0 0 0 1.5px var(--accent-bg); }
   .hint { color:var(--muted); font-size:12px; }
+  .kb-hide-row { display:flex; align-items:center; gap:8px; margin:0 0 12px; font-size:13px; color:#444; }
+  .kb-hide-row input { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
   button.btn { background:var(--accent); color:#fff; border:none; padding:7px 16px;
     border-radius:7px; cursor:pointer; font-size:13px; font-weight:500;
     transition:background .15s ease, opacity .15s ease; }
@@ -113,6 +115,27 @@
       </label>
     </div>
     <p class="hint">端口修改后需重启应用生效;自定义域名保存即生效。</p>
+  </div>
+
+  <div class="section">
+    <h3>PPTX 图片理解（阿里云百炼）</h3>
+    <p class="hint" style="margin:-6px 0 12px">保存时会发送一张应用图标验证配置。之后同步 PPTX 时，仅将其中的图片发给百炼识别；源文件和转换文档仍保存在本机。百炼调用可能产生费用。</p>
+    <div class="row">
+      <label class="field" style="flex:2;min-width:230px">API Key
+        <input type="password" id="visionApiKey" autocomplete="new-password" placeholder="未配置" />
+      </label>
+      <label class="field" style="flex:3;min-width:280px">OpenAI 兼容地址
+        <input type="text" id="visionBaseUrl" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" />
+      </label>
+      <label class="field" style="flex:1;min-width:150px">视觉模型
+        <input type="text" id="visionModel" placeholder="qwen3.8-max" />
+      </label>
+    </div>
+    <div class="row" style="align-items:center">
+      <button class="btn sm" id="btnSaveVision">验证并保存百炼配置</button>
+      <button class="btn ghost sm" id="btnClearVision">停用</button>
+      <span class="hint" id="visionStatus">读取中…</span>
+    </div>
   </div>
 
   <div id="kbSections"></div>
@@ -208,6 +231,40 @@ async function loadConfig(){
   snapshotSavedCounts();
   renderKbs();
 }
+
+async function loadVisionConfig(){
+  try {
+    const vision=await invoke('get_vision_config');
+    document.getElementById('visionApiKey').value='';
+    document.getElementById('visionApiKey').placeholder=vision.configured
+      ? `已保存 ${vision.api_key_masked}，留空不修改` : '请输入百炼 API Key';
+    document.getElementById('visionBaseUrl').value=vision.base_url||'';
+    document.getElementById('visionModel').value=vision.model||'';
+    document.getElementById('visionStatus').textContent=vision.configured?'已配置':'未配置；PPTX 仍可预览并转换，但图片不会生成 AI 描述';
+  } catch(e){
+    document.getElementById('visionStatus').textContent='读取失败：'+e;
+  }
+}
+document.getElementById('btnSaveVision').addEventListener('click',async()=>{
+  const btn=document.getElementById('btnSaveVision');
+  const update={
+    api_key:document.getElementById('visionApiKey').value.trim(),
+    base_url:document.getElementById('visionBaseUrl').value.trim(),
+    model:document.getElementById('visionModel').value.trim(),
+  };
+  btn.disabled=true; btn.textContent='验证中…';
+  try {
+    await invoke('save_vision_config',{update});
+    toast('百炼图片理解已验证并保存');
+    await loadVisionConfig();
+  } catch(e){ await alertDialog('百炼配置验证失败：'+e); }
+  finally { btn.disabled=false; btn.textContent='验证并保存百炼配置'; }
+});
+document.getElementById('btnClearVision').addEventListener('click',async()=>{
+  if(!await confirmDialog('停用百炼图片理解？已生成的 Markdown 图片描述会保留。')) return;
+  try { await invoke('clear_vision_config'); await loadVisionConfig(); toast('已停用百炼图片理解'); }
+  catch(e){ await alertDialog('停用失败：'+e); }
+});
 // 加载配置时各 KB 已保存的绑定条数 —— 用来区分「已保存」(名字只读、删除走 API 清数据)
 // 和「新增未保存」(名字可填、删除只是移除行)。绑定只会 append,所以 idx < 已保存数 = 已保存。
 let SAVED_COUNTS = [];
@@ -233,6 +290,11 @@ function renderKbs(){
           <input type="text" data-i="${i}" data-f="root" value="${esc(kb.root||'')}" />
         </label>
       </div>
+      <label class="kb-hide-row">
+        <input type="checkbox" data-i="${i}" data-f="hidden" ${kb.hidden?'checked':''} />
+        <span>隐藏此知识库</span>
+        <span class="hint">网页目录与搜索不显示；文件、同步和已有直链不受影响</span>
+      </label>
       <div class="vcs-section">
         <div class="vcs-head">
           <span class="vcs-title">仓库绑定(git / svn)→ src/vcs/&lt;名字&gt;/(只读镜像,严格同步)</span>
@@ -300,6 +362,7 @@ function collect(){
     if(!kb) return;
     if(f==='name') kb.name=inp.value.trim();
     else if(f==='root') kb.root=inp.value.trim();
+    else if(f==='hidden') kb.hidden=inp.checked;
   });
   // 仓库绑定字段(input + select)
   document.querySelectorAll('#kbSections [data-vi][data-vf]').forEach(inp=>{
@@ -445,7 +508,7 @@ document.getElementById('kbSections').addEventListener('change', e=>{
 document.getElementById('btnAddKb').addEventListener('click', ()=>{
   collect();
   CFG.knowledge_bases = CFG.knowledge_bases || [];
-  CFG.knowledge_bases.push({ id:'', name:'新知识库', root:'', vcs_bindings:[], cloud_bindings:[] });
+  CFG.knowledge_bases.push({ id:'', name:'新知识库', root:'', hidden:false, vcs_bindings:[], cloud_bindings:[] });
   renderKbs();
 });
 document.getElementById('btnSave').addEventListener('click', async ()=>{
@@ -487,6 +550,7 @@ document.getElementById('btnCheckUpdate').addEventListener('click', async ()=>{
 
 loadStatus();
 loadConfig();
+loadVisionConfig();
 setInterval(loadStatus, 5000);
 </script>
 </body>

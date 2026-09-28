@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
+use base64::Engine;
+
+use crate::config::VisionConfig;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -18,6 +21,15 @@ struct ConvertRequest<'a> {
     ref_dir: &'a str,
     /// Markdown 中引用上述资源时用的相对路径前缀
     ref_prefix: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vision: Option<&'a VisionConfig>,
+}
+
+#[derive(Serialize)]
+struct VisionTestRequest<'a> {
+    operation: &'static str,
+    image_base64: String,
+    vision: &'a VisionConfig,
 }
 
 /// Node sidecar 的转换结果。ok=false 时看 error。
@@ -82,6 +94,7 @@ pub fn convert_file(
     ext: &str,
     ref_dir: &Path,
     ref_prefix: &str,
+    vision: Option<&VisionConfig>,
 ) -> anyhow::Result<ConvertResult> {
     let input_str = input
         .to_str()
@@ -94,8 +107,26 @@ pub fn convert_file(
         ext,
         ref_dir: ref_dir_str,
         ref_prefix,
+        vision,
     })?;
 
+    run_sidecar_request(&req)
+}
+
+/// 保存视觉配置前发一次真实图片请求，与工作站相同，避免无效密钥延迟到同步时才暴露。
+pub fn test_vision_config(vision: &VisionConfig) -> anyhow::Result<()> {
+    let image_base64 = base64::engine::general_purpose::STANDARD
+        .encode(include_bytes!("../icons/128x128.png"));
+    let req = serde_json::to_string(&VisionTestRequest {
+        operation: "vision_test",
+        image_base64,
+        vision,
+    })?;
+    let result = run_sidecar_request(&req)?;
+    if result.ok { Ok(()) } else { anyhow::bail!("{}", result.error) }
+}
+
+fn run_sidecar_request(req: &str) -> anyhow::Result<ConvertResult> {
     let (program, args) = sidecar_command();
     let mut cmd = sidecar_process(&program);
     let mut child = cmd

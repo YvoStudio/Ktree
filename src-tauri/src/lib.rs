@@ -222,6 +222,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             config::get_config,
             config::set_config,
+            config::get_vision_config,
+            config::save_vision_config,
+            config::clear_vision_config,
             commands::get_service_info,
             commands::delete_binding,
             commands::check_vcs_all,

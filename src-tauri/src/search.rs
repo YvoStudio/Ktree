@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::config::KnowledgeBase;
 use crate::embed::QUERY_INSTRUCTION;
 use crate::index::SearchHit;
 use crate::ingest;
@@ -16,6 +17,13 @@ use crate::store::Document;
 /// Reciprocal Rank Fusion 常数(业界惯用 60):靠名次而非绝对分融合,
 /// 免去 BM25 分与 cosine 分量纲不一致的归一化麻烦。
 const RRF_K: f32 = 60.0;
+
+fn visible_kb_ids(kbs: &[KnowledgeBase], requested: Option<&str>) -> Vec<String> {
+    kbs.iter()
+        .filter(|item| !item.hidden && requested.map_or(true, |id| item.id == id))
+        .map(|item| item.id.clone())
+        .collect()
+}
 
 /// 混合检索:BM25 与语义向量各取候选,RRF 融合后返回前 `limit` 条。
 ///
@@ -31,12 +39,23 @@ pub fn hybrid(
     let (free_text, constraints) = query_parser::parse(query);
     let free_text = free_text.trim();
     let limit = limit.max(1);
+    // 搜索范围从配置实时计算，不改动索引。按可见库分别召回再合并，
+    // 避免隐藏库占满全局 TopDocs 候选池、挤掉可见库结果。
+    let cfg = state.config.snapshot();
+    let visible_kbs = visible_kb_ids(&cfg.knowledge_bases, kb);
+    if visible_kbs.is_empty() {
+        return Ok(Vec::new());
+    }
 
     // 算子约束 → 允许的 doc_id 集合(None = 无约束,不过滤)。
     let allowed: Option<HashSet<i64>> = if constraints.is_empty() {
         None
     } else {
-        Some(state.store.doc_ids_matching(kb, &constraints)?)
+        let mut ids = HashSet::new();
+        for kb_id in &visible_kbs {
+            ids.extend(state.store.doc_ids_matching(Some(kb_id), &constraints)?);
+        }
+        Some(ids)
     };
 
     // 纯算子无自由文本:没有相关度可言,直接按约束列举(更新时间倒序)。
@@ -55,15 +74,19 @@ pub fn hybrid(
         (limit * 3).max(20)
     };
 
-    let bm25: Vec<SearchHit> = state
-        .index
-        .search(kb, free_text, candidates)?
-        .into_iter()
-        .filter(|h| !is_ignored_doc_id(state, h.doc_id))
-        .filter(|h| allowed.as_ref().map_or(true, |s| s.contains(&h.doc_id)))
-        .collect();
+    let mut bm25: Vec<SearchHit> = Vec::new();
+    for kb_id in &visible_kbs {
+        bm25.extend(
+            state.index.search(Some(kb_id), free_text, candidates)?
+                .into_iter()
+                .filter(|h| !is_ignored_doc_id(state, h.doc_id))
+                .filter(|h| allowed.as_ref().map_or(true, |s| s.contains(&h.doc_id))),
+        );
+    }
+    bm25.sort_by(|a, b| b.score.total_cmp(&a.score));
+    bm25.truncate(candidates);
     // 向量路失败不致命:退化成纯 BM25。
-    let vector: Vec<(i64, f32)> = vector_search(state, kb, free_text, candidates, allowed.as_ref())
+    let vector: Vec<(i64, f32)> = vector_search(state, &visible_kbs, free_text, candidates, allowed.as_ref())
         .unwrap_or_default()
         .into_iter()
         .filter(|(doc_id, _)| !is_ignored_doc_id(state, *doc_id))
@@ -124,7 +147,7 @@ pub fn hybrid(
 /// `allowed` 非 None 时,在截断前先按约束过滤,保证被约束命中的文档不会因排在候选外而漏掉。
 fn vector_search(
     state: &AppState,
-    kb: Option<&str>,
+    visible_kbs: &[String],
     query: &str,
     limit: usize,
     allowed: Option<&HashSet<i64>>,
@@ -136,15 +159,17 @@ fn vector_search(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("查询向量为空"))?;
-    let mut scored: Vec<(i64, f32)> = state
-        .store
-        .all_vectors(kb)?
-        .into_iter()
-        .filter(|(id, v)| {
-            v.len() == qv.len() && allowed.map_or(true, |s| s.contains(id))
-        })
-        .map(|(id, v)| (id, dot(&qv, &v)))
-        .collect();
+    let mut scored: Vec<(i64, f32)> = Vec::new();
+    for kb_id in visible_kbs {
+        scored.extend(
+            state.store.all_vectors(Some(kb_id))?
+                .into_iter()
+                .filter(|(id, v)| {
+                    v.len() == qv.len() && allowed.map_or(true, |s| s.contains(id))
+                })
+                .map(|(id, v)| (id, dot(&qv, &v))),
+        );
+    }
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     scored.truncate(limit);
     Ok(scored)
@@ -212,4 +237,28 @@ fn hit_from_store(state: &AppState, doc_id: i64, score: f32) -> Option<SearchHit
         summary: doc.summary,
         score,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kb(id: &str, hidden: bool) -> KnowledgeBase {
+        KnowledgeBase {
+            id: id.to_string(),
+            name: id.to_string(),
+            root: std::path::PathBuf::from(format!("/tmp/{id}")),
+            hidden,
+            vcs_bindings: Vec::new(),
+            cloud_bindings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn visible_scope_excludes_hidden_even_when_explicitly_requested() {
+        let kbs = [kb("public-a", false), kb("private", true), kb("public-b", false)];
+        assert_eq!(visible_kb_ids(&kbs, None), ["public-a", "public-b"]);
+        assert_eq!(visible_kb_ids(&kbs, Some("public-b")), ["public-b"]);
+        assert!(visible_kb_ids(&kbs, Some("private")).is_empty());
+    }
 }

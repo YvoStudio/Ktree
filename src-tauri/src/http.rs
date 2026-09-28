@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use axum::{
-    extract::{ConnectInfo, Multipart, Path as AxPath, Query, State as AxState},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path as AxPath, Query, State as AxState},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -225,7 +225,8 @@ pub async fn serve(state: AppState) {
         .route("/api/tree", get(tree))
         .route("/api/files", get(list_files))
         .route("/api/folder", post(create_folder).delete(delete_folder_http))
-        .route("/api/upload", post(upload))
+        .route("/api/upload", post(upload).layer(DefaultBodyLimit::max(64 * 1024 * 1024)))
+        .route("/api/kb/:kb_id/pptx/backfill", post(backfill_uploaded_pptx_http))
         .route("/api/search", get(search))
         .route("/api/backlinks", get(backlinks))
         .route("/api/related", get(related))
@@ -251,6 +252,7 @@ pub async fn serve(state: AppState) {
         .route("/lib/github.min.css", get(lib_css))
         .route("/lib/mermaid.min.js", get(lib_mermaid))
         .route("/lib/tex-svg.js", get(lib_mathjax))
+        .route("/lib/pptx-preview.js", get(lib_pptx))
         // MCP 只支持 JSON-RPC POST;不注册 GET,axum 会自动回 405 + Allow: POST
         .route("/mcp", post(mcp::handle))
         // 知识库文件直链:/<知识库名>/<相对知识库根的路径>。放最后,优先匹配上面的固定路由。
@@ -353,6 +355,14 @@ async fn lib_mathjax() -> Response {
     (
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
         include_str!("lib/tex-svg.js"),
+    )
+        .into_response()
+}
+
+async fn lib_pptx() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        include_str!("lib/pptx-preview.js"),
     )
         .into_response()
 }
@@ -657,7 +667,7 @@ async fn reorder_notes(
 async fn list_kbs(AxState(state): AxState<AppState>) -> Result<Response, ApiError> {
     let cfg = state.config.snapshot();
     let mut kbs = Vec::new();
-    for kb in &cfg.knowledge_bases {
+    for kb in cfg.knowledge_bases.iter().filter(|kb| !kb.hidden) {
         let docs = state
             .store
             .list_documents(&kb.id, None)?
@@ -1085,6 +1095,26 @@ async fn upload(
     })))
 }
 
+/// 从已有 src/upload/ 原件补录 PPTX，不经过 multipart，也不改动源文件。
+/// 仅本机可触发，避免局域网请求反复转换大量课件。
+async fn backfill_uploaded_pptx_http(
+    AxState(state): AxState<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    AxPath(kb_id): AxPath<String>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_local(&addr) {
+        return Ok(r);
+    }
+    let kb = match require_kb(&state, &kb_id) {
+        Ok(k) => k,
+        Err(r) => return Ok(r),
+    };
+    let report = tokio::task::spawn_blocking(move || ingest::backfill_uploaded_pptx(&state, &kb))
+        .await
+        .map_err(|e| anyhow::anyhow!("PPTX 补录任务失败: {e}"))??;
+    Ok(json_ok(json!({ "ok": report.failed.is_empty(), "report": report })))
+}
+
 #[derive(Deserialize)]
 struct SearchQuery {
     #[serde(default)]
@@ -1105,9 +1135,9 @@ async fn search(
     } else {
         Some(q.kb.clone())
     };
-    // 指定了知识库就先校验存在 —— 不存在直接报错,而不是返回空结果。
+    // 隐藏库也不允许被显式指定搜索，避免通过 kb 参数绕过全局过滤。
     if let Some(ref kb_id) = kb {
-        if state.config.get_kb(kb_id).is_none() {
+        if !state.config.get_kb(kb_id).is_some_and(|kb| !kb.hidden) {
             return Ok(not_found("知识库不存在"));
         }
     }

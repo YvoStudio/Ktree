@@ -334,11 +334,11 @@ async fn call_tool(
 
 async fn tool_list(state: &AppState) -> anyhow::Result<String> {
     let cfg = state.config.snapshot();
-    if cfg.knowledge_bases.is_empty() {
-        return Ok("还没有知识库。".to_string());
+    if !cfg.knowledge_bases.iter().any(|kb| !kb.hidden) {
+        return Ok("还没有可见知识库。".to_string());
     }
     let mut out = String::from("知识库列表:\n");
-    for kb in &cfg.knowledge_bases {
+    for kb in cfg.knowledge_bases.iter().filter(|kb| !kb.hidden) {
         let n = state
             .store
             .list_documents(&kb.id, None)
@@ -367,9 +367,9 @@ async fn tool_search(state: &AppState, args: &Value) -> anyhow::Result<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    // 指定了知识库就先校验存在 —— 与 kb_list_docs 行为一致,不存在直接报错。
+    // 隐藏库不能通过显式指定 kb 绕过搜索范围。
     if let Some(ref kb_id) = kb {
-        if state.config.get_kb(kb_id).is_none() {
+        if !state.config.get_kb(kb_id).is_some_and(|kb| !kb.hidden) {
             anyhow::bail!("知识库「{kb_id}」不存在");
         }
     }
@@ -539,6 +539,7 @@ async fn tool_list_docs(state: &AppState, args: &Value) -> anyhow::Result<String
     let kb = state
         .config
         .get_kb(kb_id)
+        .filter(|kb| !kb.hidden)
         .ok_or_else(|| anyhow::anyhow!("知识库 {kb_id} 不存在"))?;
     let path = args.get("path").and_then(|v| v.as_str());
     let docs: Vec<_> = state

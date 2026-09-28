@@ -88,6 +88,9 @@ pub struct KnowledgeBase {
     pub name: String,
     /// 知识库根目录
     pub root: PathBuf,
+    /// 网页目录与搜索中隐藏；不删除数据，也不停止同步。
+    #[serde(default)]
+    pub hidden: bool,
     #[serde(default)]
     pub vcs_bindings: Vec<VcsBinding>,
     #[serde(default)]
@@ -111,6 +114,82 @@ pub struct AppConfig {
     pub knowledge_bases: Vec<KnowledgeBase>,
 }
 
+/// 百炼视觉配置单独保存在本机 vision.json，不进入对外的 /api/config。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisionConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
+            model: "qwen3.8-max".to_string(),
+        }
+    }
+}
+
+impl VisionConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.api_key.trim().is_empty()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.is_configured() {
+            anyhow::bail!("请输入百炼 API Key");
+        }
+        let url = self.base_url.trim().trim_end_matches('/');
+        let Some(rest) = url.strip_prefix("https://") else {
+            anyhow::bail!("百炼兼容地址必须是 HTTPS URL");
+        };
+        let host = rest.split('/').next().unwrap_or_default();
+        if host.is_empty() || host.contains('@') || host.contains('?') || host.contains('#')
+            || url.chars().any(char::is_whitespace)
+        {
+            anyhow::bail!("百炼兼容地址格式不正确");
+        }
+        if self.model.is_empty()
+            || self.model.len() > 100
+            || !self.model.chars().all(|c| c.is_ascii_alphanumeric() || "._:-".contains(c))
+        {
+            anyhow::bail!("百炼模型名称格式不正确");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+pub struct VisionConfigView {
+    pub configured: bool,
+    pub api_key_masked: String,
+    pub base_url: String,
+    pub model: String,
+}
+
+impl From<&VisionConfig> for VisionConfigView {
+    fn from(config: &VisionConfig) -> Self {
+        let key = config.api_key.trim();
+        let masked = if key.is_empty() {
+            String::new()
+        } else if key.chars().count() <= 8 {
+            "••••••••".to_string()
+        } else {
+            let prefix: String = key.chars().take(5).collect();
+            let suffix: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+            format!("{prefix}••••••••{suffix}")
+        };
+        Self {
+            configured: config.is_configured(),
+            api_key_masked: masked,
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+        }
+    }
+}
+
 impl AppConfig {
     /// 首次启动时给一个默认知识库,开箱即用。
     fn with_default_kb(data_dir: &std::path::Path) -> Self {
@@ -122,6 +201,7 @@ impl AppConfig {
                 id: String::new(),
                 name: "默认知识库".to_string(),
                 root: data_dir.join("kb"),
+                hidden: false,
                 vcs_bindings: Vec::new(),
                 cloud_bindings: Vec::new(),
             }],
@@ -215,6 +295,8 @@ fn ensure_kb_dirs(kb: &KnowledgeBase) -> std::io::Result<()> {
 pub struct ConfigStore {
     inner: Mutex<AppConfig>,
     file: PathBuf,
+    vision: Mutex<VisionConfig>,
+    vision_file: PathBuf,
     /// 应用数据目录 —— 新增知识库未指定 root 时落在这里。
     data_dir: PathBuf,
 }
@@ -233,6 +315,11 @@ impl ConfigStore {
         fs::create_dir_all(&data_dir)?;
 
         let file = cfg_dir.join("config.json");
+        let vision_file = cfg_dir.join("vision.json");
+        let vision = fs::read_to_string(&vision_file)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<VisionConfig>(&raw).ok())
+            .unwrap_or_default();
         let mut cfg: AppConfig = if file.exists() {
             let txt = fs::read_to_string(&file)?;
             serde_json::from_str(&txt).unwrap_or_else(|_| AppConfig::with_default_kb(&data_dir))
@@ -265,12 +352,62 @@ impl ConfigStore {
         Ok(Self {
             inner: Mutex::new(cfg),
             file,
+            vision: Mutex::new(vision),
+            vision_file,
             data_dir,
         })
     }
 
     pub fn snapshot(&self) -> AppConfig {
         self.inner.lock().unwrap().clone()
+    }
+
+    pub fn vision_snapshot(&self) -> VisionConfig {
+        self.vision.lock().unwrap().clone()
+    }
+
+    pub fn vision_updated_at(&self) -> Option<std::time::SystemTime> {
+        if !self.vision.lock().unwrap().is_configured() {
+            return None;
+        }
+        fs::metadata(&self.vision_file).ok()?.modified().ok()
+    }
+
+    pub fn save_vision(&self, mut vision: VisionConfig) -> anyhow::Result<VisionConfigView> {
+        vision.validate()?;
+        vision.base_url = vision.base_url.trim().trim_end_matches('/').to_string();
+        vision.model = vision.model.trim().to_string();
+        vision.api_key = vision.api_key.trim().to_string();
+        let raw = serde_json::to_vec_pretty(&vision)?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.vision_file)?;
+            // OpenOptions::mode 只在新建文件时生效；既有文件也收紧到仅当前用户可读写。
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            f.write_all(&raw)?;
+        }
+        #[cfg(not(unix))]
+        fs::write(&self.vision_file, &raw)?;
+        let view = VisionConfigView::from(&vision);
+        *self.vision.lock().unwrap() = vision;
+        Ok(view)
+    }
+
+    pub fn clear_vision(&self) -> anyhow::Result<VisionConfigView> {
+        if self.vision_file.exists() {
+            fs::remove_file(&self.vision_file)?;
+        }
+        let vision = VisionConfig::default();
+        let view = VisionConfigView::from(&vision);
+        *self.vision.lock().unwrap() = vision;
+        Ok(view)
     }
 
     /// 按 id 取知识库。
@@ -339,6 +476,7 @@ impl ConfigStore {
             id: String::new(),
             name: name.clone(),
             root,
+            hidden: false,
             vcs_bindings: Vec::new(),
             cloud_bindings: Vec::new(),
         });
@@ -469,4 +607,65 @@ pub fn set_config(
     config: AppConfig,
 ) -> Result<(), String> {
     state.config.replace(config).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+pub struct VisionConfigUpdate {
+    #[serde(default)]
+    api_key: String,
+    base_url: String,
+    model: String,
+}
+
+#[tauri::command]
+pub fn get_vision_config(state: State<'_, crate::state::AppState>) -> VisionConfigView {
+    VisionConfigView::from(&state.config.vision_snapshot())
+}
+
+#[tauri::command]
+pub async fn save_vision_config(
+    state: State<'_, crate::state::AppState>,
+    update: VisionConfigUpdate,
+) -> Result<VisionConfigView, String> {
+    let store = state.config.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let old = store.vision_snapshot();
+        let vision = VisionConfig {
+            api_key: if update.api_key.trim().is_empty() { old.api_key } else { update.api_key },
+            base_url: update.base_url,
+            model: update.model,
+        };
+        vision.validate().map_err(|e| e.to_string())?;
+        crate::convert::test_vision_config(&vision).map_err(|e| e.to_string())?;
+        store.save_vision(vision).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if result.is_ok() {
+        // 配置改变后同一 SVN 修订也需要重新核对 PPTX 产物。
+        for kb in state.config.snapshot().knowledge_bases {
+            for idx in 0..kb.vcs_bindings.len() {
+                state.clear_audited(&kb.id, idx);
+            }
+        }
+    }
+    result
+}
+
+#[tauri::command]
+pub fn clear_vision_config(state: State<'_, crate::state::AppState>) -> Result<VisionConfigView, String> {
+    state.config.clear_vision().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KnowledgeBase;
+
+    #[test]
+    fn legacy_kb_without_hidden_field_stays_visible() {
+        let kb: KnowledgeBase = serde_json::from_str(
+            r#"{"id":"old","name":"old","root":"/tmp/old"}"#,
+        ).unwrap();
+        assert!(!kb.hidden);
+    }
 }

@@ -1107,7 +1107,9 @@ fn ingest_vcs_rel_path(
         Ok(doc) => {
             if old_doc.is_none() {
                 report.added.push(rel_path.to_string());
-            } else if old_md5 != Some(doc.md5.as_str()) || !old_output_ok {
+            } else if old_md5 != Some(doc.md5.as_str()) || !old_output_ok
+                || old_doc.as_ref().and_then(|d| d.md_path.as_deref()) != doc.md_path.as_deref()
+            {
                 report.updated.push(rel_path.to_string());
             }
         }
@@ -1316,6 +1318,7 @@ fn audit_reconcile_state(
     target: &Path,
     prefix: &str,
     manifest: &kbmeta::Manifest,
+    vision_updated_at: Option<std::time::SystemTime>,
 ) -> anyhow::Result<ReconcileAudit> {
     let docs = store.list_documents(&kb.id, Some(prefix))?;
     let stored_by_path: std::collections::HashMap<&str, &crate::store::Document> = docs
@@ -1357,7 +1360,13 @@ fn audit_reconcile_state(
         // 存在性判定与 ingest 的短路口径一致(见 docs_artifact_present):
         // 这里若用 is_file(),Windows 上"原样镜像"的产物会被整批判成缺失,
         // 逐文件核对每轮都报不一致 → 每轮触发全库对账重灌。
-        if !ingest::docs_artifact_present(&kb.root, output) {
+        let pptx_stale = doc.ext == "pptx" && (!output.ends_with(".md")
+            || vision_updated_at.is_some_and(|changed| {
+                fs::metadata(kb.root.join(output))
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|created| created < changed)
+            }));
+        if !ingest::docs_artifact_present(&kb.root, output) || pptx_stale {
             audit.missing_outputs.push(rel_path.clone());
         }
 
@@ -1468,7 +1477,7 @@ fn sync_binding_inner(
                 // 不信任 SVN 增量报告是否完整:逐文件核对 src / store / manifest / docs。
                 // 数量相等也可能是一漏一残留互相抵消;内容 md5 还能发现 SVN 漏报修改。
                 state.set_sync_progress("vcs", &kb.id, binding_idx, "逐文件核对一致性…");
-                let audit = audit_reconcile_state(&state.store, kb, &target, &prefix, &manifest)?;
+                let audit = audit_reconcile_state(&state.store, kb, &target, &prefix, &manifest, state.config.vision_updated_at())?;
                 if audit.is_consistent() {
                     state.mark_audited(&kb.id, binding_idx, &report.revision);
                 } else {
@@ -1481,7 +1490,7 @@ fn sync_binding_inner(
                     )?;
 
                     let remaining =
-                        audit_reconcile_state(&state.store, kb, &target, &prefix, &manifest)?;
+                        audit_reconcile_state(&state.store, kb, &target, &prefix, &manifest, state.config.vision_updated_at())?;
                     if remaining.is_consistent() {
                         state.mark_audited(&kb.id, binding_idx, &report.revision);
                     } else {
@@ -1667,11 +1676,12 @@ mod tests {
             id: "kb".to_string(),
             name: "kb".to_string(),
             root: root.clone(),
+            hidden: false,
             vcs_bindings: Vec::new(),
             cloud_bindings: Vec::new(),
         };
         let audit =
-            audit_reconcile_state(&store, &kb, &target, prefix, &kbmeta::Manifest::new()).unwrap();
+            audit_reconcile_state(&store, &kb, &target, prefix, &kbmeta::Manifest::new(), None).unwrap();
         assert_eq!(audit.source_files, 1);
         assert_eq!(audit.stored_docs, 1);
         assert_eq!(audit.missing_store, vec![format!("{prefix}/new-dir/missed.txt")]);
@@ -1695,12 +1705,13 @@ mod tests {
             id: "kb".to_string(),
             name: "kb".to_string(),
             root: root.clone(),
+            hidden: false,
             vcs_bindings: Vec::new(),
             cloud_bindings: Vec::new(),
         };
 
         let mut audit =
-            audit_reconcile_state(&store, &kb, &target, prefix, &kbmeta::Manifest::new()).unwrap();
+            audit_reconcile_state(&store, &kb, &target, prefix, &kbmeta::Manifest::new(), None).unwrap();
         audit.missing_store.sort();
         assert_eq!(audit.source_files, 2);
         assert_eq!(audit.stored_docs, 0);
@@ -1713,6 +1724,39 @@ mod tests {
         );
         assert!(!audit.is_consistent());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn audit_reprocesses_legacy_pptx_mirror() {
+        let root = tmp_dir();
+        let prefix = "vcs/demo";
+        let rel = format!("{prefix}/slides.pptx");
+        let target = root.join("src").join(prefix);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(root.join("docs").join(prefix)).unwrap();
+        std::fs::write(target.join("slides.pptx"), b"pptx").unwrap();
+        std::fs::write(root.join("docs").join(&rel), b"pptx").unwrap();
+        let md5 = format!("{:x}", Md5::digest(b"pptx"));
+        let store = crate::store::Store::open(&root.join("test.db")).unwrap();
+        store.upsert_document(&crate::store::NewDocument {
+            kb_id: "kb".to_string(), rel_path: rel.clone(), title: "slides".to_string(),
+            ext: "pptx".to_string(), size: 4, md5: md5.clone(), summary: String::new(),
+            tags: String::new(), props: String::new(), md_path: Some(format!("docs/{rel}")),
+            source: "vcs".to_string(),
+        }).unwrap();
+        let mut manifest = kbmeta::Manifest::new();
+        manifest.insert(rel.clone(), kbmeta::ManifestEntry {
+            md5, output: format!("docs/{rel}"), converted_at: String::new(),
+        });
+        let kb = KnowledgeBase {
+            id: "kb".to_string(), name: "kb".to_string(), root: root.clone(),
+            hidden: false,
+            vcs_bindings: Vec::new(), cloud_bindings: Vec::new(),
+        };
+        let audit = audit_reconcile_state(&store, &kb, &target, prefix, &manifest, None).unwrap();
+        assert_eq!(audit.missing_outputs, vec![rel]);
+        assert!(!audit.is_consistent());
         let _ = std::fs::remove_dir_all(&root);
     }
 

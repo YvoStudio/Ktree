@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+use serde::Serialize;
+
 use md5::{Digest, Md5};
 
 use crate::config::KnowledgeBase;
@@ -199,6 +201,75 @@ pub fn ingest_file(
     Ok(doc)
 }
 
+#[derive(Serialize)]
+pub struct PptxBackfillReport {
+    pub scanned: usize,
+    pub converted: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+/// 补录已经放在 src/upload/ 的 PPTX。走正常入库流程，保持 docs、manifest、
+/// SQLite 与搜索索引一致；不重写源文件。仅本机 HTTP 入口调用。
+pub fn backfill_uploaded_pptx(
+    state: &AppState,
+    kb: &KnowledgeBase,
+) -> anyhow::Result<PptxBackfillReport> {
+    fn collect(base: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name.ends_with(".assets") || is_ignored_component(&name) {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                collect(base, &entry.path(), out)?;
+            } else if kind.is_file()
+                && entry.path().extension().and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("pptx"))
+            {
+                let rel = entry.path().strip_prefix(base)
+                    .map_err(std::io::Error::other)?
+                    .to_string_lossy().replace('\\', "/");
+                out.push(rel);
+            }
+        }
+        Ok(())
+    }
+
+    let src_root = kb.root.join("src");
+    let mut paths = Vec::new();
+    collect(&src_root, &src_root.join(crate::config::AREA_UPLOAD), &mut paths)?;
+    paths.sort();
+    let mut report = PptxBackfillReport {
+        scanned: paths.len(), converted: Vec::new(), skipped: Vec::new(), failed: Vec::new(),
+    };
+    let mut manifest = kbmeta::load_manifest(&kb.root);
+    let mut changed = false;
+    for rel in paths {
+        let mut dirty = false;
+        match ingest_file_with_manifest(
+            state, kb, &rel, "upload", true, false, &mut manifest, &mut dirty,
+        ) {
+            Ok(doc) if doc.md_path.as_deref().is_some_and(|p| p.ends_with(".md")) => {
+                if dirty { report.converted.push(rel); } else { report.skipped.push(rel); }
+            }
+            Ok(_) => report.failed.push((rel, "PPTX 转换失败，docs 仍是原件镜像".to_string())),
+            Err(e) => report.failed.push((rel, e.to_string())),
+        }
+        changed |= dirty;
+    }
+    if changed {
+        kbmeta::save_manifest(&kb.root, &manifest)?;
+        refresh_kb_meta(state, kb)?;
+    }
+    Ok(report)
+}
+
 /// `ingest_file` 的批量版本:manifest 由调用方加载、传入并负责落盘。
 /// 修改过 manifest 时置位 `manifest_dirty`(跳过路径不落盘,调用方据此省掉无谓写)。
 #[allow(clippy::too_many_arguments)]
@@ -248,7 +319,17 @@ pub(crate) fn ingest_file_with_manifest(
                         .as_deref()
                         .map(|md| docs_artifact_present(&kb.root, md))
                         .unwrap_or(false);
-                    if store_ok && docs_ok {
+                    // 旧版本把 PPTX 原样镜像到 docs/；新版本需升级为逐页 Markdown。
+                    let pptx_ready = ext != "pptx" || !convert_md || doc.md_path.as_deref()
+                        .filter(|p| p.ends_with(".md"))
+                        .is_some_and(|p| {
+                            state.config.vision_updated_at().map_or(true, |changed| {
+                                fs::metadata(kb.root.join(p))
+                                    .and_then(|meta| meta.modified())
+                                    .is_ok_and(|created| created >= changed)
+                            })
+                        });
+                    if store_ok && docs_ok && pptx_ready {
                         return Ok(doc);
                     }
                 }
@@ -266,7 +347,8 @@ pub(crate) fn ingest_file_with_manifest(
         let assets_abs = kb.root.join("docs").join(&rel_assets);
         // md 与 .assets 同目录,引用前缀就是目录名本身
         let assets_prefix = format!("{stem}.assets");
-        match convert::convert_file(&src_abs, &ext, &assets_abs, &assets_prefix) {
+        let vision = (ext == "pptx").then(|| state.config.vision_snapshot());
+        match convert::convert_file(&src_abs, &ext, &assets_abs, &assets_prefix, vision.as_ref().filter(|v| v.is_configured())) {
             Ok(r) if r.ok => Some(r),
             _ => None,
         }
@@ -287,6 +369,13 @@ pub(crate) fn ingest_file_with_manifest(
             let tags = derive_tags(&body, &stem);
             let fm = kbmeta::build_frontmatter(&stem, &category, &tags, &summary);
             fs::write(&docs_abs, format!("{fm}{body}"))?;
+            if ext == "pptx" {
+                // 升级旧版原样镜像时，不要让 docs/ 同时留下同一份 PPTX 与新 Markdown。
+                let legacy = kb.root.join("docs").join(rel_path);
+                if fs::symlink_metadata(&legacy).is_ok() {
+                    fs::remove_file(&legacy)?;
+                }
+            }
             (Some(format!("docs/{rel_md}")), body, summary, tags)
         } else {
             // 文本 / 转换失败 / 不支持转换:在 docs/<rel_path> 镜像 src 原文。
@@ -1011,6 +1100,7 @@ mod tests {
             id: "kb".to_string(),
             name: "kb".to_string(),
             root: root.clone(),
+            hidden: false,
             vcs_bindings: Vec::new(),
             cloud_bindings: Vec::new(),
         };
