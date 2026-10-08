@@ -43,6 +43,8 @@ npm run build                  # 出当前平台安装包(externalBin 自动打�
 
 跨平台:在各目标平台分别重跑 `node sidecar/build.js` + `npm run build`。
 
+GitHub 标签发布先汇总到 Release 草稿；macOS ARM64、Windows x64、Linux x64 的构建均成功后，才校验安装包、`latest.json` 三平台条目和更新签名，再公开发布并提升为 Latest。任一平台失败或清单缺项时保留上一完整版本的自动更新入口；不要把旧 Mac 包伪装成新版本写入清单。发布校验可运行 `npm run test:release`，实际附件核对用 `node scripts/verify-release.cjs --repo YvoStudio/Ktree --tag vX.Y.Z`（需 `gh` 登录，支持草稿）。
+
 ### PPTX 图片理解
 
 在桌面端「设置 → PPTX 图片理解」填写百炼 API Key、OpenAI 兼容地址与支持视觉输入的模型。默认地址为 `https://dashscope.aliyuncs.com/compatible-mode/v1`，默认模型为 `qwen3.8-max`。保存时会用应用图标发起一次真实验证；密钥仅保存在本机应用配置目录的 `vision.json`，不会由 `/api/config` 返回。PPTX 原件不上传，只有其中支持的图片以 Base64 发送给配置的视觉 API；未配置或识别失败时仍生成 Markdown 和幻灯片画面。SVN 已入库的 PPTX 可通过「检查全库」补生成；已放在 `src/upload/` 的 PPTX 可点击网页「对账上传文件」或在本机调用 `POST /api/kb/{知识库ID}/pptx/backfill` 补录，原件不会改写。更改百炼配置后，下次仓库/上传区对账或再次调用补录接口会重新处理。

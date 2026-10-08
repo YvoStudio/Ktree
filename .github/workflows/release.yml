@@ -8,6 +8,7 @@ on:
 
 jobs:
   build:
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     strategy:
@@ -145,6 +146,30 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Ktree ${{ github.ref_name }}'
           releaseBody: ${{ steps.changelog.outputs.body }}
-          releaseDraft: false
+          # 产物先汇入草稿;任一平台失败都不能替换旧客户端读取的 Latest。
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Test release completeness guard
+        run: npm run test:release
+      - name: Verify all installers and signed updater entries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/verify-release.cjs --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG"
+      - name: Publish complete release as Latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
