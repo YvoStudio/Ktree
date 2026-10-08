@@ -28,10 +28,10 @@ mod mcp;
 mod query_parser;
 mod scheduler;
 mod search;
-mod textproc;
-mod vcs;
 mod state;
 mod store;
+mod textproc;
+mod vcs;
 
 use std::sync::{Arc, Mutex};
 
@@ -79,8 +79,7 @@ pub fn run() {
                 .map_err(|e| anyhow::anyhow!("app_data_dir: {e}"))?;
             let cfg_store = Arc::new(config::ConfigStore::load(app.handle())?);
             let store = Arc::new(store::Store::open(&data_dir.join("ktree.db"))?);
-            let search_index =
-                Arc::new(index::SearchIndex::open(&data_dir.join("index"))?);
+            let search_index = Arc::new(index::SearchIndex::open(&data_dir.join("index"))?);
             let app_state = state::AppState {
                 config: cfg_store,
                 store,
@@ -91,6 +90,7 @@ pub fn run() {
                 last_cloud_sync: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 syncing: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 sync_progress: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                upload_reconcile_results: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 audited_revision: Arc::new(Mutex::new(std::collections::HashMap::new())),
             };
             app.manage(app_state.clone());
@@ -122,20 +122,18 @@ pub fn run() {
 
                 for kb in rebuild_state.config.snapshot().knowledge_bases {
                     let st = rebuild_state.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        match kbmeta::rebuild_cache_if_needed(&st, &kb) {
+                    let _ =
+                        tokio::task::spawn_blocking(move || match kbmeta::rebuild_cache_if_needed(
+                            &st, &kb,
+                        ) {
                             Ok(n) if n > 0 => println!(
                                 "[ktree] 知识库「{}」从 manifest 重建缓存 {} 篇",
                                 kb.name, n
                             ),
                             Ok(_) => {}
-                            Err(e) => eprintln!(
-                                "[ktree] 知识库「{}」缓存重建失败: {e}",
-                                kb.name
-                            ),
-                        }
-                    })
-                    .await;
+                            Err(e) => eprintln!("[ktree] 知识库「{}」缓存重建失败: {e}", kb.name),
+                        })
+                        .await;
                 }
 
                 // 给还没有语义向量的存量文档后台补算
@@ -177,8 +175,7 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "tray_quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&settings_item, &quit_item])?;
 
-            let tray_png =
-                image::load_from_memory(include_bytes!("../icons/tray.png"))?.to_rgba8();
+            let tray_png = image::load_from_memory(include_bytes!("../icons/tray.png"))?.to_rgba8();
             let (tw, th) = (tray_png.width(), tray_png.height());
             let tray_icon = tauri::image::Image::new_owned(tray_png.into_raw(), tw, th);
 

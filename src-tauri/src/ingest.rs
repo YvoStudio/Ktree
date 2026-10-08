@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use serde::Serialize;
 
@@ -166,7 +166,10 @@ pub(crate) fn docs_artifact_present(kb_root: &Path, md_path: &str) -> bool {
 
 /// 把 rel_path 的父目录 + 新文件名拼成相对路径(正斜杠)。
 fn with_name(rel_path: &str, name: &str) -> String {
-    match Path::new(rel_path).parent().filter(|p| !p.as_os_str().is_empty()) {
+    match Path::new(rel_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
         Some(dir) => format!("{}/{}", dir.to_string_lossy().replace('\\', "/"), name),
         None => name.to_string(),
     }
@@ -193,7 +196,14 @@ pub fn ingest_file(
     let mut manifest = kbmeta::load_manifest(&kb.root);
     let mut dirty = false;
     let doc = ingest_file_with_manifest(
-        state, kb, rel_path, source, convert_md, force, &mut manifest, &mut dirty,
+        state,
+        kb,
+        rel_path,
+        source,
+        convert_md,
+        force,
+        &mut manifest,
+        &mut dirty,
     )?;
     if dirty {
         kbmeta::save_manifest(&kb.root, &manifest)?;
@@ -229,12 +239,18 @@ pub fn backfill_uploaded_pptx(
             if kind.is_dir() {
                 collect(base, &entry.path(), out)?;
             } else if kind.is_file()
-                && entry.path().extension().and_then(|e| e.to_str())
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
                     .is_some_and(|e| e.eq_ignore_ascii_case("pptx"))
             {
-                let rel = entry.path().strip_prefix(base)
+                let rel = entry
+                    .path()
+                    .strip_prefix(base)
                     .map_err(std::io::Error::other)?
-                    .to_string_lossy().replace('\\', "/");
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 out.push(rel);
             }
         }
@@ -243,27 +259,319 @@ pub fn backfill_uploaded_pptx(
 
     let src_root = kb.root.join("src");
     let mut paths = Vec::new();
-    collect(&src_root, &src_root.join(crate::config::AREA_UPLOAD), &mut paths)?;
+    collect(
+        &src_root,
+        &src_root.join(crate::config::AREA_UPLOAD),
+        &mut paths,
+    )?;
     paths.sort();
     let mut report = PptxBackfillReport {
-        scanned: paths.len(), converted: Vec::new(), skipped: Vec::new(), failed: Vec::new(),
+        scanned: paths.len(),
+        converted: Vec::new(),
+        skipped: Vec::new(),
+        failed: Vec::new(),
     };
     let mut manifest = kbmeta::load_manifest(&kb.root);
     let mut changed = false;
     for rel in paths {
         let mut dirty = false;
         match ingest_file_with_manifest(
-            state, kb, &rel, "upload", true, false, &mut manifest, &mut dirty,
+            state,
+            kb,
+            &rel,
+            "upload",
+            true,
+            false,
+            &mut manifest,
+            &mut dirty,
         ) {
             Ok(doc) if doc.md_path.as_deref().is_some_and(|p| p.ends_with(".md")) => {
-                if dirty { report.converted.push(rel); } else { report.skipped.push(rel); }
+                if dirty {
+                    report.converted.push(rel);
+                } else {
+                    report.skipped.push(rel);
+                }
             }
-            Ok(_) => report.failed.push((rel, "PPTX 转换失败，docs 仍是原件镜像".to_string())),
+            Ok(_) => report
+                .failed
+                .push((rel, "PPTX 转换失败，docs 仍是原件镜像".to_string())),
             Err(e) => report.failed.push((rel, e.to_string())),
         }
         changed |= dirty;
     }
     if changed {
+        kbmeta::save_manifest(&kb.root, &manifest)?;
+        refresh_kb_meta(state, kb)?;
+    }
+    Ok(report)
+}
+
+#[derive(Serialize)]
+pub struct UploadReconcileReport {
+    pub scanned: usize,
+    pub added: Vec<String>,
+    pub updated: Vec<String>,
+    pub skipped: usize,
+    pub deleted: Vec<String>,
+    /// 应转换为 Markdown 的格式却退回了原件镜像。
+    pub fallback: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+/// 枚举网页上传区的可见普通文件。先完整扫描再做任何清理:目录不存在或读取失败时,
+/// 不能把一次临时挂载故障误判为「用户删光了文件」。软链接与系统保留目录不参与入库。
+fn collect_uploaded_files(src_root: &Path) -> anyhow::Result<Vec<String>> {
+    fn walk(src_root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name.ends_with(".assets") || is_ignored_component(&name) {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(src_root, &entry.path(), out)?;
+            } else if kind.is_file() {
+                let rel = entry
+                    .path()
+                    .strip_prefix(src_root)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push(rel);
+            } else if kind.is_symlink() {
+                anyhow::bail!(
+                    "上传区含符号链接({}),已停止对账以避免误删旧记录",
+                    entry.path().display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    let upload = src_root.join(crate::config::AREA_UPLOAD);
+    if !fs::symlink_metadata(&upload)?.is_dir() {
+        anyhow::bail!("src/upload 不是普通目录,已停止对账以保护现有文档");
+    }
+    let mut paths = Vec::new();
+    walk(src_root, &upload, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+/// 只移除确切由旧 manifest / SQLite 记录指向的上传区产物；不扫描删除用户直接
+/// 放进 docs/ 的文件。共享产物路径由仍存在的 src 文档占用时也不能删除。
+fn remove_stale_upload_output(
+    kb_root: &Path,
+    output: &str,
+    active_outputs: &HashSet<String>,
+) -> anyhow::Result<()> {
+    if active_outputs.contains(output) {
+        return Ok(());
+    }
+    let path = Path::new(output);
+    if !output.starts_with("docs/upload/")
+        || !path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        anyhow::bail!("拒绝清理上传区之外的产物路径: {output}");
+    }
+    let abs = kb_root.join(path);
+    match fs::symlink_metadata(&abs) {
+        Ok(meta) if meta.is_dir() => anyhow::bail!("产物路径意外指向目录: {output}"),
+        Ok(_) => fs::remove_file(&abs)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+fn prune_empty_upload_parents(kb_root: &Path, output: &str) -> anyhow::Result<()> {
+    let boundary = kb_root.join("docs/upload");
+    let mut parent = kb_root.join(output).parent().map(Path::to_path_buf);
+    while let Some(dir) = parent {
+        if dir == boundary || !dir.starts_with(&boundary) {
+            break;
+        }
+        match fs::remove_dir(&dir) {
+            Ok(()) => parent = dir.parent().map(Path::to_path_buf),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                parent = dir.parent().map(Path::to_path_buf);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// 将 src/upload/ 与 docs、manifest、SQLite、搜索索引增量对账,不依赖 Git/SVN 绑定。
+/// 只读 src 原件;不删除未被系统记录过的 docs 文件。
+pub fn reconcile_uploaded_files(
+    state: &AppState,
+    kb: &KnowledgeBase,
+) -> anyhow::Result<UploadReconcileReport> {
+    let src_root = kb.root.join("src");
+    let paths = collect_uploaded_files(&src_root)?;
+    let source_set: HashSet<String> = paths.iter().cloned().collect();
+    let old_docs = state
+        .store
+        .list_documents(&kb.id, Some(crate::config::AREA_UPLOAD))?;
+    let old_paths: HashSet<String> = old_docs.iter().map(|d| d.rel_path.clone()).collect();
+    let mut manifest = kbmeta::load_manifest(&kb.root);
+    let mut changed = false;
+    let mut report = UploadReconcileReport {
+        scanned: paths.len(),
+        added: Vec::new(),
+        updated: Vec::new(),
+        skipped: 0,
+        deleted: Vec::new(),
+        fallback: Vec::new(),
+        failed: Vec::new(),
+    };
+
+    for (i, rel) in paths.iter().enumerate() {
+        if i % 10 == 0 {
+            state.set_sync_progress(
+                "upload",
+                &kb.id,
+                0,
+                &format!("入库核对 {}/{}", i + 1, paths.len()),
+            );
+        }
+        let mut dirty = false;
+        match ingest_file_with_manifest(
+            state,
+            kb,
+            rel,
+            "upload",
+            true,
+            false,
+            &mut manifest,
+            &mut dirty,
+        ) {
+            Ok(doc) => {
+                if matches!(doc.ext.as_str(), "pptx" | "docx" | "xlsx" | "xls" | "pdf")
+                    && !doc.md_path.as_deref().is_some_and(|p| p.ends_with(".md"))
+                {
+                    report.fallback.push(rel.clone());
+                }
+                if dirty && old_paths.contains(rel) {
+                    report.updated.push(rel.clone());
+                } else if dirty {
+                    report.added.push(rel.clone());
+                } else {
+                    report.skipped += 1;
+                }
+            }
+            Err(e) => report.failed.push((rel.clone(), e.to_string())),
+        }
+        changed |= dirty;
+    }
+
+    // 后清理旧记录,避免旧路径与新转换产物同名时删掉刚生成的文件。
+    let active_docs = state
+        .store
+        .list_documents(&kb.id, Some(crate::config::AREA_UPLOAD))?;
+    let active_outputs: HashSet<String> = active_docs
+        .iter()
+        .filter(|d| source_set.contains(&d.rel_path))
+        .filter_map(|d| d.md_path.clone())
+        .collect();
+    let active_assets: HashSet<String> = active_docs
+        .iter()
+        .filter(|d| source_set.contains(&d.rel_path))
+        .map(|d| assets_rel_of(&d.rel_path))
+        .collect();
+    let stale_docs: Vec<&Document> = old_docs
+        .iter()
+        .filter(|d| !source_set.contains(&d.rel_path))
+        .collect();
+    for (i, doc) in stale_docs.iter().enumerate() {
+        // 扫描之后若用户刚补回原件,本轮不清理;下轮会重新入库。
+        if src_root.join(&doc.rel_path).exists() {
+            continue;
+        }
+        state.set_sync_progress(
+            "upload",
+            &kb.id,
+            0,
+            &format!("清理过期记录 {}/{}", i + 1, stale_docs.len()),
+        );
+        let outcome = (|| -> anyhow::Result<()> {
+            if let Some(ref output) = doc.md_path {
+                remove_stale_upload_output(&kb.root, output, &active_outputs)?;
+                prune_empty_upload_parents(&kb.root, output)?;
+            }
+            let assets = assets_rel_of(&doc.rel_path);
+            if !active_assets.contains(&assets) {
+                let assets_path = kb.root.join("docs").join(&assets);
+                if !assets.starts_with("upload/")
+                    || !Path::new(&assets)
+                        .components()
+                        .all(|part| matches!(part, Component::Normal(_)))
+                {
+                    anyhow::bail!("拒绝清理上传区之外的资源目录: {assets}");
+                }
+                if assets_path.is_dir() {
+                    fs::remove_dir_all(&assets_path)?;
+                }
+                prune_empty_upload_parents(&kb.root, &format!("docs/{assets}"))?;
+            }
+            state.store.delete_document(doc.id)?;
+            state.index.delete(doc.id)?;
+            if manifest.remove(&doc.rel_path).is_some() {
+                changed = true;
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                report.deleted.push(doc.rel_path.clone());
+                changed = true;
+            }
+            Err(e) => report.failed.push((doc.rel_path.clone(), e.to_string())),
+        }
+    }
+
+    // manifest 里有记录而 SQLite 已无记录的旧文件,也仅按已知产物路径清理。
+    let stale_manifest: Vec<String> = manifest
+        .keys()
+        .filter(|p| {
+            in_upload_area(p)
+                && *p != crate::config::AREA_UPLOAD
+                && !source_set.contains(*p)
+                && !old_paths.contains(*p)
+        })
+        .cloned()
+        .collect();
+    for rel in stale_manifest {
+        if src_root.join(&rel).exists() {
+            continue;
+        }
+        let output = manifest
+            .get(&rel)
+            .map(|e| e.output.clone())
+            .unwrap_or_default();
+        if !output.is_empty() {
+            if let Err(e) = remove_stale_upload_output(&kb.root, &output, &active_outputs) {
+                report.failed.push((rel.clone(), e.to_string()));
+                continue;
+            }
+            if let Err(e) = prune_empty_upload_parents(&kb.root, &output) {
+                report.failed.push((rel.clone(), e.to_string()));
+                continue;
+            }
+        }
+        manifest.remove(&rel);
+        changed = true;
+        if !report.deleted.contains(&rel) {
+            report.deleted.push(rel);
+        }
+    }
+
+    if changed {
+        state.index.commit()?;
         kbmeta::save_manifest(&kb.root, &manifest)?;
         refresh_kb_meta(state, kb)?;
     }
@@ -320,15 +628,19 @@ pub(crate) fn ingest_file_with_manifest(
                         .map(|md| docs_artifact_present(&kb.root, md))
                         .unwrap_or(false);
                     // 旧版本把 PPTX 原样镜像到 docs/；新版本需升级为逐页 Markdown。
-                    let pptx_ready = ext != "pptx" || !convert_md || doc.md_path.as_deref()
-                        .filter(|p| p.ends_with(".md"))
-                        .is_some_and(|p| {
-                            state.config.vision_updated_at().map_or(true, |changed| {
-                                fs::metadata(kb.root.join(p))
-                                    .and_then(|meta| meta.modified())
-                                    .is_ok_and(|created| created >= changed)
-                            })
-                        });
+                    let pptx_ready = ext != "pptx"
+                        || !convert_md
+                        || doc
+                            .md_path
+                            .as_deref()
+                            .filter(|p| p.ends_with(".md"))
+                            .is_some_and(|p| {
+                                state.config.vision_updated_at().map_or(true, |changed| {
+                                    fs::metadata(kb.root.join(p))
+                                        .and_then(|meta| meta.modified())
+                                        .is_ok_and(|created| created >= changed)
+                                })
+                            });
                     if store_ok && docs_ok && pptx_ready {
                         return Ok(doc);
                     }
@@ -348,7 +660,13 @@ pub(crate) fn ingest_file_with_manifest(
         // md 与 .assets 同目录,引用前缀就是目录名本身
         let assets_prefix = format!("{stem}.assets");
         let vision = (ext == "pptx").then(|| state.config.vision_snapshot());
-        match convert::convert_file(&src_abs, &ext, &assets_abs, &assets_prefix, vision.as_ref().filter(|v| v.is_configured())) {
+        match convert::convert_file(
+            &src_abs,
+            &ext,
+            &assets_abs,
+            &assets_prefix,
+            vision.as_ref().filter(|v| v.is_configured()),
+        ) {
             Ok(r) if r.ok => Some(r),
             _ => None,
         }
@@ -549,9 +867,8 @@ fn prune_docs_orphans_with_store(
             fs::remove_dir(dir)
         }
     }
-    rm_empty(&scan_root).map_err(|e| {
-        anyhow::anyhow!("清理 docs 空目录失败({}): {e}", scan_root.display())
-    })?;
+    rm_empty(&scan_root)
+        .map_err(|e| anyhow::anyhow!("清理 docs 空目录失败({}): {e}", scan_root.display()))?;
 
     Ok(removed)
 }
@@ -569,11 +886,7 @@ pub fn refresh_kb_meta(state: &AppState, kb: &KnowledgeBase) -> anyhow::Result<(
 
 /// 递归删除 src/ 下的一个文件夹及其在 docs/ manifest SQLite tantivy 里的所有关联。
 /// `src_rel` 是相对 src 的子路径(如 "upload/T1/sub"),不能为空(避免误删整个 src)。
-pub fn delete_folder(
-    state: &AppState,
-    kb: &KnowledgeBase,
-    src_rel: &str,
-) -> anyhow::Result<usize> {
+pub fn delete_folder(state: &AppState, kb: &KnowledgeBase, src_rel: &str) -> anyhow::Result<usize> {
     if src_rel.trim().is_empty() {
         anyhow::bail!("不能删除 src 根目录");
     }
@@ -652,9 +965,7 @@ pub(crate) fn forget_doc_artifacts_with_manifest(
         let _ = fs::remove_file(kb.root.join(md));
     }
     // 伴生资源目录:docs/<父目录>/<stem>.assets/
-    let _ = fs::remove_dir_all(
-        kb.root.join("docs").join(assets_rel_of(&doc.rel_path)),
-    );
+    let _ = fs::remove_dir_all(kb.root.join("docs").join(assets_rel_of(&doc.rel_path)));
 
     if manifest.remove(&doc.rel_path).is_some() {
         *manifest_dirty = true;
@@ -795,14 +1106,14 @@ pub(crate) fn parse_frontmatter_props(text: &str) -> String {
         }
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
-            if key.is_empty() || k.starts_with('-') || RESERVED.contains(&key.to_lowercase().as_str()) {
+            if key.is_empty()
+                || k.starts_with('-')
+                || RESERVED.contains(&key.to_lowercase().as_str())
+            {
                 continue;
             }
             let val = v.trim().trim_matches('"').trim_matches('\'').trim();
-            map.insert(
-                key.to_string(),
-                serde_json::Value::String(val.to_string()),
-            );
+            map.insert(key.to_string(), serde_json::Value::String(val.to_string()));
         }
     }
     if map.is_empty() {
@@ -814,7 +1125,10 @@ pub(crate) fn parse_frontmatter_props(text: &str) -> String {
 
 /// 去掉文件开头的 YAML frontmatter(`---` 包起来的块)。
 fn strip_frontmatter(s: &str) -> &str {
-    if let Some(rest) = s.strip_prefix("---\n").or_else(|| s.strip_prefix("---\r\n")) {
+    if let Some(rest) = s
+        .strip_prefix("---\n")
+        .or_else(|| s.strip_prefix("---\r\n"))
+    {
         for marker in ["\n---\n", "\n---\r\n"] {
             if let Some(i) = rest.find(marker) {
                 return &rest[i + marker.len()..];
@@ -836,7 +1150,12 @@ fn push_unique_path(paths: &mut Vec<String>, rel: &str) {
 /// 若 docs 产物失效、断链、空文件或 Windows 路径异常,回落到同路径 docs 与 src 原文。
 pub(crate) fn read_doc_markdown(kb: &KnowledgeBase, doc: &Document) -> anyhow::Result<String> {
     let mut paths = Vec::new();
-    if let Some(md) = doc.md_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(md) = doc
+        .md_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         push_unique_path(&mut paths, md);
     }
     push_unique_path(&mut paths, &format!("docs/{}", doc.rel_path));
@@ -919,10 +1238,9 @@ pub fn backfill_meta(state: &AppState) -> usize {
                 continue;
             }
             let category = kbmeta::category_of(&doc.rel_path);
-            let _ =
-                state
-                    .index
-                    .add_or_update(&kb.id, doc.id, &doc.title, &category, &body, &summary);
+            let _ = state
+                .index
+                .add_or_update(&kb.id, doc.id, &doc.title, &category, &body, &summary);
             // 用纯文本重算向量(HTML 此前的向量含标签噪音)
             let etext: String = format!("{}\n{}", doc.title, body)
                 .chars()
@@ -972,9 +1290,54 @@ pub fn backfill_vectors(state: &AppState) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        docs_artifact_present, extract_links, link_key_of, parse_frontmatter_props,
-        path_has_ignored_component, prune_docs_orphans_with_store,
+        collect_uploaded_files, docs_artifact_present, extract_links, link_key_of,
+        parse_frontmatter_props, path_has_ignored_component, prune_docs_orphans_with_store,
+        prune_empty_upload_parents, remove_stale_upload_output,
     };
+
+    #[test]
+    fn upload_scan_requires_source_dir_and_skips_reserved_paths() {
+        let root = std::env::temp_dir().join(format!("ktree_upload_scan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        assert!(collect_uploaded_files(&src).is_err());
+        std::fs::create_dir_all(src.join("upload/课程/子目录")).unwrap();
+        std::fs::create_dir_all(src.join("upload/课程/图.assets")).unwrap();
+        std::fs::create_dir_all(src.join("upload/##!忽略目录")).unwrap();
+        std::fs::write(src.join("upload/课程/子目录/课件.md"), "正文").unwrap();
+        std::fs::write(src.join("upload/课程/.隐藏.md"), "hidden").unwrap();
+        std::fs::write(src.join("upload/课程/图.assets/img.png"), "image").unwrap();
+        std::fs::write(src.join("upload/##!忽略目录/草稿.md"), "draft").unwrap();
+        assert_eq!(
+            collect_uploaded_files(&src).unwrap(),
+            vec!["upload/课程/子目录/课件.md"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upload_cleanup_only_removes_recorded_safe_unshared_output() {
+        let root =
+            std::env::temp_dir().join(format!("ktree_upload_cleanup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docs/upload")).unwrap();
+        std::fs::write(root.join("docs/upload/stale.md"), "old").unwrap();
+        std::fs::create_dir_all(root.join("docs/upload/旧目录")).unwrap();
+        std::fs::write(root.join("docs/upload/旧目录/old.md"), "old").unwrap();
+        std::fs::write(root.join("docs/upload/manual.md"), "user").unwrap();
+        std::fs::write(root.join("docs/upload/shared.md"), "current").unwrap();
+        let keep = std::collections::HashSet::from(["docs/upload/shared.md".to_string()]);
+        remove_stale_upload_output(&root, "docs/upload/stale.md", &keep).unwrap();
+        remove_stale_upload_output(&root, "docs/upload/旧目录/old.md", &keep).unwrap();
+        prune_empty_upload_parents(&root, "docs/upload/旧目录/old.md").unwrap();
+        remove_stale_upload_output(&root, "docs/upload/shared.md", &keep).unwrap();
+        assert!(!root.join("docs/upload/stale.md").exists());
+        assert!(root.join("docs/upload/manual.md").exists());
+        assert!(root.join("docs/upload/shared.md").exists());
+        assert!(!root.join("docs/upload/旧目录").exists());
+        assert!(remove_stale_upload_output(&root, "docs/upload/../../outside.md", &keep).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// 断链软链必须算「产物在」:Windows 上「原样镜像」类文件的 docs 产物就是这个
     /// 形态。若按 is_file() 判定,每个镜像类文件每轮同步都被判缺失 → 整库重灌。
@@ -1001,7 +1364,9 @@ mod tests {
         assert!(path_has_ignored_component("vcs/svn/##!草稿/方案.md"));
         assert!(path_has_ignored_component("vcs/svn/##！草稿/方案.md"));
         assert!(path_has_ignored_component("vcs/svn/策划/##!方案.md"));
-        assert!(!path_has_ignored_component("vcs/svn/归档（AI不看）/方案.md"));
+        assert!(!path_has_ignored_component(
+            "vcs/svn/归档（AI不看）/方案.md"
+        ));
         assert!(!path_has_ignored_component("vcs/svn/策划/方案##!.md"));
     }
 

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::ConfigStore;
 use crate::embed::Embedder;
@@ -58,6 +59,8 @@ pub struct AppState {
     /// 进行中同步的阶段描述(如「全库对账:入库核对 3500/14406」),同 key。
     /// 大库一轮同步可达几十分钟,webui 需要能看到卡在哪个阶段,而不是干等"同步中…"。
     pub sync_progress: Arc<Mutex<HashMap<(String, String, usize), String>>>,
+    /// 上传区对账的最近一次结果(进程内)。耗时任务由后台执行,网页轮询读取。
+    pub upload_reconcile_results: Arc<Mutex<HashMap<String, Value>>>,
     /// 本进程内「逐文件核对确认过一致」的修订号:key=(kb_id, binding_idx)。
     ///
     /// 只有在本进程真的跑完一次一致的核对后才写入,故意**不持久化**:
@@ -85,7 +88,10 @@ impl AppState {
 
     /// 启动时从 SQLite 恢复历次同步状态到内存 map。
     pub fn restore_sync_states(&self) {
-        for (kind, map) in [("vcs", &self.last_vcs_sync), ("cloud", &self.last_cloud_sync)] {
+        for (kind, map) in [
+            ("vcs", &self.last_vcs_sync),
+            ("cloud", &self.last_cloud_sync),
+        ] {
             let Ok(rows) = self.store.load_sync_states(kind) else {
                 continue;
             };

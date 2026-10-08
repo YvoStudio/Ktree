@@ -465,6 +465,7 @@
   .pv-body img { display:block; max-width:100%; margin:0 auto; }
   .pv-body video, .pv-body audio { display:block; max-width:100%; margin:20px auto; }
   .pv-body iframe { width:100%; height:100%; border:none; display:block; }
+  .pv-body.docx-preview-body { overflow:hidden; }
   .pv-body embed { width:100%; height:100%; display:block; }
   .pv-code { margin:0; padding:20px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
     font-size:13px; line-height:1.6; overflow:auto; }
@@ -1076,12 +1077,60 @@ async function renderOpsList(host){
       </div>
       <div class="ops-actions">
         <button class="btn ghost" data-act="vcs-all">同步全部仓库</button>
+        <button class="btn ghost" data-act="upload-reconcile">对账上传文件</button>
         <span class="hint" style="align-self:center">绑定的添加 / 删除请在桌面端「Ktree → 设置」中配置</span>
       </div>
       <div class="vcs-list" data-vcs-host="1"><div class="ops-empty">加载仓库绑定…</div></div>
+      <div class="ops-report" data-upload-report="1" style="display:none"></div>
       <div class="ops-report" data-report="1" style="display:none"></div>`;
     const reportBox=block.querySelector('[data-report]');
     function show(msg){ reportBox.style.display='block'; reportBox.textContent=msg; }
+
+    // 上传区对账独立于 VCS:检查 src/upload 与 docs / 索引,不需要任何仓库绑定。
+    const uploadBtn=block.querySelector('[data-act="upload-reconcile"]');
+    const uploadReport=block.querySelector('[data-upload-report]');
+    function showUpload(msg){ uploadReport.style.display='block'; uploadReport.textContent=msg; }
+    async function reloadUploadStatus(){
+      const status=await api(`/api/kb/${encodeURIComponent(kb.id)}/upload/reconcile`);
+      if(!status || !status.ok) throw new Error(status?.error||'读取状态失败');
+      uploadBtn.disabled=!!status.running;
+      uploadBtn.textContent=status.running?'上传文件对账中…':'对账上传文件';
+      if(status.running) showUpload(status.progress||'扫描 src/upload …');
+      else if(status.result) showUpload(formatUploadReconcileResult(status.result));
+      return status;
+    }
+    let uploadPollTimer=null;
+    function startUploadPolling(notifyWhenDone){
+      if(uploadPollTimer) return;
+      uploadPollTimer=setInterval(async()=>{
+        if(!document.body.contains(block)){ clearInterval(uploadPollTimer); uploadPollTimer=null; return; }
+        try{
+          const status=await reloadUploadStatus();
+          if(status.running) return;
+          clearInterval(uploadPollTimer); uploadPollTimer=null;
+          await loadKbs(); await loadTree(kb.id); renderSidebar();
+          const r=status.result?.report;
+          if(notifyWhenDone && r){
+            const count=(r.added?.length||0)+(r.updated?.length||0)+(r.deleted?.length||0);
+            if(count || (r.failed?.length||0) || (r.fallback?.length||0)){
+              const ok=await confirmDialog(`上传文件对账完成:新增 ${r.added.length} · 更新 ${r.updated.length} · 清理 ${r.deleted.length} · 未转换 ${r.fallback.length} · 失败 ${r.failed.length}`,
+                {detail:['源文件保持不变；仅清理有系统记录的过期 docs 产物。'],okText:'刷新页面查看'});
+              if(ok) location.reload();
+            }
+          }
+        }catch(e){ showUpload('读取对账状态失败: '+e); }
+      },3000);
+    }
+    uploadBtn.addEventListener('click',async()=>{
+      uploadBtn.disabled=true;
+      showUpload('正在启动上传文件对账…');
+      try{
+        const r=await api(`/api/kb/${encodeURIComponent(kb.id)}/upload/reconcile`,{method:'POST'});
+        if(!r || !r.ok) throw new Error(r?.error||'启动失败');
+        await reloadUploadStatus();
+        startUploadPolling(!!r.started);
+      }catch(e){ uploadBtn.disabled=false; showUpload('启动对账失败: '+e); }
+    });
 
     // ---- 仓库(VCS)绑定:列表 + 手动同步 ----
     const vcsHost=block.querySelector('[data-vcs-host]');
@@ -1089,8 +1138,9 @@ async function renderOpsList(host){
       try{
         const r=await api(`/api/kb/${encodeURIComponent(kb.id)}/vcs`);
         const bindings=r.bindings||[];
+        block.querySelector('[data-act="vcs-all"]').disabled=!bindings.length;
         if(!bindings.length){
-          vcsHost.innerHTML='<div class="ops-empty">未绑定仓库。在桌面端「Ktree → 设置」添加后,内容将镜像到 src/vcs/&lt;名字&gt;/(只读)。</div>';
+          vcsHost.innerHTML='<div class="ops-empty">未绑定仓库；手动放入 src/upload 的文件请点「对账上传文件」。</div>';
           return;
         }
         vcsHost.innerHTML='';
@@ -1147,8 +1197,10 @@ async function renderOpsList(host){
       reloadVcs(); startSyncPolling();
     });
 
-    await reloadVcs();
     host.appendChild(block);
+    try{ const status=await reloadUploadStatus(); if(status.running) startUploadPolling(false); }
+    catch(e){ showUpload('读取对账状态失败: '+e); }
+    await reloadVcs();
   }
 }
 
@@ -1239,6 +1291,29 @@ function formatVcsReports(reports,errors){
   const parts=reports.map(formatVcsReport);
   errors.forEach(e=>parts.push(`[#${e.idx}] 失败: ${e.error}`));
   return parts.join('\n\n');
+}
+function formatUploadReconcileResult(result){
+  if(!result) return '(无对账报告)';
+  if(!result.report) return '上传文件对账失败: '+(result.error||'未知错误');
+  const r=result.report;
+  const lines=[`扫描 src/upload ${r.scanned} 个文件 · 新增 ${r.added.length} · 更新 ${r.updated.length} · 未变 ${r.skipped} · 清理旧记录 ${r.deleted.length} · 未转换 ${r.fallback.length} · 失败 ${r.failed.length}`];
+  for(const [label,items] of [['新增',r.added],['更新',r.updated],['清理',r.deleted]]){
+    if(!items?.length) continue;
+    lines.push(label+':');
+    items.slice(0,12).forEach(path=>lines.push('  '+path));
+    if(items.length>12) lines.push(`  … 等 ${items.length} 项`);
+  }
+  if(r.failed?.length){
+    lines.push('失败:');
+    r.failed.slice(0,20).forEach(([path,error])=>lines.push(`  ${path}: ${error}`));
+    if(r.failed.length>20) lines.push(`  … 等 ${r.failed.length} 项`);
+  }
+  if(r.fallback?.length){
+    lines.push('未转换为 Markdown（保留原件镜像）:');
+    r.fallback.slice(0,20).forEach(path=>lines.push('  '+path));
+    if(r.fallback.length>20) lines.push(`  … 等 ${r.fallback.length} 项`);
+  }
+  return lines.join('\n');
 }
 
 // ---------- 启动 ----------
@@ -1447,7 +1522,10 @@ function fileIconHtml(kb,f,thumbSm){
 function previewPathOf(f){
   const rel=String(f.rel_path||'');
   const md=String(f.md_path||'');
-  if(extOf(rel)==='pptx') return rel; // src 点击看原件幻灯片；docs 中的 .md 仍按 Markdown 阅读。
+  // Office 原件直接预览;搜索/反链返回的 src 相对路径需补齐 src/ 前缀。
+  if(['pptx','docx'].includes(extOf(rel))){
+    return /^(src|docs)\//.test(rel)?rel:'src/'+rel;
+  }
   if(!md) return rel;
   // md_path 只是 docs/ 下的同名镜像时,预览直接走 src 原文件;真正转换出来的 md 仍走 md_path。
   if(rel.startsWith('src/') && md==='docs/'+rel.slice(4)) return rel;
@@ -2290,6 +2368,10 @@ document.getElementById('listArea').addEventListener('click',e=>{
   else if(act==='notedel') deleteNote(el.dataset.id, el.dataset.scope);
 });
 function openUrl(url,ext){
+  if((ext||'').toLowerCase()==='docx'){
+    const name=decodeURIComponent(new URL(url,location.href).pathname.split('/').pop()||'document.docx');
+    return showDocxPreview(url,name);
+  }
   if((ext||'').toLowerCase()==='pptx'){
     const name=decodeURIComponent(new URL(url,location.href).pathname.split('/').pop()||'slides.pptx');
     return showPptxPreview(url,name);
@@ -2405,7 +2487,7 @@ function setColor(kb,rp,color,isFolder){
 }
 
 // ---------- 预览(照搬 Haystack)----------
-function createModal(name, openUrl){
+function createModal(name, openUrl, options={}){
   const overlay=document.createElement('div');
   overlay.className='pv-overlay';
   const box=document.createElement('div'); box.className='pv-box';
@@ -2413,8 +2495,15 @@ function createModal(name, openUrl){
   const title=document.createElement('div'); title.className='pv-title'; title.textContent=name;
   head.appendChild(title);
   if(openUrl){
-    const bo=document.createElement('button'); bo.className='btn ghost sm'; bo.textContent='在新标签打开';
-    bo.onclick=()=>window.open(openUrl,'_blank'); head.appendChild(bo);
+    const bo=document.createElement('button'); bo.className='btn ghost sm';
+    bo.textContent=options.download?'下载原件':'在新标签打开';
+    bo.onclick=()=>{
+      if(options.download){
+        const a=document.createElement('a'); a.href=openUrl; a.download=name;
+        document.body.appendChild(a); a.click(); a.remove();
+      }else window.open(openUrl,'_blank');
+    };
+    head.appendChild(bo);
   }
   const close=document.createElement('button'); close.className='btn ghost sm'; close.textContent='关闭';
   close.onclick=()=>overlay.remove(); head.appendChild(close);
@@ -2430,6 +2519,7 @@ function createModal(name, openUrl){
 }
 function previewFile(url,name){
   const ext=extOf(name);
+  if(ext==='docx') return showDocxPreview(url,name);
   if(ext==='pptx') return showPptxPreview(url,name);
   if(MD_EXT.has(ext)) return showMarkdownPreview(url,name);
   if(IMG_EXT.has(ext)) return showImagePreview(url,name);
@@ -2439,6 +2529,68 @@ function previewFile(url,name){
   if(AUDIO_EXT.has(ext)) return showMediaPreview(url,name,'audio');
   if(CODE_EXT.has(ext)||TEXT_EXT.has(ext)||ext==='json') return showCodePreview(url,name);
   return showBinaryPreview(url,name);
+}
+let docxRendererPromise;
+function loadDocxRenderer(){
+  if(window.KtreeDocx) return Promise.resolve(window.KtreeDocx);
+  if(!docxRendererPromise) docxRendererPromise=new Promise((resolve,reject)=>{
+    const script=document.createElement('script'); script.src='/lib/docx-preview.js';
+    script.onload=()=>window.KtreeDocx?resolve(window.KtreeDocx):reject(new Error('Word 预览模块未初始化'));
+    script.onerror=()=>{ script.remove(); reject(new Error('Word 预览模块加载失败')); };
+    document.head.appendChild(script);
+  }).catch(e=>{ docxRendererPromise=null; throw e; });
+  return docxRendererPromise;
+}
+async function showDocxPreview(url,name){
+  const body=createModal(name,url,{download:true});
+  body.innerHTML='<div class="pv-binary">正在加载 Word 文档…</div>';
+  const overlay=body.closest('.pv-overlay');
+  const controller=new AbortController();
+  const observer=new MutationObserver(()=>{
+    if(!overlay.isConnected){ controller.abort(); observer.disconnect(); }
+  });
+  observer.observe(document.body,{childList:true});
+  try{
+    const [renderer,response]=await Promise.all([
+      loadDocxRenderer(), fetch(url,{signal:controller.signal}),
+    ]);
+    if(!response.ok) throw new Error(`文件读取失败（HTTP ${response.status}）`);
+    const bytes=await response.arrayBuffer();
+    if(!overlay.isConnected) return;
+    const frame=document.createElement('iframe'); frame.title=name+' — Word 预览';
+    frame.setAttribute('sandbox','allow-same-origin'); frame.referrerPolicy='no-referrer';
+    const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+    frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8">
+      <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; font-src data: blob:; style-src 'unsafe-inline'">
+      <style>html,body{margin:0;background:#e7e7eb}body{font-family:Arial,"Microsoft YaHei",sans-serif}
+      .ktree-docx-wrapper{padding:24px!important;min-width:fit-content}
+      @media(max-width:850px){.ktree-docx-wrapper{padding:12px!important}}</style>
+      </head><body></body></html>`;
+    body.classList.add('docx-preview-body'); body.replaceChildren(frame);
+    await loaded;
+    if(!overlay.isConnected) return;
+    const frameDoc=frame.contentDocument;
+    const content=frameDoc.createElement('div');
+    const styles=frameDoc.createElement('div'); styles.hidden=true;
+    frameDoc.body.append(styles,content);
+    await renderer.render(bytes,content,styles);
+    if(!overlay.isConnected) return;
+    frameDoc.addEventListener('click',e=>{
+      const a=e.target.closest('a[href]'); if(!a) return;
+      const href=a.getAttribute('href')||'';
+      if(href.startsWith('#')) return;
+      e.preventDefault();
+      try{
+        const target=new URL(href);
+        if(['http:','https:'].includes(target.protocol)) window.open(target.href,'_blank','noopener,noreferrer');
+      }catch(_){}
+    });
+  }catch(e){
+    if(overlay.isConnected){
+      body.classList.remove('docx-preview-body');
+      body.innerHTML='<div class="pv-binary">Word 预览失败：'+esc(e.message||e)+'<br>可点击上方「下载原件」查看。</div>';
+    }
+  }
 }
 let pptxRendererPromise;
 function loadPptxRenderer(){

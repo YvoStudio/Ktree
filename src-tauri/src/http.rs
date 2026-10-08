@@ -134,9 +134,7 @@ fn dir_has_visible_file(dir: &Path) -> bool {
     };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.')
-            || name.ends_with(".assets")
-            || ingest::is_ignored_component(&name)
+        if name.starts_with('.') || name.ends_with(".assets") || ingest::is_ignored_component(&name)
         {
             continue;
         }
@@ -224,9 +222,22 @@ pub async fn serve(state: AppState) {
         .route("/api/kbs", get(list_kbs))
         .route("/api/tree", get(tree))
         .route("/api/files", get(list_files))
-        .route("/api/folder", post(create_folder).delete(delete_folder_http))
-        .route("/api/upload", post(upload).layer(DefaultBodyLimit::max(64 * 1024 * 1024)))
-        .route("/api/kb/:kb_id/pptx/backfill", post(backfill_uploaded_pptx_http))
+        .route(
+            "/api/folder",
+            post(create_folder).delete(delete_folder_http),
+        )
+        .route(
+            "/api/upload",
+            post(upload).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/api/kb/:kb_id/pptx/backfill",
+            post(backfill_uploaded_pptx_http),
+        )
+        .route(
+            "/api/kb/:kb_id/upload/reconcile",
+            get(upload_reconcile_status).post(start_upload_reconcile),
+        )
         .route("/api/search", get(search))
         .route("/api/backlinks", get(backlinks))
         .route("/api/related", get(related))
@@ -239,9 +250,15 @@ pub async fn serve(state: AppState) {
         .route("/api/kb", post(add_kb))
         .route("/api/kb/:kb_id/vcs", get(list_kb_vcs).post(add_kb_vcs))
         .route("/api/kb/:kb_id/vcs/sync", post(sync_kb_vcs_all))
-        .route("/api/kb/:kb_id/vcs/:idx", put(update_kb_vcs).delete(remove_kb_vcs))
+        .route(
+            "/api/kb/:kb_id/vcs/:idx",
+            put(update_kb_vcs).delete(remove_kb_vcs),
+        )
         .route("/api/kb/:kb_id/vcs/:idx/sync", post(sync_kb_vcs_one))
-        .route("/api/kb/:kb_id/cloud", get(list_kb_cloud).post(add_kb_cloud))
+        .route(
+            "/api/kb/:kb_id/cloud",
+            get(list_kb_cloud).post(add_kb_cloud),
+        )
         .route(
             "/api/kb/:kb_id/cloud/:idx",
             put(update_kb_cloud).delete(remove_kb_cloud),
@@ -253,6 +270,8 @@ pub async fn serve(state: AppState) {
         .route("/lib/mermaid.min.js", get(lib_mermaid))
         .route("/lib/tex-svg.js", get(lib_mathjax))
         .route("/lib/pptx-preview.js", get(lib_pptx))
+        .route("/lib/docx-preview.js", get(lib_docx))
+        .route("/lib/docx-preview.LICENSE.txt", get(lib_docx_license))
         // MCP 只支持 JSON-RPC POST;不注册 GET,axum 会自动回 405 + Allow: POST
         .route("/mcp", post(mcp::handle))
         // 知识库文件直链:/<知识库名>/<相对知识库根的路径>。放最后,优先匹配上面的固定路由。
@@ -325,14 +344,20 @@ async fn api_info() -> Response {
 
 async fn lib_marked() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         include_str!("lib/marked.min.js"),
     )
         .into_response()
 }
 async fn lib_hljs() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         include_str!("lib/highlight.min.js"),
     )
         .into_response()
@@ -346,14 +371,20 @@ async fn lib_css() -> Response {
 }
 async fn lib_mermaid() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         include_str!("lib/mermaid.min.js"),
     )
         .into_response()
 }
 async fn lib_mathjax() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         include_str!("lib/tex-svg.js"),
     )
         .into_response()
@@ -361,10 +392,27 @@ async fn lib_mathjax() -> Response {
 
 async fn lib_pptx() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         include_str!("lib/pptx-preview.js"),
     )
         .into_response()
+}
+
+async fn lib_docx() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        include_str!("lib/docx-preview.js"),
+    ).into_response()
+}
+
+async fn lib_docx_license() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        include_str!("lib/docx-preview.LICENSE.txt"),
+    ).into_response()
 }
 
 async fn health(AxState(state): AxState<AppState>) -> Result<Response, ApiError> {
@@ -796,8 +844,8 @@ async fn list_files(
                 continue;
             }
             // 跟随软链取真实文件元数据;docs 镜像断链时回落到 src 同名源文件。
-            let meta = file_metadata_with_docs_fallback(&kb, &entry_rel, &p)
-                .or_else(|| e.metadata().ok());
+            let meta =
+                file_metadata_with_docs_fallback(&kb, &entry_rel, &p).or_else(|| e.metadata().ok());
             let modified = meta
                 .as_ref()
                 .and_then(|m| m.modified().ok())
@@ -845,7 +893,10 @@ async fn list_files(
         }
     }
     let name_of = |v: &Value| {
-        v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string()
+        v.get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
     };
     folders.sort_by(|a, b| {
         let (na, nb) = (name_of(a), name_of(b));
@@ -946,10 +997,9 @@ async fn delete_folder_http(
     let st = state.clone();
     let kb2 = kb.clone();
     let sr = src_rel.clone();
-    let removed =
-        tokio::task::spawn_blocking(move || ingest::delete_folder(&st, &kb2, &sr))
-            .await
-            .map_err(|e| anyhow::anyhow!("删除任务失败: {e}"))??;
+    let removed = tokio::task::spawn_blocking(move || ingest::delete_folder(&st, &kb2, &sr))
+        .await
+        .map_err(|e| anyhow::anyhow!("删除任务失败: {e}"))??;
     let st2 = state.clone();
     let kb3 = kb.clone();
     let _ = tokio::task::spawn_blocking(move || ingest::refresh_kb_meta(&st2, &kb3)).await;
@@ -1041,7 +1091,9 @@ async fn upload(
             continue;
         };
         if filename.ends_with(".assets") {
-            errors.push(json!({ "file": raw_name, "error": "文件名不能以 .assets 结尾(系统保留后缀)" }));
+            errors.push(
+                json!({ "file": raw_name, "error": "文件名不能以 .assets 结尾(系统保留后缀)" }),
+            );
             continue;
         }
         let data = field.bytes().await?;
@@ -1112,7 +1164,75 @@ async fn backfill_uploaded_pptx_http(
     let report = tokio::task::spawn_blocking(move || ingest::backfill_uploaded_pptx(&state, &kb))
         .await
         .map_err(|e| anyhow::anyhow!("PPTX 补录任务失败: {e}"))??;
-    Ok(json_ok(json!({ "ok": report.failed.is_empty(), "report": report })))
+    Ok(json_ok(
+        json!({ "ok": report.failed.is_empty(), "report": report }),
+    ))
+}
+
+/// 手工上传区对账与 VCS 同步分开:即使知识库没有任何仓库绑定也能触发。
+/// 后台执行,避免 PDF/PPTX 转换耗时超过浏览器或反向代理的请求超时。
+async fn start_upload_reconcile(
+    AxState(state): AxState<AppState>,
+    AxPath(kb_id): AxPath<String>,
+) -> Result<Response, ApiError> {
+    let kb = match require_kb(&state, &kb_id) {
+        Ok(k) => k,
+        Err(r) => return Ok(r),
+    };
+    if !state.try_begin_sync("upload", &kb_id, 0) {
+        return Ok(json_ok(
+            json!({ "ok": true, "started": false, "running": true }),
+        ));
+    }
+    state.set_sync_progress("upload", &kb_id, 0, "扫描 src/upload …");
+    if let Ok(mut results) = state.upload_reconcile_results.lock() {
+        results.remove(&kb_id);
+    }
+    tokio::spawn(async move {
+        let worker_state = state.clone();
+        let kb_for_worker = kb.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            ingest::reconcile_uploaded_files(&worker_state, &kb_for_worker)
+        })
+        .await;
+        let payload = match result {
+            Ok(Ok(report)) => {
+                json!({ "ok": report.failed.is_empty() && report.fallback.is_empty(), "report": report })
+            }
+            Ok(Err(e)) => json!({ "ok": false, "error": e.to_string() }),
+            Err(e) => json!({ "ok": false, "error": format!("对账任务异常退出: {e}") }),
+        };
+        if let Ok(mut results) = state.upload_reconcile_results.lock() {
+            results.insert(kb_id.clone(), payload);
+        }
+        state.end_sync("upload", &kb_id, 0);
+    });
+    Ok(json_ok(
+        json!({ "ok": true, "started": true, "running": true }),
+    ))
+}
+
+async fn upload_reconcile_status(
+    AxState(state): AxState<AppState>,
+    AxPath(kb_id): AxPath<String>,
+) -> Result<Response, ApiError> {
+    if let Err(r) = require_kb(&state, &kb_id) {
+        return Ok(r);
+    }
+    let running = state
+        .syncing
+        .lock()
+        .map(|s| s.contains(&("upload".to_string(), kb_id.clone(), 0)))
+        .unwrap_or(false);
+    let progress = state.get_sync_progress("upload", &kb_id, 0);
+    let result = state
+        .upload_reconcile_results
+        .lock()
+        .ok()
+        .and_then(|r| r.get(&kb_id).cloned());
+    Ok(json_ok(
+        json!({ "ok": true, "running": running, "progress": progress, "result": result }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1171,7 +1291,9 @@ async fn search(
             }))
         })
         .collect();
-    Ok(json_ok(json!({ "ok": true, "query": q.q, "hits": enriched })))
+    Ok(json_ok(
+        json!({ "ok": true, "query": q.q, "hits": enriched }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1219,7 +1341,9 @@ async fn backlinks(
             })
         })
         .collect();
-    Ok(json_ok(json!({ "ok": true, "doc": doc_meta, "backlinks": hits })))
+    Ok(json_ok(
+        json!({ "ok": true, "doc": doc_meta, "backlinks": hits }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1280,7 +1404,6 @@ async fn related(
     Ok(json_ok(json!({ "ok": true, "related": related })))
 }
 
-
 async fn get_doc(
     AxState(state): AxState<AppState>,
     AxPath(id): AxPath<i64>,
@@ -1333,11 +1456,7 @@ async fn get_doc_raw(
     };
     let abs = kb.root.join("src").join(&doc.rel_path);
     let bytes = tokio::fs::read(&abs).await?;
-    Ok((
-        [(header::CONTENT_TYPE, file_content_type(&abs))],
-        bytes,
-    )
-        .into_response())
+    Ok(([(header::CONTENT_TYPE, file_content_type(&abs))], bytes).into_response())
 }
 
 async fn delete_doc(
@@ -1458,5 +1577,7 @@ async fn sync_kb_vcs_all(
             Err(e) => errors.push(json!({ "idx": i, "error": e.to_string() })),
         }
     }
-    Ok(json_ok(json!({ "ok": true, "reports": reports, "errors": errors })))
+    Ok(json_ok(
+        json!({ "ok": true, "reports": reports, "errors": errors }),
+    ))
 }

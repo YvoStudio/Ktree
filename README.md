@@ -8,9 +8,11 @@
 
 - **文档上传与转换** — pptx / docx / xlsx / pdf / html / md / txt 上传后可一键转 Markdown(Node sidecar:mammoth / xlsx / pdf-parse / turndown 等)
 - **PPTX 阅读与图片理解** — `src/` 保留原件，点击即可逐页预览；`docs/` 生成含幻灯片画面、页面文字、图表数据和图片的 Markdown。设置中配置百炼视觉 API 后，还会为常见图片补充 OCR 文字与语义描述。
+- **Word 原件预览** — 点击 `src/` 中的 `.docx` 文件名或「打开」即可在网页查看文字、表格、图片、页眉页脚及已保存的分页；预览模块随应用提供，文件在浏览器内解析。`docs/` 继续提供 Markdown 阅读视图；复杂分页、特殊字体等排版可能与 Word 有差异。旧式 `.doc` 仍需另存为 `.docx`。
 - **混合检索** — tantivy(Rust 版 Lucene)BM25 字面匹配 + jieba 中文分词,叠加 **语义向量检索**(bge-small-zh 本地嵌入模型),用 RRF 融合排序,能命中近义 / 概念相关的文档
 - **元数据库** — SQLite 记录文档、分类与语义向量
 - **VCS 同步** — 把 git / svn 仓库(可指定仓库内子目录,git 用稀疏检出)映射到知识库 `src` 子目录,支持手动触发或按间隔定时同步
+- **上传区对账** — 无需绑定 Git/SVN；网页「操作 → 对账上传文件」会核对 `src/upload/`，补齐 `docs/`、元数据与搜索索引，并清理已知的过期产物（不删除 `src` 原件或未被系统记录的 `docs` 文件）
 - **知识库隐藏** — 在桌面设置里逐库勾选「隐藏此知识库」后，该库不出现在网页目录、收藏列表或 REST/MCP 知识库列表，也不参与网页 / MCP 搜索；文件与同步照常保留。隐藏不是访问权限控制，已知直链仍可读取。
 - **飞书同步** — 内置 feishu sidecar,可手动触发或按间隔定时同步飞书共享文件夹(docx / 多维表格 / 画板思维导图)
 - **REST API** — 绑 `0.0.0.0`,局域网任意客户端可上传 / 搜索 / 读取
@@ -43,7 +45,7 @@ npm run build                  # 出当前平台安装包(externalBin 自动打�
 
 ### PPTX 图片理解
 
-在桌面端「设置 → PPTX 图片理解」填写百炼 API Key、OpenAI 兼容地址与支持视觉输入的模型。默认地址为 `https://dashscope.aliyuncs.com/compatible-mode/v1`，默认模型为 `qwen3.8-max`。保存时会用应用图标发起一次真实验证；密钥仅保存在本机应用配置目录的 `vision.json`，不会由 `/api/config` 返回。PPTX 原件不上传，只有其中支持的图片以 Base64 发送给配置的视觉 API；未配置或识别失败时仍生成 Markdown 和幻灯片画面。SVN 已入库的 PPTX 可通过「检查全库」补生成；已放在 `src/upload/` 的 PPTX 可在本机调用 `POST /api/kb/{知识库ID}/pptx/backfill` 补录，原件不会改写。更改百炼配置后，下次仓库对账或再次调用补录接口会重新处理。
+在桌面端「设置 → PPTX 图片理解」填写百炼 API Key、OpenAI 兼容地址与支持视觉输入的模型。默认地址为 `https://dashscope.aliyuncs.com/compatible-mode/v1`，默认模型为 `qwen3.8-max`。保存时会用应用图标发起一次真实验证；密钥仅保存在本机应用配置目录的 `vision.json`，不会由 `/api/config` 返回。PPTX 原件不上传，只有其中支持的图片以 Base64 发送给配置的视觉 API；未配置或识别失败时仍生成 Markdown 和幻灯片画面。SVN 已入库的 PPTX 可通过「检查全库」补生成；已放在 `src/upload/` 的 PPTX 可点击网页「对账上传文件」或在本机调用 `POST /api/kb/{知识库ID}/pptx/backfill` 补录，原件不会改写。更改百炼配置后，下次仓库/上传区对账或再次调用补录接口会重新处理。
 
 > 注:语义检索的 embed sidecar 目前仅开发模式(`node sidecar/embed.js`)可用,
 > 尚未纳入 `build.js` 发行打包(pkg 打包 onnxruntime 原生插件 + 模型待处理)。
@@ -67,6 +69,7 @@ npm run build                  # 出当前平台安装包(externalBin 自动打�
 | GET | `/api/kbs` | 可见知识库列表(隐藏库不返回) |
 | GET | `/api/search?kb=<id>&q=<kw>&limit=<n>` | 混合检索(`kb` 可选，隐藏库不参与) |
 | POST | `/api/upload?kb=<id>&path=src/<dir>&convert=md` | multipart 上传,可选转 Markdown |
+| GET/POST | `/api/kb/:kb_id/upload/reconcile` | 查询状态 / 后台对账手工上传区；与 VCS 绑定无关 |
 | GET | `/api/doc/:id` `/md` `/raw` | 文档元信息 / Markdown / 原始文件 |
 | DELETE | `/api/doc/:id` | 删除文档 |
 | GET | `/api/tree?kb=<id>` / `/api/files?kb=<id>&path=<dir>` | 目录树 / 目录内文件 |

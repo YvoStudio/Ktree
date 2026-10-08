@@ -66,6 +66,24 @@ function buildPptxModules() {
   });
 }
 
+function buildDocxModule() {
+  const esbuild = require('esbuild');
+  const libDir = path.join(SIDECAR_DIR, '..', 'src-tauri', 'src', 'lib');
+  const bundle = esbuild.buildSync({
+    entryPoints: [path.join(SIDECAR_DIR, 'docx-browser.mjs')],
+    bundle: true, platform: 'browser', format: 'iife', target: 'es2020', minify: true,
+    legalComments: 'eof', write: false,
+  });
+  fs.writeFileSync(path.join(libDir, 'docx-preview.js'), bundle.outputFiles[0].text.replace(/[ \t]+$/gm, ''));
+  const license = ['docx-preview', 'jszip'].map(name => {
+    const dir = path.dirname(path.dirname(require.resolve(name)));
+    const file = name === 'jszip' ? 'LICENSE.markdown' : 'LICENSE';
+    const text = fs.readFileSync(path.join(dir, file), 'utf8').replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '');
+    return `${name}\n${text}`;
+  }).join('\n\n');
+  fs.writeFileSync(path.join(libDir, 'docx-preview.LICENSE.txt'), license);
+}
+
 function pkgBin() {
   const bin = process.platform === 'win32' ? 'pkg.cmd' : 'pkg';
   const local = path.join(SIDECAR_DIR, 'node_modules', '.bin', bin);
@@ -73,6 +91,10 @@ function pkgBin() {
 }
 
 function main() {
+  if (process.argv[2] === '--docx-only') {
+    buildDocxModule();
+    return;
+  }
   if (process.argv[2] === '--pptx-only') {
     buildPptxModules();
     return;
@@ -81,6 +103,7 @@ function main() {
   const pkgCmd = pkgBin();
   fs.mkdirSync(BIN_DIR, { recursive: true });
   buildPptxModules();
+  buildDocxModule();
   console.log(`目标平台: ${pkg}  (triple: ${triple})`);
 
   for (const name of ENTRIES) {

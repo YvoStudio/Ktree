@@ -6,6 +6,7 @@
   "type": "commonjs",
   "main": "convert.js",
   "scripts": {
+    "build:docx": "node build.js --docx-only",
     "build:pptx": "node build.js --pptx-only",
     "pretest": "node build.js --pptx-only",
     "test": "node --test test/*.test.js"
@@ -21,6 +22,7 @@
     "@office-kit/pptx": "^0.21.0",
     "@office-kit/pptx-preview": "^0.11.0",
     "@yao-pkg/pkg": "^6.3.0",
+    "docx-preview": "0.4.1",
     "esbuild": "^0.28.2"
   }
 }
