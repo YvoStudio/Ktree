@@ -1521,11 +1521,11 @@ function fileIconHtml(kb,f,thumbSm){
 }
 function previewPathOf(f){
   const rel=String(f.rel_path||'');
-  const md=String(f.md_path||'');
-  // Office 原件直接预览;搜索/反链返回的 src 相对路径需补齐 src/ 前缀。
-  if(['pptx','docx'].includes(extOf(rel))){
+  // PDF / Office 原件直接预览,不依赖关联 MD;搜索/反链的 src 相对路径需补齐前缀。
+  if(['pdf','pptx','docx'].includes(extOf(rel))){
     return /^(src|docs)\//.test(rel)?rel:'src/'+rel;
   }
+  const md=String(f.md_path||'');
   if(!md) return rel;
   // md_path 只是 docs/ 下的同名镜像时,预览直接走 src 原文件;真正转换出来的 md 仍走 md_path。
   if(rel.startsWith('src/') && md==='docs/'+rel.slice(4)) return rel;

@@ -9,6 +9,7 @@
 - **文档上传与转换** — pptx / docx / xlsx / pdf / html / md / txt 上传后可一键转 Markdown(Node sidecar:mammoth / xlsx / pdf-parse / turndown 等)
 - **PPTX 阅读与图片理解** — `src/` 保留原件，点击即可逐页预览；`docs/` 生成含幻灯片画面、页面文字、图表数据和图片的 Markdown。设置中配置百炼视觉 API 后，还会为常见图片补充 OCR 文字与语义描述。
 - **Word 原件预览** — 点击 `src/` 中的 `.docx` 文件名或「打开」即可在网页查看文字、表格、图片、页眉页脚及已保存的分页；预览模块随应用提供，文件在浏览器内解析。`docs/` 继续提供 Markdown 阅读视图；复杂分页、特殊字体等排版可能与 Word 有差异。旧式 `.doc` 仍需另存为 `.docx`。
+- **PDF 原件预览** — 文件列表、搜索结果及相关文档中的 PDF 直接使用浏览器预览原件，不依赖关联 Markdown；`docs/` 的转换和检索保持不变，显式打开 `.md` 仍使用 Markdown 阅读视图。
 - **混合检索** — tantivy(Rust 版 Lucene)BM25 字面匹配 + jieba 中文分词,叠加 **语义向量检索**(bge-small-zh 本地嵌入模型),用 RRF 融合排序,能命中近义 / 概念相关的文档
 - **元数据库** — SQLite 记录文档、分类与语义向量
 - **VCS 同步** — 把 git / svn 仓库(可指定仓库内子目录,git 用稀疏检出)映射到知识库 `src` 子目录,支持手动触发或按间隔定时同步
